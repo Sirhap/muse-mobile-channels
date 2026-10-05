@@ -12,8 +12,8 @@ Dual mobile channels for Muse, running in parallel on one VM:
   restarts the systemd units if they vanish (e.g. after a VM replacement);
   `channel-restore.timer` runs it every 5 minutes.
 - `slash-commands-2026-10-04.md` — the in-chat slash command table
-  (/ping /status /queue /jump /stop /new /help /subagent) implemented by the
-  gateways.
+  (/ping /status /queue /jump /stop /new /help /check /subagent) implemented
+  by the gateways.
 
 The inbox hooks that wake the agent per message live outside this repo in
 `~/hooks/` (scripts + definitions), managed by the Muse runtime.
@@ -36,6 +36,12 @@ cd weixin-bot && python3 -m venv .venv && .venv/bin/pip install -r requirements.
 cd ../wecom-bot && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 # then install the systemd units from each bot dir / channel-restore/
 ```
+
+The gateway units run as user `hatch` with `HOME` and `MUSE_HOME` set to
+`/home/hatch`, so slash commands and the inbox hook share one state
+directory. `channel-restore` stays root so it can reinstall systemd
+units; it still resolves the install home to `/home/hatch` when the
+process home is `/root`.
 
 Syntax-verified 2026-10-04: all Python files compile, shell scripts pass
 `bash -n`, hook JSON parses.

@@ -11,6 +11,7 @@
 !/weixin-bot/
 !/wecom-bot/
 !/channel-restore/
+!/channel_common.py
 !/hooks/
 !/hooks/scripts/
 !/hooks/scripts/*.sh

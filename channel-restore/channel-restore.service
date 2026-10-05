@@ -5,4 +5,6 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
+Environment=HOME=/home/hatch
+Environment=MUSE_HOME=/home/hatch
 ExecStart=/home/hatch/workspace/channel-restore/restore.sh

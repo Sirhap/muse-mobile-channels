@@ -11,9 +11,16 @@ import json
 import os
 import sys
 import time
+import uuid
 from pathlib import Path
+from urllib.parse import urlencode
 
 import httpx
+
+try:
+    import qrcode as qr_lib
+except ImportError:
+    qr_lib = None
 
 BASE = Path(__file__).resolve().parent
 QR_PNG = BASE / "login-qr.png"
@@ -32,8 +39,13 @@ def note(msg: str) -> None:
 
 
 def save_login_state(obj: dict) -> None:
+    """Write login state mode 0600. The qrcode session string can mint a token."""
     LOGIN_STATE.parent.mkdir(parents=True, exist_ok=True)
-    LOGIN_STATE.write_text(json.dumps(obj, ensure_ascii=False, indent=1), encoding="utf-8")
+    tmp = LOGIN_STATE.with_name(f"{LOGIN_STATE.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
+    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=1), encoding="utf-8")
+    os.chmod(tmp, 0o600)
+    tmp.replace(LOGIN_STATE)
+    os.chmod(LOGIN_STATE, 0o600)
 
 
 def write_credentials(token: str, bot_id: str, user_id: str) -> None:
@@ -50,15 +62,22 @@ def write_credentials(token: str, bot_id: str, user_id: str) -> None:
     if user_id:
         lines["ILINK_USER_ID"] = user_id
     content = "".join(f"{k}={v}\n" for k, v in lines.items())
-    import os as _os, uuid as _uuid
-    tmp = CRED_FILE.with_name(f"{CRED_FILE.name}.tmp.{_os.getpid()}.{_uuid.uuid4().hex}")
+    tmp = CRED_FILE.with_name(f"{CRED_FILE.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
     tmp.write_text(content, encoding="utf-8")
     os.chmod(tmp, 0o600)
     tmp.replace(CRED_FILE)
     os.chmod(CRED_FILE, 0o600)
 
 
-async def main() -> int:
+def status_url(qrcode: str, verify_code: str = "") -> str:
+    """Status poll URL. verify_code is included only when the user supplied one."""
+    query = {"qrcode": qrcode}
+    if verify_code:
+        query["verify_code"] = verify_code
+    return f"{BASE_URL}/ilink/bot/get_qrcode_status?{urlencode(query)}"
+
+
+async def main(verify_code: str = "") -> int:
     proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or None
     async with httpx.AsyncClient(proxy=proxy, trust_env=False) as client:
         resp = await client.post(
@@ -76,23 +95,20 @@ async def main() -> int:
             return 1
         save_login_state({"status": "waiting_scan", "qrcode": qrcode, "ts": int(time.time())})
         try:
-            import qrcode as qr_lib
-
+            if qr_lib is None:
+                raise ImportError("qrcode is not installed")
             img = qr_lib.make(img_content)
             img.save(str(QR_PNG))
+            os.chmod(QR_PNG, 0o600)
             note(f"QR code rendered to {QR_PNG}")
         except Exception as e:
-            note(f"QR render failed ({e}); raw content: {img_content}")
+            note(f"QR render failed ({e}); image was not written")
         note("waiting for scan... (valid about 5 minutes)")
 
         deadline = time.time() + 5 * 60
-        verify_code = ""
         while time.time() < deadline:
             try:
-                url = f"{BASE_URL}/ilink/bot/get_qrcode_status?qrcode={qrcode}"
-                if verify_code:
-                    url += f"&verify_code={verify_code}"
-                r = await client.get(url, timeout=httpx.Timeout(40.0, connect=15.0))
+                r = await client.get(status_url(qrcode, verify_code), timeout=httpx.Timeout(40.0, connect=15.0))
                 r.raise_for_status()
                 st = r.json()
             except httpx.TimeoutException:
@@ -135,8 +151,5 @@ async def main() -> int:
 if __name__ == "__main__":
     vc = sys.argv[1] if len(sys.argv) > 1 else ""
     if vc:
-        # a fresh QR is required to submit a verify code; the code is passed
-        # to the status poll of the new code's session by WeChat design, so
-        # simply note it here (the common path needs no code at all).
-        print("verify-code flow: give the code to the agent; it will rerun login")
-    sys.exit(asyncio.run(main()))
+        print("verify-code flow: submitting the code with the new QR session")
+    sys.exit(asyncio.run(main(vc)))
