@@ -19,6 +19,7 @@ INBOX = STATE / "inbox.jsonl"
 OUTBOX = STATE / "outbox.jsonl"
 RESULTS = STATE / "outbox_results.jsonl"
 STATUS = STATE / "status.json"
+HOOK_STATE = Path.home() / "hooks" / "state" / "wecom-bot"
 
 
 def read_text_arg(args) -> str:
@@ -244,6 +245,12 @@ def main() -> int:
     pcn = sub.add_parser("cancel", help="register a user cancellation for a running task (by msgid)")
     pcn.add_argument("--msgid", required=True)
     sub.add_parser("cancelled", help="list registered cancellations")
+    phb = sub.add_parser("heartbeat-start", help="start the internal heartbeat for a batch")
+    phb.add_argument("--msgids", required=True,
+                     help="comma-separated msgids of the batch being worked on")
+    phs = sub.add_parser("heartbeat-stop", help="stop the internal heartbeat for a batch")
+    phs.add_argument("--msgids", required=True,
+                     help="comma-separated msgids whose heartbeat should stop")
     sub.add_parser("status", help="show gateway status")
 
     pi = sub.add_parser("inbox", help="show recent inbox entries")
@@ -436,6 +443,40 @@ def main() -> int:
             except Exception:
                 rows = []
         print(json.dumps(rows, ensure_ascii=False))
+    if args.cmd == "heartbeat-start":
+        # Spawn the detached heartbeat loop for this batch (see
+        # heartbeat.py). While it runs, the inbox hook counts the
+        # batch as alive even if the worker sends no progress: death
+        # is judged by heartbeat + outbox, not by silence alone.
+        import subprocess
+        msgids = [m.strip() for m in args.msgids.split(",") if m.strip()]
+        if not msgids:
+            print("no msgids given", file=sys.stderr)
+            return 2
+        hb_dir = STATE / "heartbeats"
+        hb_dir.mkdir(parents=True, exist_ok=True)
+        for m in msgids:
+            try:
+                (hb_dir / f"{m}.stop").unlink()
+            except OSError:
+                pass
+        subprocess.Popen(
+            [sys.executable, str(BASE / "heartbeat.py"),
+             str(STATE), str(HOOK_STATE), ",".join(msgids)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True)
+        print(json.dumps({"heartbeat_started": msgids}, ensure_ascii=False))
+        return 0
+    if args.cmd == "heartbeat-stop":
+        msgids = [m.strip() for m in args.msgids.split(",") if m.strip()]
+        hb_dir = STATE / "heartbeats"
+        for m in msgids:
+            try:
+                (hb_dir / f"{m}.stop").write_text(str(time.time()), encoding="utf-8")
+            except OSError:
+                pass
+        print(json.dumps({"heartbeat_stopped": msgids}, ensure_ascii=False))
+        return 0
     if args.cmd == "status":
         if STATUS.exists():
             print(STATUS.read_text(encoding="utf-8"))

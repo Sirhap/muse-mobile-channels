@@ -172,6 +172,30 @@ def _queue_summary(hook_state_dir):
     return batch, ids, pcount, len(detached)
 
 
+def _queue_position(other_items, running_ids, now):
+    """1-based queue position for a newly arrived message, given the
+    sender's other still-unanswered messages as (msgid, record) pairs.
+
+    Only messages that are themselves WAITING count as ahead of the
+    new one. Messages in service — the in-flight batch (active +
+    detached, per the hook state) — are being served, not queued,
+    and must not inflate the number (live bug 2026-10-05: a message
+    right behind an in-service burst was told it was 2nd, then the
+    next 3rd, then 4th in queue, because every unanswered earlier
+    message was counted). When the hook snapshot lags and shows no
+    batch yet, the earliest burst cluster among the others is the
+    one being picked up, so it counts as in service too; every
+    later other is genuinely queued ahead of the new message."""
+    running = {str(m) for m in (running_ids or [])}
+    if not running and other_items:
+        t0 = min(float(r.get("ts") or now) for _m, r in other_items)
+        running = {str(m) for m, r in other_items
+                   if float(r.get("ts") or now) - t0
+                   <= BURST_MERGE_WINDOW_SECS}
+    ahead = sum(1 for m, _r in other_items if str(m) not in running)
+    return ahead + 1
+
+
 def is_stop_request(text):
     # Verbatim port of the hook scripts' matcher (~/hooks/scripts/
     # weixin-inbox.sh, wecom-inbox.sh): a stop/cancel imperative must
@@ -1266,8 +1290,9 @@ class Gateway:
                 return None
             now = time.time()
             mid = str(msgid or "")
-            others = [r for m, r in self.feedback_track.items()
-                      if m != mid and r.get("user") == from_user]
+            other_items = [(m, r) for m, r in self.feedback_track.items()
+                           if m != mid and r.get("user") == from_user]
+            others = [r for _m, r in other_items]
             rec = {"user": from_user, "ts": now,
                    "excerpt": _excerpt(text or "", 20),
                    "queued": False, "queued_at": 0.0,
@@ -1288,12 +1313,11 @@ class Gateway:
                 return "stop"
             busy = batch_in_flight(STATE, HOOK_STATE_DIR)
             if busy:
-                # Queue position: the hook snapshot lags up to one
-                # poll, so a burst can repeat the same N. Correct it
-                # with local tracking: every still-unanswered earlier
-                # message is ahead of this one in line.
-                _b, _i, pcount, _d = _queue_summary(HOOK_STATE_DIR)
-                position = max(pcount + 1, len(others)) if others else pcount + 1
+                # Queue position: only messages that are themselves
+                # still waiting count as ahead; the in-flight batch is
+                # being served, not queued (see _queue_position).
+                _b, running_ids, _p, _d = _queue_summary(HOOK_STATE_DIR)
+                position = _queue_position(other_items, running_ids, now)
                 if self._maybe_soft_ack(from_user, text, position=position):
                     rec["kind"] = "queued"
                     rec["queued"] = True
@@ -1315,11 +1339,12 @@ class Gateway:
                     rec["kind"] = "merged"
                     self._queue_notice(from_user, MERGED_ACK_TEXT, "merged")
                     return "merged"
-                # Earlier message still unanswered past the burst
+                # Earlier messages still unanswered past the burst
                 # window (worker cold-starting / starting): this one
-                # is effectively queued behind it even though the hook
-                # snapshot does not show a batch yet.
-                position = max(1, len(others))
+                # queues behind the ones that are themselves waiting,
+                # not behind the burst already being picked up.
+                _b, running_ids, _p, _d = _queue_summary(HOOK_STATE_DIR)
+                position = _queue_position(other_items, running_ids, now)
                 # soft_ack_text requires a hook-visible batch, so in
                 # this lag window queue the same template directly.
                 rec["kind"] = "queued"
