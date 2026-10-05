@@ -39,3 +39,7 @@ cd ../wecom-bot && python3 -m venv .venv && .venv/bin/pip install -r requirement
 
 Syntax-verified 2026-10-04: all Python files compile, shell scripts pass
 `bash -n`, hook JSON parses.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

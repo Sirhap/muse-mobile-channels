@@ -3,6 +3,7 @@
 /*
 !/.gitignore
 !/README.md
+!/LICENSE
 !/weixin-bot/
 !/wecom-bot/
 !/channel-restore/
