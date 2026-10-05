@@ -3,7 +3,11 @@
 /*
 !/.gitignore
 !/README.md
+!/CONTRIBUTING.md
 !/LICENSE
+!/.github/
+!/.github/ISSUE_TEMPLATE/
+!/.github/ISSUE_TEMPLATE/*.md
 !/weixin-bot/
 !/wecom-bot/
 !/channel-restore/
