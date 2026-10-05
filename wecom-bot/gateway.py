@@ -26,6 +26,7 @@ enough; no restart needed.
 
 import asyncio
 import base64
+import fcntl
 import hashlib
 import json
 import os
@@ -37,6 +38,30 @@ from pathlib import Path
 
 import httpx
 import websockets
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+_REPO = Path(__file__).resolve().parent.parent
+if str(_REPO) not in sys.path:
+    sys.path.insert(0, str(_REPO))
+
+from channel_common import (  # noqa: E402
+    SEND_MAX_ATTEMPTS,
+    allocate_subagent_id,
+    append_jsonl as append_jsonl_line,
+    complete_jsonl_lines,
+    load_json_dict,
+    media_filename,
+    merge_queue_admin,
+    muse_home,
+    outbound_file_allowed,
+    parse_jsonl_line,
+    read_offset,
+    retry_backoff_secs,
+    subagent_outcome_default,
+    trim_mapping,
+    atomic_write_text,
+    write_offset,
+)
 
 WS_URL = "wss://openws.work.weixin.qq.com"
 BASE = Path(__file__).resolve().parent
@@ -49,8 +74,14 @@ REQMAP = STATE / "reqmap.json"
 CARDS = STATE / "cards.json"
 STATUS = STATE / "status.json"
 OUTBOX_OFFSET = STATE / "outbox.offset"
+OUTBOX_RETRY = STATE / "outbox_retry.json"
+OUTBOX_PARTIAL = STATE / "outbox_partial.json"
+CANCELLED_FILE = STATE / "cancelled.json"
+SEEN_FILE = STATE / "seen_ids.jsonl"
+LOCK_FILE = STATE / "gateway.lock"
 CRED_FILE = Path(
-    os.environ.get("WECOM_CRED_FILE") or (Path.home() / ".config" / "wecom-bot" / "credentials.env")
+    os.environ.get("WECOM_CRED_FILE")
+    or str(muse_home() / ".config" / "wecom-bot" / "credentials.env")
 )
 
 HEARTBEAT_SECS = 30
@@ -225,8 +256,6 @@ def split_chunks(text: str, limit: int = CHUNK_LIMIT) -> list[str]:
 def decrypt_wecom_media(data: bytes, aeskey_b64: str) -> bytes:
     """AES-256-CBC; key = base64decode(aeskey), IV = first 16 key bytes,
     PKCS#7 padding to a 32-byte block (per the official SDK's decryptFile)."""
-    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-
     key_arg = aeskey_b64.strip()
     key_arg += "=" * (-len(key_arg) % 4)  # callbacks may strip b64 padding
     try:
@@ -285,7 +314,7 @@ def log(msg: str) -> None:
 # the gateway answers itself through the normal proactive send path.
 # Unknown slash text (e.g. /foo) is NOT a command and flows through as
 # an ordinary message.
-HOOK_STATE_DIR = Path(os.environ.get("HOME") or "/home/hatch") / "hooks" / "state" / "wecom-bot"
+HOOK_STATE_DIR = muse_home() / "hooks" / "state" / "wecom-bot"
 CLI_WRAPPER = BASE / "wecom"
 CHAN_LABEL = "企业微信"
 
@@ -371,6 +400,29 @@ def _write_hook_json(hook_state_dir, filename, obj):
         tmp.write_text(json.dumps(obj, ensure_ascii=False), encoding="utf-8")
         os.replace(tmp, hook_state_dir / filename)
         return True
+    except OSError:
+        return False
+
+
+def enqueue_queue_admin(hook_state_dir, action, msgids) -> bool:
+    """Merge this clear/drop into an unconsumed queue_admin.json."""
+    path = hook_state_dir / "queue_admin.json"
+    lock_path = hook_state_dir / "queue_admin.lock"
+    try:
+        hook_state_dir.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a+") as lock_handle:
+            fcntl.flock(lock_handle, fcntl.LOCK_EX)
+            try:
+                existing = _read_json_file(path, None)
+                merged = merge_queue_admin(
+                    existing if isinstance(existing, dict) else None,
+                    action,
+                    msgids,
+                    time.time(),
+                )
+                return _write_hook_json(hook_state_dir, "queue_admin.json", merged)
+            finally:
+                fcntl.flock(lock_handle, fcntl.LOCK_UN)
     except OSError:
         return False
 
@@ -712,22 +764,8 @@ def _append_jsonl_file(path, obj):
 
 
 def slash_subagent_next_id(state_dir):
-    """Allocate the next job id (S<n>) from the sequence file in the
-    gateway state dir. This process is the only writer of that file,
-    so a plain read/increment/replace is race-free here. Ids keep
-    increasing across restarts and are never reused."""
-    p = state_dir / "subagent_seq.json"
-    data = _read_json_file(p, {}) or {}
-    n = data.get("next") if isinstance(data, dict) else None
-    if not isinstance(n, int) or n < 1:
-        n = 1
-    try:
-        tmp = p.with_name(p.name + ".tmp")
-        tmp.write_text(json.dumps({"next": n + 1}), encoding="utf-8")
-        os.replace(tmp, p)
-    except OSError:
-        pass
-    return f"S{n}"
+    """Allocate the next job id (S<n>), or None if it cannot be saved."""
+    return allocate_subagent_id(state_dir)
 
 
 def _subagent_jobs_read(hook_state_dir):
@@ -821,11 +859,10 @@ def slash_subagent_stop_ack(hook_state_dir, job_id):
 # re-checks every reply at dispatch so even a bypassed CLI
 # cannot deliver an unlabeled or mislabeled job result.
 
-def _forced_subagent_label(jid, content):
+def _forced_subagent_label(jid, content, status=None):
     """Return content whose first line opens with the authoritative
-    label 【副助手 #<jid> <outcome>】. An existing label keeps its
-    outcome word (完成/失败/已停止) and any text after it, with the job
-    id corrected to jid; a missing label is prepended as 完成."""
+    label 【副助手 #<jid> <outcome>】. A missing label follows the job
+    status and the reply text instead of always claiming 完成."""
     text = content or ""
     if not text.strip():
         return text
@@ -842,7 +879,8 @@ def _forced_subagent_label(jid, content):
                 tail = head[end + 1:].strip()
                 break
     if outcome is None:
-        return f"【副助手 #{jid} 完成】\n" + text
+        outcome = subagent_outcome_default(text, status)
+        return f"【副助手 #{jid} {outcome}】\n" + text
     new_first = f"【副助手 #{jid} {outcome}】" + (f" {tail}" if tail else "")
     return new_first + (sep + rest if sep else "")
 
@@ -858,7 +896,7 @@ def normalize_subagent_content(msgid, content):
         return content
     for jid, rec in jobs.items():
         if isinstance(rec, dict) and str(rec.get("msgid")) == str(msgid):
-            return _forced_subagent_label(str(jid), content)
+            return _forced_subagent_label(str(jid), content, rec.get("status"))
     return content
 
 def load_credentials() -> tuple[str, str, set[str]]:
@@ -908,7 +946,25 @@ class Gateway:
         self.seen_msgids: set[str] = set()
         self.reqmap: dict[str, str] = {}
         self.cards: dict[str, dict] = {}
+        self._lock_fd = None
+        self._kicked = False
+        self._acquire_instance_lock()
         self._load_persisted()
+
+    def _acquire_instance_lock(self) -> None:
+        """Refuse a second local process. Two subscriptions kick each other."""
+        STATE.mkdir(parents=True, exist_ok=True)
+        fd = open(LOCK_FILE, "a+")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            fd.close()
+            raise RuntimeError(f"another gateway instance already holds {LOCK_FILE}")
+        fd.seek(0)
+        fd.truncate()
+        fd.write(str(os.getpid()))
+        fd.flush()
+        self._lock_fd = fd
 
     # ---------- persistence helpers ----------
 
@@ -922,6 +978,17 @@ class Gateway:
                             self.seen_msgids.add(entry["msgid"])
                     except json.JSONDecodeError:
                         continue
+            except OSError:
+                pass
+        if SEEN_FILE.exists():
+            try:
+                for line in SEEN_FILE.read_text(encoding="utf-8").splitlines():
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(entry, dict) and entry.get("msgid"):
+                        self.seen_msgids.add(str(entry["msgid"]))
             except OSError:
                 pass
         if REQMAP.exists():
@@ -961,11 +1028,20 @@ class Gateway:
         }
         self._save_cards()
 
+    def _mark_seen(self, msgid: str) -> None:
+        """Remember msgid in memory and on disk so a restart can dedupe."""
+        if not msgid or str(msgid) in self.seen_msgids:
+            return
+        self.seen_msgids.add(str(msgid))
+        try:
+            append_jsonl_line(SEEN_FILE, {"msgid": str(msgid)})
+        except OSError:
+            self.seen_msgids.discard(str(msgid))
+
     def _save_reqmap(self) -> None:
-        # keep only the most recent 200 mappings
-        if len(self.reqmap) > 200:
-            items = list(self.reqmap.items())[-200:]
-            self.reqmap = dict(items)
+        # Keep open streams even when the map is trimmed. 200 was short
+        # enough to drop a reply route inside the 24-hour answer window.
+        self.reqmap = trim_mapping(list(self.reqmap.items()), 2000, set(self.open_streams))
         tmp = REQMAP.with_suffix(".tmp")
         tmp.write_text(json.dumps(self.reqmap, ensure_ascii=False), encoding="utf-8")
         tmp.replace(REQMAP)
@@ -989,8 +1065,44 @@ class Gateway:
 
     @staticmethod
     def append_jsonl(path: Path, obj: dict) -> None:
-        with path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        append_jsonl_line(path, obj)
+
+    def _event_allowed(self, userid: str) -> bool:
+        """Same allowlist as ordinary messages. Empty allowlist allows all."""
+        if not self.allow_users:
+            return True
+        if userid and userid in self.allow_users:
+            return True
+        log(f"ignored event from non-allowlisted user {userid}")
+        return False
+
+    @staticmethod
+    def _cancelled_ids() -> set:
+        try:
+            rows = json.loads(CANCELLED_FILE.read_text(encoding="utf-8"))
+            return {str(row.get("msgid")) for row in rows if isinstance(row, dict) and row.get("msgid")}
+        except (OSError, json.JSONDecodeError, UnicodeError):
+            return set()
+
+    @staticmethod
+    def _load_retry() -> dict:
+        return load_json_dict(OUTBOX_RETRY)
+
+    @staticmethod
+    def _save_retry(data: dict) -> None:
+        try:
+            atomic_write_text(OUTBOX_RETRY, json.dumps(data))
+        except OSError:
+            pass
+
+    def _load_partial(self) -> dict:
+        return load_json_dict(OUTBOX_PARTIAL)
+
+    def _save_partial(self, data: dict) -> None:
+        try:
+            atomic_write_text(OUTBOX_PARTIAL, json.dumps(data))
+        except OSError:
+            pass
 
     @staticmethod
     def _delivered_reply_before(item: dict) -> bool:
@@ -1078,20 +1190,30 @@ class Gateway:
 
     # ---------- slash commands ----------
 
-    async def _send_slash_ack(self, chatid, chattype, ack):
-        resp = await self.send_frame(
-            {
-                "cmd": "aibot_send_msg",
-                "headers": {"req_id": self.new_req_id("send")},
-                "body": {
-                    "chatid": chatid,
-                    "chat_type": 2 if chattype == "group" else 1,
-                    "msgtype": "markdown",
-                    "markdown": {"content": ack},
+    async def _send_slash_ack(self, chatid, chattype, ack, req_id=""):
+        """Answer a slash command on the callback req_id when we have one.
+
+        A proactive send alone leaves the callback unanswered. The same
+        text is the reply, so it is not also sent a second time.
+        """
+        if req_id:
+            resp = await self.respond(
+                req_id, {"msgtype": "markdown", "markdown": {"content": ack}},
+            )
+        else:
+            resp = await self.send_frame(
+                {
+                    "cmd": "aibot_send_msg",
+                    "headers": {"req_id": self.new_req_id("send")},
+                    "body": {
+                        "chatid": chatid,
+                        "chat_type": 2 if chattype == "group" else 1,
+                        "msgtype": "markdown",
+                        "markdown": {"content": ack},
+                    },
                 },
-            },
-            wait_response=True,
-        )
+                wait_response=True,
+            )
         if isinstance(resp, dict) and resp.get("errcode") == 0:
             self.msgs_sent += 1
         elif isinstance(resp, dict) and resp.get("errcode") not in (None, 0):
@@ -1143,12 +1265,14 @@ class Gateway:
                         ack = "排队中没有消息可清。"
                     else:
                         texts = _inbox_texts(STATE)
-                        _write_hook_json(HOOK_STATE_DIR, "queue_admin.json",
-                                         {"ts": time.time(), "action": "clear",
-                                          "msgids": [m for m, _t in pend]})
+                        wrote = enqueue_queue_admin(
+                            HOOK_STATE_DIR, "clear", [m for m, _t in pend])
                         excerpts = "、".join(f"「{_excerpt(texts.get(m, ''))}」" for m, _t in pend)
-                        ack = (f"已提交清除排队消息 {len(pend)} 条：{excerpts}。"
-                               f"约 5 秒内生效。正在跑的任务不受影响。")
+                        if wrote:
+                            ack = (f"已提交清除排队消息 {len(pend)} 条：{excerpts}。"
+                                   f"约 5 秒内生效。正在跑的任务不受影响。")
+                        else:
+                            ack = "清除排队失败：暂时写不了队列指令，请稍后再试。"
                 elif qtokens[0] == "drop" and len(qtokens) == 2 and qtokens[1].isdigit():
                     pend = _pending_sorted(HOOK_STATE_DIR)
                     n = int(qtokens[1])
@@ -1157,10 +1281,11 @@ class Gateway:
                     else:
                         mid = pend[n - 1][0]
                         texts = _inbox_texts(STATE)
-                        _write_hook_json(HOOK_STATE_DIR, "queue_admin.json",
-                                         {"ts": time.time(), "action": "drop",
-                                          "msgids": [mid]})
-                        ack = f"已提交删除排队第 {n} 条：「{_excerpt(texts.get(mid, ''))}」，约 5 秒内生效。"
+                        wrote = enqueue_queue_admin(HOOK_STATE_DIR, "drop", [mid])
+                        if wrote:
+                            ack = f"已提交删除排队第 {n} 条：「{_excerpt(texts.get(mid, ''))}」，约 5 秒内生效。"
+                        else:
+                            ack = "删除排队失败：暂时写不了队列指令，请稍后再试。"
                 else:
                     return None  # unknown /queue subcommand: not a command
             elif name == "subagent":
@@ -1183,7 +1308,9 @@ class Gateway:
                 else:
                     jid = slash_subagent_next_id(STATE)
                     mid = str(msgid or "")
-                    if _append_jsonl_file(HOOK_STATE_DIR / "subagent_requests.jsonl",
+                    if not jid:
+                        ack = "派发失败：暂时无法登记副助手任务，请稍后再试。"
+                    elif _append_jsonl_file(HOOK_STATE_DIR / "subagent_requests.jsonl",
                                           {"job_id": jid, "msgid": mid,
                                            "text": arg, "ts": time.time()}):
                         if mid:
@@ -1210,15 +1337,17 @@ class Gateway:
                 active = bool(batch.get("msgids"))
                 if not active:
                     if arg:
-                        await self._send_slash_ack(chatid, chattype,
-                                                   "当前没有任务在跑，这条会直接处理。")
+                        await self._send_slash_ack(
+                            chatid, chattype,
+                            "当前没有任务在跑，这条会直接处理。", req_id)
                         return ("rewrite", arg)
                     ack = "当前没有任务在跑，下一条消息会直接处理。"
                 elif arg:
                     _write_hook_json(HOOK_STATE_DIR, "jump_request.json", {"ts": time.time()})
                     await self._send_slash_ack(
                         chatid, chattype,
-                        f"已强制插队：排队的 {pcount + 1} 条立即处理，前面的长任务继续在跑。")
+                        f"已强制插队：排队的 {pcount + 1} 条立即处理，前面的长任务继续在跑。",
+                        req_id)
                     return ("rewrite", arg)
                 elif pcount > 0:
                     _write_hook_json(HOOK_STATE_DIR, "jump_request.json", {"ts": time.time()})
@@ -1228,7 +1357,7 @@ class Gateway:
                                      {"ts": time.time(), "armed": True})
                     ack = "已武装插队：你下一条消息会立即插队处理，前面的长任务继续在跑。"
             if ack is not None:
-                await self._send_slash_ack(chatid, chattype, ack)
+                await self._send_slash_ack(chatid, chattype, ack, req_id)
             log(f"slash /{name} handled for chat {chatid}")
             return "handled"
         except Exception as e:  # never let a command break the inbound flow
@@ -1264,8 +1393,6 @@ class Gateway:
         if msgid and msgid in self.seen_msgids:
             log(f"duplicate msgid {msgid}, skipped")
             return
-        if msgid:
-            self.seen_msgids.add(msgid)
         msgtype = body.get("msgtype", "")
         # Parse like the OpenClaw plugin's message-parser: plain text, voice
         # transcription, mixed text/image, quoted content, and media refs.
@@ -1287,6 +1414,8 @@ class Gateway:
                         text_parts.append(c)
                 elif itype == "image":
                     _collect_media("image", item.get("image"))
+                elif itype == "video":
+                    _collect_media("video", item.get("video"))
         else:
             if (body.get("text") or {}).get("content"):
                 text_parts.append(body["text"]["content"])
@@ -1296,6 +1425,8 @@ class Gateway:
                 _collect_media("image", body.get("image"))
             if msgtype == "file":
                 _collect_media("file", body.get("file"))
+            if msgtype == "video":
+                _collect_media("video", body.get("video"))
         quote = body.get("quote") or {}
         if quote:
             qtext = ""
@@ -1308,7 +1439,8 @@ class Gateway:
             _collect_media("image", quote.get("image"))
             _collect_media("file", quote.get("file"))
         for m in media:
-            text_parts.append("[图片]" if m["kind"] == "image" else "[文件]")
+            labels = {"image": "[图片]", "file": "[文件]", "video": "[视频]"}
+            text_parts.append(labels.get(m["kind"], "[文件]"))
         text = "\n".join(text_parts)
         chattype = body.get("chattype", "")
         from_userid = (body.get("from") or {}).get("userid", "")
@@ -1322,6 +1454,7 @@ class Gateway:
             # before the inbox write — they never wake a worker.
             slash = await self._slash_dispatch(text, chatid, chattype, msgid, req_id)
             if slash == "handled":
+                self._mark_seen(msgid)
                 self.msgs_received += 1
                 self.write_status()
                 return
@@ -1362,6 +1495,7 @@ class Gateway:
         if msgtype == "text" and stripped.lower() == "ping":
             entry["auto_handled"] = True
             self.append_jsonl(INBOX, entry)
+            self._mark_seen(msgid)
             resp = await self.respond(
                 req_id, {"msgtype": "markdown", "markdown": {"content": "pong ✅ 网关在线"}}
             )
@@ -1370,6 +1504,7 @@ class Gateway:
                 self.msgs_sent += 1
         else:
             self.append_jsonl(INBOX, entry)
+            self._mark_seen(msgid)
             if not slash_rewritten:
                 # Soft ack: if a batch is in flight this message just
                 # joined the pending queue — acknowledge immediately
@@ -1415,6 +1550,8 @@ class Gateway:
         from_userid = (body.get("from") or {}).get("userid", "")
         log(f"event {etype} from {from_userid}")
         if etype == "enter_chat":
+            if not self._event_allowed(from_userid):
+                return
             resp = await self.send_frame(
                 {
                     "cmd": "aibot_respond_welcome_msg",
@@ -1431,10 +1568,21 @@ class Gateway:
                 self.msgs_sent += 1
             self.write_status()
         elif etype == "disconnected_event":
+            self._kicked = True
             self.last_error = "kicked by a newer connection (disconnected_event)"
             log("WARNING: disconnected_event received; another connection replaced this one")
             self.write_status()
+            try:
+                await self.ws.close()
+            except Exception:
+                pass
         elif etype == "template_card_event":
+            if not self._event_allowed(from_userid):
+                return
+            event_msgid = str(body.get("msgid") or "")
+            if event_msgid and event_msgid in self.seen_msgids:
+                log(f"duplicate event msgid {event_msgid}, skipped")
+                return
             # A button on a confirm card was clicked. Record the click as a
             # NON-auto-handled inbox entry so the agent wake hook picks it
             # up, remember how to reach this chat for the agent's follow-up
@@ -1527,6 +1675,7 @@ class Gateway:
                 },
             )
             self.msgs_received += 1
+            self._mark_seen(str(msgid or ""))
             if task_id:
                 try:
                     resp = await self.send_frame(
@@ -1559,6 +1708,12 @@ class Gateway:
                     log(f"template_card_event {task_id}: card update failed: {e!r}")
             self.write_status()
         elif etype == "feedback_event":
+            if not self._event_allowed(from_userid):
+                return
+            event_msgid = str(body.get("msgid") or "")
+            if event_msgid and event_msgid in self.seen_msgids:
+                log(f"duplicate event msgid {event_msgid}, skipped")
+                return
             # The user gave feedback (e.g. like/dislike) on a bot reply.
             # Stream replies carry feedback.id="fb-<msgid>" (set on the
             # first stream frame), so the verdict can be traced back. The
@@ -1618,6 +1773,7 @@ class Gateway:
                 },
             )
             self.msgs_received += 1
+            self._mark_seen(str(msgid or ""))
             log(f"feedback_event id={fb_id} type={fb_type} orig={orig_msgid}")
             self.write_status()
         else:
@@ -1699,20 +1855,28 @@ class Gateway:
             url, aeskey = m.get("url", ""), m.get("aeskey", "")
             if not url or not aeskey:
                 continue
-            try:
-                r = await client.get(url, timeout=httpx.Timeout(20.0, connect=10.0))
-                r.raise_for_status()
-                data = r.content
-                if len(data) > 25 * 1024 * 1024:
-                    log(f"media {msgid}/{i}: too large ({len(data)} bytes), skipped")
-                    continue
-                plain = decrypt_wecom_media(data, aeskey)
-                path = MEDIA_DIR / f"{msgid}-{i}.{sniff_ext(plain)}"
-                path.write_bytes(plain)
-                m["local_path"] = str(path)
-                log(f"media {msgid}/{i}: saved {path} ({len(plain)} bytes)")
-            except Exception as e:
-                log(f"media {msgid}/{i}: download/decrypt failed: {e!r}")
+            last_error: Exception | None = None
+            for _attempt in range(3):
+                try:
+                    r = await client.get(url, timeout=httpx.Timeout(20.0, connect=10.0))
+                    r.raise_for_status()
+                    data = r.content
+                    if len(data) > 25 * 1024 * 1024:
+                        log(f"media {msgid}/{i}: too large ({len(data)} bytes), skipped")
+                        last_error = None
+                        break
+                    plain = decrypt_wecom_media(data, aeskey)
+                    path = MEDIA_DIR / media_filename(msgid, i, sniff_ext(plain))
+                    path.write_bytes(plain)
+                    m["local_path"] = str(path)
+                    log(f"media {msgid}/{i}: saved {path} ({len(plain)} bytes)")
+                    last_error = None
+                    break
+                except Exception as e:
+                    last_error = e
+                    await asyncio.sleep(1)
+            if last_error is not None:
+                log(f"media {msgid}/{i}: download/decrypt failed: {last_error!r}")
 
     async def upload_media(self, data: bytes, mtype: str, filename: str) -> str:
         chunk_size = 512 * 1024
@@ -1800,12 +1964,14 @@ class Gateway:
     # ---------- outbox ----------
 
     def _outbox_offset(self) -> int:
-        try:
-            return int(OUTBOX_OFFSET.read_text().strip() or 0)
-        except (OSError, ValueError):
-            return 0
+        return read_offset(OUTBOX_OFFSET)
 
     async def outbox_loop(self) -> None:
+        """Send outbox rows. A transient failure stays at the head and backs off.
+
+        Dead-letter after SEND_MAX_ATTEMPTS so one poison row cannot block
+        the channel, and a single timeout cannot drop the only copy.
+        """
         while True:
             await asyncio.sleep(1.0)
             await self.check_stream_watchdog()
@@ -1814,38 +1980,77 @@ class Gateway:
             offset = self._outbox_offset()
             try:
                 size = OUTBOX.stat().st_size
-                if size < offset:  # file truncated/rotated
+                if size < offset:
                     offset = 0
                 if size == offset:
                     continue
-                with OUTBOX.open("rb") as f:
-                    f.seek(offset)
-                    chunk = f.read()
+                with OUTBOX.open("rb") as handle:
+                    handle.seek(offset)
+                    data = handle.read()
             except OSError as e:
                 log(f"outbox read error: {e}")
                 continue
-            lines = chunk.split(b"\n")
             consumed = 0
-            for raw_line in lines:
-                if not raw_line.strip():
+            retry = self._load_retry()
+            for raw_line in complete_jsonl_lines(data):
+                parsed = parse_jsonl_line(raw_line)
+                if parsed is None or parsed.get("__invalid__"):
+                    if parsed and parsed.get("__invalid__"):
+                        log(f"outbox: skipping bad line at offset {offset + consumed}")
                     consumed += len(raw_line) + 1
+                    try:
+                        write_offset(OUTBOX_OFFSET, offset + consumed)
+                    except OSError:
+                        pass
                     continue
-                try:
-                    item = json.loads(raw_line.decode("utf-8"))
-                except (json.JSONDecodeError, UnicodeDecodeError):
-                    log(f"outbox: skipping bad line at offset {offset + consumed}")
-                    consumed += len(raw_line) + 1
-                    continue
+                item = parsed
+                item_id = str(item.get("id") or "")
+                rec = retry.get(item_id) if item_id else None
+                if rec and float(rec.get("next") or 0) > time.time():
+                    try:
+                        write_offset(OUTBOX_OFFSET, offset + consumed)
+                    except OSError:
+                        pass
+                    await asyncio.sleep(min(float(rec["next"]) - time.time(), 30.0))
+                    break
                 ok = await self.dispatch_outbox_item(item)
-                consumed += len(raw_line) + 1
-                try:
-                    OUTBOX_OFFSET.write_text(str(offset + consumed))
-                except OSError:
-                    pass
                 if not ok:
-                    # still consume: failures are recorded in results log;
-                    # retrying forever would block the queue
-                    pass
+                    attempts = int((rec or {}).get("n") or 0) + 1
+                    if item_id and attempts >= SEND_MAX_ATTEMPTS:
+                        self.append_jsonl(OUTBOX_RESULTS, {
+                            "id": item_id,
+                            "mode": item.get("mode", ""),
+                            "ts": int(time.time()),
+                            "ok": False,
+                            "errmsg": f"dead-lettered after {attempts} failed attempts; queue unblocked",
+                            "deadletter": True,
+                        })
+                        log(f"outbox {item.get('mode')} {item_id}: dead-lettered after {attempts} attempts")
+                        retry.pop(item_id, None)
+                        self._save_retry(retry)
+                        ok = True
+                    else:
+                        if item_id:
+                            retry[item_id] = {
+                                "n": attempts,
+                                "next": time.time() + retry_backoff_secs(attempts),
+                            }
+                            self._save_retry(retry)
+                        try:
+                            write_offset(OUTBOX_OFFSET, offset + consumed)
+                        except OSError:
+                            pass
+                        await asyncio.sleep(2.0)
+                        break
+                if ok:
+                    if item_id and item_id in retry:
+                        retry.pop(item_id, None)
+                        self._save_retry(retry)
+                    consumed += len(raw_line) + 1
+                    try:
+                        write_offset(OUTBOX_OFFSET, offset + consumed)
+                    except OSError:
+                        pass
 
     async def dispatch_outbox_item(self, item: dict) -> bool:
         item_id = item.get("id", "")
@@ -1855,6 +2060,12 @@ class Gateway:
             content = normalize_subagent_content(item.get("msgid", ""), content)
         result = {"id": item_id, "mode": mode, "ts": int(time.time()), "ok": False}
         _mid = str(item.get("msgid", "") or "")
+        if _mid and _mid in self._cancelled_ids():
+            result["errmsg"] = "cancelled"
+            result["cancelled"] = True
+            self.append_jsonl(OUTBOX_RESULTS, result)
+            log(f"outbox {mode} {item_id}: skipped, cancelled msgid={_mid}")
+            return True
         if mode in ("update", "reply_file") and _mid and self._delivered_reply_before(item):
             result["errmsg"] = "suppressed: msgid already has a delivered formal reply"
             result["suppressed"] = True
@@ -1912,7 +2123,9 @@ class Gateway:
                             "stream": {"id": stream_id, "finish": True, "content": chunks[0]},
                         },
                     )
-                    if resp.get("errcode") != 0:
+                    if resp.get("errcode") == -1:
+                        log(f"outbox reply {item_id}: stream finish ack timed out; retrying the stream, not a second markdown")
+                    elif resp.get("errcode") != 0:
                         log(f"outbox reply {item_id}: stream finish failed errcode={resp.get('errcode')}, falling back to markdown")
                         resp = None
                 if resp is None:
@@ -1969,9 +2182,15 @@ class Gateway:
                     log(f"outbox reply_file {item_id}: {result['errmsg']}")
                     return False
                 fpath = item.get("file_path", "")
-                data = Path(fpath).read_bytes()
+                file_path = Path(fpath)
+                if not outbound_file_allowed(file_path, CRED_FILE, [muse_home(), STATE, BASE, Path("/tmp")]):
+                    result["errmsg"] = f"file path is not allowed: {fpath}"
+                    self.append_jsonl(OUTBOX_RESULTS, result)
+                    log(f"outbox reply_file {item_id}: {result['errmsg']}")
+                    return True
+                data = file_path.read_bytes()
                 mtype = media_type_for_path(fpath)
-                media_id = await self.upload_media(data, mtype, Path(fpath).name)
+                media_id = await self.upload_media(data, mtype, file_path.name)
                 resp = await self.respond(
                     orig_req_id,
                     {"msgtype": mtype, mtype: {"media_id": media_id}},
@@ -2114,9 +2333,15 @@ class Gateway:
                 chatid = item.get("chatid", "")
                 chat_type = int(item.get("chat_type", 1))
                 fpath = item.get("file_path", "")
-                data = Path(fpath).read_bytes()
+                file_path = Path(fpath)
+                if not outbound_file_allowed(file_path, CRED_FILE, [muse_home(), STATE, BASE, Path("/tmp")]):
+                    result["errmsg"] = f"file path is not allowed: {fpath}"
+                    self.append_jsonl(OUTBOX_RESULTS, result)
+                    log(f"outbox send_file {item_id}: {result['errmsg']}")
+                    return True
+                data = file_path.read_bytes()
                 mtype = media_type_for_path(fpath)
-                media_id = await self.upload_media(data, mtype, Path(fpath).name)
+                media_id = await self.upload_media(data, mtype, file_path.name)
                 resp = await self.send_frame(
                     {
                         "cmd": "aibot_send_msg",
@@ -2139,7 +2364,7 @@ class Gateway:
             result["ok"] = resp.get("errcode") == 0
             if result["ok"]:
                 self.msgs_sent += 1
-                if mode == "reply":
+                if mode in ("reply", "reply_file", "reply_confirm"):
                     self.open_streams.pop(str(item.get("msgid", "")), None)
         except Exception as e:
             result["errmsg"] = f"exception: {e}"
@@ -2210,11 +2435,13 @@ class Gateway:
                     self.write_status()
                 await asyncio.sleep(30)
                 continue
+            started = time.time()
             try:
                 reason = await self.run_session(bot_id, secret)
             except Exception as e:
                 reason = f"exception: {e}"
                 self.last_error = reason
+            lived = time.time() - started
             self.connected = False
             if self.state == "auth_failed":
                 # wrong credentials will not fix themselves; also avoids
@@ -2227,13 +2454,23 @@ class Gateway:
                 continue
             self.state = "reconnecting"
             self.write_status()
+            if self._kicked:
+                reason = "kicked by a newer connection"
+                backoff = max(backoff, 60)
+                self._kicked = False
+            elif lived >= 60:
+                backoff = 5
             log(f"session ended ({reason}); reconnecting in {backoff}s")
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 120)
 
 
 def main() -> None:
-    gw = Gateway()
+    try:
+        gw = Gateway()
+    except RuntimeError as e:
+        log(f"refusing to start: {e}")
+        sys.exit(1)
     gw.write_status()
     try:
         asyncio.run(gw.run())

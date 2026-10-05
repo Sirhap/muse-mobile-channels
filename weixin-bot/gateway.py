@@ -25,8 +25,32 @@ import sys
 import time
 import uuid
 from pathlib import Path
+from urllib.parse import quote
 
 import httpx
+
+_REPO = Path(__file__).resolve().parent.parent
+if str(_REPO) not in sys.path:
+    sys.path.insert(0, str(_REPO))
+
+from channel_common import (  # noqa: E402
+    allocate_subagent_id,
+    append_jsonl as append_jsonl_line,
+    complete_jsonl_lines,
+    load_json_dict,
+    media_filename,
+    media_url_allowed,
+    merge_queue_admin,
+    muse_home,
+    outbound_file_allowed,
+    parse_feedback_clear_line,
+    parse_jsonl_line,
+    retry_backoff_secs as _retry_backoff_secs,
+    subagent_outcome_default,
+    trim_mapping,
+    write_offset,
+    read_offset,
+)
 
 BASE = Path(__file__).resolve().parent
 STATE = BASE / "state"
@@ -72,17 +96,18 @@ SEND_FILE_CDN500_DROP_AFTER_FAILURES = 3
 
 
 def retry_backoff_secs(attempt: int) -> float:
-    return min(20.0 * (2 ** max(0, attempt - 1)), 300.0)
+    """Seconds before the next send attempt. See channel_common."""
+    return _retry_backoff_secs(attempt)
 STATUS = STATE / "status.json"
 SYNC_FILE = STATE / "sync.json"
 CONTEXT_FILE = STATE / "context.json"
 LOCK_FILE = STATE / "gateway.lock"
 CANCELLED_FILE = STATE / "cancelled.json"
 FEEDBACK_CLEAR_FILE = STATE / "feedback_clear.jsonl"
+SEEN_FILE = STATE / "seen_ids.jsonl"
 CRED_FILE = Path(
-    os.environ.get(
-        "ILINK_CRED_FILE", str(Path.home() / ".config" / "weixin-bot" / "credentials.env")
-    )
+    os.environ.get("ILINK_CRED_FILE")
+    or str(muse_home() / ".config" / "weixin-bot" / "credentials.env")
 )
 
 DEFAULT_BASE_URL = "https://ilinkai.weixin.qq.com"
@@ -107,7 +132,7 @@ def log(msg: str) -> None:
 # the gateway answers itself through the normal proactive send path.
 # Unknown slash text (e.g. /foo) is NOT a command and flows through as
 # an ordinary message.
-HOOK_STATE_DIR = Path(os.environ.get("HOME") or "/home/hatch") / "hooks" / "state" / "weixin-bot"
+HOOK_STATE_DIR = muse_home() / "hooks" / "state" / "weixin-bot"
 CLI_WRAPPER = BASE / "weixin"
 CHAN_LABEL = "个人微信"
 
@@ -193,6 +218,33 @@ def _write_hook_json(hook_state_dir, filename, obj):
         tmp.write_text(json.dumps(obj, ensure_ascii=False), encoding="utf-8")
         os.replace(tmp, hook_state_dir / filename)
         return True
+    except OSError:
+        return False
+
+
+def enqueue_queue_admin(hook_state_dir, action, msgids) -> bool:
+    """Merge this clear/drop into an unconsumed queue_admin.json.
+
+    Two commands inside the hook's poll window used to overwrite each
+    other. The hook still reads one object with action and msgids.
+    """
+    path = hook_state_dir / "queue_admin.json"
+    lock_path = hook_state_dir / "queue_admin.lock"
+    try:
+        hook_state_dir.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a+") as lock_handle:
+            fcntl.flock(lock_handle, fcntl.LOCK_EX)
+            try:
+                existing = _read_json_file(path, None)
+                merged = merge_queue_admin(
+                    existing if isinstance(existing, dict) else None,
+                    action,
+                    msgids,
+                    time.time(),
+                )
+                return _write_hook_json(hook_state_dir, "queue_admin.json", merged)
+            finally:
+                fcntl.flock(lock_handle, fcntl.LOCK_UN)
     except OSError:
         return False
 
@@ -626,22 +678,9 @@ def _append_jsonl_file(path, obj):
 
 
 def slash_subagent_next_id(state_dir):
-    """Allocate the next job id (S<n>) from the sequence file in the
-    gateway state dir. This process is the only writer of that file,
-    so a plain read/increment/replace is race-free here. Ids keep
-    increasing across restarts and are never reused."""
-    p = state_dir / "subagent_seq.json"
-    data = _read_json_file(p, {}) or {}
-    n = data.get("next") if isinstance(data, dict) else None
-    if not isinstance(n, int) or n < 1:
-        n = 1
-    try:
-        tmp = p.with_name(p.name + ".tmp")
-        tmp.write_text(json.dumps({"next": n + 1}), encoding="utf-8")
-        os.replace(tmp, p)
-    except OSError:
-        pass
-    return f"S{n}"
+    """Allocate the next job id (S<n>), or None if the sequence file
+    cannot be replaced. A failed replace must not reuse the same id."""
+    return allocate_subagent_id(state_dir)
 
 
 def _subagent_jobs_read(hook_state_dir):
@@ -735,11 +774,12 @@ def slash_subagent_stop_ack(hook_state_dir, job_id):
 # re-checks every reply at dispatch so even a bypassed CLI
 # cannot deliver an unlabeled or mislabeled job result.
 
-def _forced_subagent_label(jid, content):
+def _forced_subagent_label(jid, content, status=None):
     """Return content whose first line opens with the authoritative
     label 【副助手 #<jid> <outcome>】. An existing label keeps its
     outcome word (完成/失败/已停止) and any text after it, with the job
-    id corrected to jid; a missing label is prepended as 完成."""
+    id corrected to jid. A missing label uses the job status and the
+    reply text so a failed job is not relabeled 完成."""
     text = content or ""
     if not text.strip():
         return text
@@ -756,7 +796,8 @@ def _forced_subagent_label(jid, content):
                 tail = head[end + 1:].strip()
                 break
     if outcome is None:
-        return f"【副助手 #{jid} 完成】\n" + text
+        outcome = subagent_outcome_default(text, status)
+        return f"【副助手 #{jid} {outcome}】\n" + text
     new_first = f"【副助手 #{jid} {outcome}】" + (f" {tail}" if tail else "")
     return new_first + (sep + rest if sep else "")
 
@@ -772,7 +813,7 @@ def normalize_subagent_content(msgid, content):
         return content
     for jid, rec in jobs.items():
         if isinstance(rec, dict) and str(rec.get("msgid")) == str(msgid):
-            return _forced_subagent_label(str(jid), content)
+            return _forced_subagent_label(str(jid), content, rec.get("status"))
     return content
 
 def base_info() -> dict:
@@ -1002,6 +1043,17 @@ class Gateway:
                         continue
             except OSError:
                 pass
+        if SEEN_FILE.exists():
+            try:
+                for line in SEEN_FILE.read_text(encoding="utf-8").splitlines():
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(entry, dict) and entry.get("msgid"):
+                        self.seen_msgids.add(str(entry["msgid"]))
+            except OSError:
+                pass
         if SYNC_FILE.exists():
             try:
                 self.sync_buf = json.loads(SYNC_FILE.read_text(encoding="utf-8")).get("buf", "")
@@ -1016,9 +1068,52 @@ class Gateway:
     def _save_sync(self) -> None:
         self._atomic_write(SYNC_FILE, json.dumps({"buf": self.sync_buf}))
 
+    def _mark_seen(self, msgid: str) -> None:
+        """Remember msgid in memory and on disk.
+
+        Disk is what survives a restart. Slash commands never enter the
+        inbox, so this file is the only record that they already ran.
+        """
+        if not msgid or str(msgid) in self.seen_msgids:
+            return
+        self.seen_msgids.add(str(msgid))
+        try:
+            append_jsonl_line(SEEN_FILE, {"msgid": str(msgid)})
+        except OSError:
+            self.seen_msgids.discard(str(msgid))
+
+    def _route_for(self, msgid: str) -> dict:
+        """Reply route from memory, or rebuilt from the inbox tail."""
+        info = self.context.get(str(msgid)) or {}
+        if info.get("from_user_id"):
+            return info
+        if not INBOX.exists():
+            return info
+        try:
+            lines = INBOX.read_text(encoding="utf-8").splitlines()[-500:]
+        except OSError:
+            return info
+        for line in reversed(lines):
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if str(entry.get("msgid") or "") != str(msgid):
+                continue
+            recovered = {
+                "from_user_id": entry.get("from_user_id", ""),
+                "group_id": entry.get("group_id", ""),
+                "context_token": entry.get("context_token", ""),
+                "client_id": "",
+            }
+            if recovered["from_user_id"]:
+                self.context[str(msgid)] = recovered
+                return recovered
+        return info
+
     def _save_context(self) -> None:
-        if len(self.context) > 200:
-            self.context = dict(list(self.context.items())[-200:])
+        pinned = set(self.feedback_track)
+        self.context = trim_mapping(list(self.context.items()), 2000, pinned)
         self._atomic_write(CONTEXT_FILE, json.dumps(self.context, ensure_ascii=False))
 
     def write_status(self) -> None:
@@ -1038,8 +1133,7 @@ class Gateway:
 
     @staticmethod
     def append_jsonl(path: Path, obj: dict) -> None:
-        with path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        append_jsonl_line(path, obj)
 
     # ---------- HTTP ----------
 
@@ -1182,14 +1276,16 @@ class Gateway:
                         ack = "排队中没有消息可清。"
                     else:
                         texts = _inbox_texts(STATE)
-                        _write_hook_json(HOOK_STATE_DIR, "queue_admin.json",
-                                         {"ts": time.time(), "action": "clear",
-                                          "msgids": [m for m, _t in pend]})
-                        self._feedback_forget([m for m, _t in pend],
-                                              source="queue-clear")
+                        wrote = enqueue_queue_admin(
+                            HOOK_STATE_DIR, "clear", [m for m, _t in pend])
                         excerpts = "、".join(f"「{_excerpt(texts.get(m, ''))}」" for m, _t in pend)
-                        ack = (f"已提交清除排队消息 {len(pend)} 条：{excerpts}。"
-                               f"约 5 秒内生效。正在跑的任务不受影响。")
+                        if wrote:
+                            self._feedback_forget([m for m, _t in pend],
+                                                  source="queue-clear")
+                            ack = (f"已提交清除排队消息 {len(pend)} 条：{excerpts}。"
+                                   f"约 5 秒内生效。正在跑的任务不受影响。")
+                        else:
+                            ack = "清除排队失败：暂时写不了队列指令，请稍后再试。"
                 elif qtokens[0] == "drop" and len(qtokens) == 2 and qtokens[1].isdigit():
                     pend = _pending_sorted(HOOK_STATE_DIR)
                     n = int(qtokens[1])
@@ -1198,11 +1294,12 @@ class Gateway:
                     else:
                         mid = pend[n - 1][0]
                         texts = _inbox_texts(STATE)
-                        _write_hook_json(HOOK_STATE_DIR, "queue_admin.json",
-                                         {"ts": time.time(), "action": "drop",
-                                          "msgids": [mid]})
-                        self._feedback_forget([mid], source="queue-drop")
-                        ack = f"已提交删除排队第 {n} 条：「{_excerpt(texts.get(mid, ''))}」，约 5 秒内生效。"
+                        wrote = enqueue_queue_admin(HOOK_STATE_DIR, "drop", [mid])
+                        if wrote:
+                            self._feedback_forget([mid], source="queue-drop")
+                            ack = f"已提交删除排队第 {n} 条：「{_excerpt(texts.get(mid, ''))}」，约 5 秒内生效。"
+                        else:
+                            ack = "删除排队失败：暂时写不了队列指令，请稍后再试。"
                 else:
                     return None  # unknown /queue subcommand: not a command
             elif name == "subagent":
@@ -1225,7 +1322,9 @@ class Gateway:
                 else:
                     jid = slash_subagent_next_id(STATE)
                     mid = str(msg.get("message_id", "") or "")
-                    if _append_jsonl_file(HOOK_STATE_DIR / "subagent_requests.jsonl",
+                    if not jid:
+                        ack = "派发失败：暂时无法登记副助手任务，请稍后再试。"
+                    elif _append_jsonl_file(HOOK_STATE_DIR / "subagent_requests.jsonl",
                                           {"job_id": jid, "msgid": mid,
                                            "text": arg, "ts": time.time()}):
                         if mid:
@@ -1281,6 +1380,7 @@ class Gateway:
         self.append_jsonl(OUTBOX, {
             "id": f"{prefix}-{uuid.uuid4().hex}",
             "mode": "send",
+            "notice": True,
             "to_user_id": from_user,
             "content": content,
         })
@@ -1368,8 +1468,10 @@ class Gateway:
                 # Queue position: only messages that are themselves
                 # still waiting count as ahead; the in-flight batch is
                 # being served, not queued (see _queue_position).
-                _b, running_ids, _p, _d = _queue_summary(HOOK_STATE_DIR)
+                _b, running_ids, pending_count, _d = _queue_summary(HOOK_STATE_DIR)
                 position = _queue_position(other_items, running_ids, now)
+                if pending_count:
+                    position = max(position, int(pending_count) + 1)
                 if self._maybe_soft_ack(from_user, text, position=position):
                     rec["kind"] = "queued"
                     rec["queued"] = True
@@ -1395,8 +1497,10 @@ class Gateway:
                 # window (worker cold-starting / starting): this one
                 # queues behind the ones that are themselves waiting,
                 # not behind the burst already being picked up.
-                _b, running_ids, _p, _d = _queue_summary(HOOK_STATE_DIR)
+                _b, running_ids, pending_count, _d = _queue_summary(HOOK_STATE_DIR)
                 position = _queue_position(other_items, running_ids, now)
+                if pending_count:
+                    position = max(position, int(pending_count) + 1)
                 # soft_ack_text requires a hook-visible batch, so in
                 # this lag window queue the same template directly.
                 rec["kind"] = "queued"
@@ -1479,9 +1583,9 @@ class Gateway:
             try:
                 raw = tmp.read_bytes().decode("utf-8", "replace")
                 for line in raw.splitlines():
-                    line = line.strip()
-                    if line:
-                        ids.append(line)
+                    msgid = parse_feedback_clear_line(line)
+                    if msgid:
+                        ids.append(msgid)
             finally:
                 try:
                     tmp.unlink()
@@ -1561,13 +1665,14 @@ class Gateway:
         if msgid and msgid in self.seen_msgids:
             return
         from_user = msg.get("from_user_id", "")
-        if owner_id and from_user and from_user != owner_id:
-            log(f"ignored message from non-owner user {from_user}")
-            if msgid:
-                self.seen_msgids.add(msgid)
+        if not owner_id:
+            log(f"ILINK_USER_ID is unset; ignoring message {msgid}")
+            self._mark_seen(msgid)
             return
-        if msgid:
-            self.seen_msgids.add(msgid)
+        if from_user and from_user != owner_id:
+            log(f"ignored message from non-owner user {from_user}")
+            self._mark_seen(msgid)
+            return
         text, media = self._extract_text(msg)
         slash_rewritten = False
         if not media:
@@ -1575,6 +1680,7 @@ class Gateway:
             # before the inbox write — they never wake a worker.
             slash = await self._slash_dispatch(client, creds, msg, text, from_user)
             if slash == "handled":
+                self._mark_seen(msgid)
                 self.msgs_received += 1
                 self.write_status()
                 return
@@ -1593,7 +1699,6 @@ class Gateway:
             "context_token": msg.get("context_token", ""),
             "raw": self._sanitize_raw(msg),
         }
-        self.append_jsonl(INBOX, entry)
         client_id = f"muse-{uuid.uuid4().hex}" if msgid else ""
         if msgid:
             self.context[msgid] = {
@@ -1603,6 +1708,8 @@ class Gateway:
                 "client_id": client_id,
             }
             self._save_context()
+        self.append_jsonl(INBOX, entry)
+        self._mark_seen(msgid)
         if not slash_rewritten:
             # Scenario-aware arrival feedback: exactly one immediate
             # notice per message, chosen by queue/burst/media/stop
@@ -1625,18 +1732,52 @@ class Gateway:
 
     # ---------- sending ----------
 
+    def _store_partial(self, item_id: str, rec: dict) -> None:
+        """Merge rec into the partial-progress record for one outbox row."""
+        if not item_id:
+            return
+        stored = self._load_partial()
+        prev = stored.get(item_id) or {}
+        merged = dict(prev) if isinstance(prev, dict) else {}
+        merged.update(rec)
+        stored[item_id] = merged
+        self._save_partial(stored)
+
     async def send_text(self, client: httpx.AsyncClient, creds: dict,
                         to_user_id: str, content: str, context_token: str = "",
-                        client_id: str = "", message_state: int = 2) -> dict:
+                        client_id: str = "", message_state: int = 2,
+                        item_id: str = "") -> dict:
+        """Send content in chunks. item_id resumes after a partial success.
+
+        Each chunk keeps the client_id it was first given, and a retry
+        starts at the first chunk that did not succeed. That stops a
+        long reply from repeating its opening paragraphs.
+        """
         content = filter_markdown_weixin(content)
         last: dict = {"ret": 0}
-        chunks = split_chunks(content)
+        chunks = split_chunks(content) or [""]
+        partial = self._load_partial().get(item_id, {}) if item_id else {}
+        if not isinstance(partial, dict):
+            partial = {}
+        start = int(partial.get("sent_chunks") or 0)
+        client_ids = dict(partial.get("client_ids") or {})
         for i, part in enumerate(chunks):
+            if i < start:
+                continue
+            key = str(i)
+            cid = client_ids.get(key) or (
+                client_id if i == 0 and client_id else f"muse-{uuid.uuid4().hex}"
+            )
+            client_ids[key] = cid
+            if item_id:
+                partial["client_ids"] = client_ids
+                partial["sent_chunks"] = start
+                self._store_partial(item_id, partial)
             body = {
                 "msg": {
                     "from_user_id": "",
                     "to_user_id": to_user_id,
-                    "client_id": client_id if (client_id and i == 0) else f"muse-{uuid.uuid4().hex}",
+                    "client_id": cid,
                     "message_type": 2,
                     "message_state": message_state,
                     "item_list": [{"type": 1, "text_item": {"text": part}}],
@@ -1651,13 +1792,15 @@ class Gateway:
             if last.get("ret") not in (None, 0):
                 return last
             self.msgs_sent += 1
+            start = i + 1
+            if item_id:
+                partial["sent_chunks"] = start
+                self._store_partial(item_id, partial)
         return last
 
     # ---------- media & typing ----------
 
     async def _download_media(self, client: httpx.AsyncClient, media: list[dict], msgid: str) -> None:
-        from urllib.parse import quote
-
         MEDIA_DIR.mkdir(parents=True, exist_ok=True)
         for i, m in enumerate(media):
             if m.get("kind") == "voice":
@@ -1681,6 +1824,9 @@ class Gateway:
                 log(f"media {msgid}/{i}: bad aes key: {e}")
             if not url or key is None:
                 continue
+            if not media_url_allowed(url):
+                log(f"media {msgid}/{i}: refused non-Tencent url host")
+                continue
             try:
                 r = await client.get(url, timeout=httpx.Timeout(30.0, connect=10.0))
                 r.raise_for_status()
@@ -1689,7 +1835,7 @@ class Gateway:
                     log(f"media {msgid}/{i}: too large ({len(data)} bytes), skipped")
                     continue
                 plain = aes_ecb_decrypt(data, key)
-                path = MEDIA_DIR / f"{msgid}-{i}.{sniff_ext(plain)}"
+                path = MEDIA_DIR / media_filename(msgid, i, sniff_ext(plain))
                 path.write_bytes(plain)
                 m["local_path"] = str(path)
                 if m.get("kind") == "voice":
@@ -1809,7 +1955,10 @@ class Gateway:
 
     async def _deliver_file(self, client: httpx.AsyncClient, creds: dict,
                             to_user_id: str, fpath: str, context_token: str = "") -> dict:
-        data = Path(fpath).read_bytes()
+        path = Path(fpath)
+        if not outbound_file_allowed(path, CRED_FILE, [muse_home(), STATE, BASE, Path("/tmp")]):
+            raise PermissionError(f"refusing to send file outside allowed directories: {fpath}")
+        data = path.read_bytes()
         mtype = weixin_media_type(fpath)
         up = await self._upload_media(client, creds, to_user_id, data, mtype)
         item = self._media_item(mtype, up, Path(fpath).name, len(data))
@@ -1818,18 +1967,11 @@ class Gateway:
     # ---------- outbox ----------
 
     def _outbox_offset(self) -> int:
-        try:
-            return int(OUTBOX_OFFSET.read_text().strip() or 0)
-        except (OSError, ValueError):
-            return 0
+        return read_offset(OUTBOX_OFFSET)
 
     @staticmethod
     def _load_retry() -> dict:
-        try:
-            d = json.loads(OUTBOX_RETRY.read_text(encoding="utf-8"))
-            return d if isinstance(d, dict) else {}
-        except Exception:
-            return {}
+        return load_json_dict(OUTBOX_RETRY)
 
     @staticmethod
     def _save_retry(d: dict) -> None:
@@ -1998,40 +2140,41 @@ class Gateway:
         typing_after = None  # (to, token_ctx, status)
         try:
             if mode == "reply":
-                info = self.context.get(str(item.get("msgid", "")), {})
+                info = self._route_for(str(item.get("msgid", "")))
                 to = info.get("from_user_id", "")
                 token_ctx = info.get("context_token", "")
                 if not to:
                     result["errmsg"] = f"no context stored for msgid {item.get('msgid')}"
                     self.append_jsonl(OUTBOX_RESULTS, result)
                     log(f"outbox reply {item_id}: {result['errmsg']}")
-                    return True  # permanent: do not retry forever
+                    return False
                 resp = await self.send_text(
-                    client, creds, to, content, token_ctx, message_state=2,
+                    client, creds, to, content, token_ctx,
+                    info.get("client_id", ""), 2, item_id,
                 )
                 if resp.get("ret") in (None, 0):
                     typing_after = (to, token_ctx, 2)
             elif mode == "update":
-                info = self.context.get(str(item.get("msgid", "")), {})
+                info = self._route_for(str(item.get("msgid", "")))
                 to = info.get("from_user_id", "")
                 if not to:
                     result["errmsg"] = f"no context stored for msgid {item.get('msgid')}"
                     self.append_jsonl(OUTBOX_RESULTS, result)
                     log(f"outbox update {item_id}: {result['errmsg']}")
-                    return True
+                    return False
                 resp = await self.send_text(
                     client, creds, to, content, info.get("context_token", ""),
-                    message_state=2,
+                    info.get("client_id", ""), 2, f"{item_id}:update",
                 )
             elif mode == "reply_file":
-                info = self.context.get(str(item.get("msgid", "")), {})
+                info = self._route_for(str(item.get("msgid", "")))
                 to = info.get("from_user_id", "")
                 token_ctx = info.get("context_token", "")
                 if not to:
                     result["errmsg"] = f"no context stored for msgid {item.get('msgid')}"
                     self.append_jsonl(OUTBOX_RESULTS, result)
                     log(f"outbox reply_file {item_id}: {result['errmsg']}")
-                    return True
+                    return False
                 fpath = item.get("file_path", "")
                 if not Path(fpath).exists():
                     result["errmsg"] = f"file not found: {fpath}"
@@ -2047,7 +2190,8 @@ class Gateway:
                 # Send the caption at most once per outbox item.
                 if not self._caption_already_sent(item_id):
                     cap_resp = await self.send_text(
-                        client, creds, to, caption, token_ctx, message_state=2,
+                        client, creds, to, caption, token_ctx,
+                        "", 2, f"{item_id}:caption",
                     )
                     if cap_resp.get("ret") not in (None, 0):
                         result["ret"] = cap_resp.get("ret")
@@ -2060,7 +2204,10 @@ class Gateway:
                 if resp.get("ret") in (None, 0):
                     typing_after = (to, token_ctx, 2)
             elif mode == "send":
-                resp = await self.send_text(client, creds, item.get("to_user_id", ""), content)
+                resp = await self.send_text(
+                    client, creds, item.get("to_user_id", ""), content,
+                    "", "", 2, item_id,
+                )
             elif mode == "send_file":
                 to = item.get("to_user_id", "")
                 fpath = item.get("file_path", "")
@@ -2069,7 +2216,9 @@ class Gateway:
                     self.append_jsonl(OUTBOX_RESULTS, result)
                     return True
                 if content and not self._caption_already_sent(item_id):
-                    cap_resp = await self.send_text(client, creds, to, content)
+                    cap_resp = await self.send_text(
+                        client, creds, to, content, "", "", 2, f"{item_id}:caption",
+                    )
                     if cap_resp.get("ret") not in (None, 0):
                         result["ret"] = cap_resp.get("ret")
                         result["errmsg"] = cap_resp.get("errmsg", "")
@@ -2086,7 +2235,7 @@ class Gateway:
             result["ret"] = resp.get("ret") if isinstance(resp, dict) else None
             result["errmsg"] = resp.get("errmsg", "") if isinstance(resp, dict) else ""
             result["ok"] = (resp.get("ret") in (None, 0)) if isinstance(resp, dict) else False
-        except FileNotFoundError as e:
+        except (FileNotFoundError, PermissionError) as e:
             result["errmsg"] = f"exception: {e}"
             self.append_jsonl(OUTBOX_RESULTS, result)
             log(f"outbox {mode} {item_id}: ok=False err={result['errmsg']}")
@@ -2096,7 +2245,7 @@ class Gateway:
             self.append_jsonl(OUTBOX_RESULTS, result)
             log(f"outbox {mode} {item_id}: ok=False err={result['errmsg']}")
             self.write_status()
-            if mode == "send" and self._send_notice_should_drop(item_id):
+            if mode == "send" and item.get("notice") and self._send_notice_should_drop(item_id):
                 return True  # wedge guard: dropped, see helper
             if mode == "send_file" and self._send_file_should_drop(
                     item_id, result["errmsg"]):
@@ -2118,11 +2267,12 @@ class Gateway:
             asyncio.create_task(
                 self._typing_best_effort(client, creds, typing_after[0], typing_after[1], typing_after[2])
             )
-        if mode == "send":
+        if mode == "send" and item.get("notice"):
             # Wedge guard bookkeeping (result row already persisted
             # above): a success resets the row's failure streak; the
             # 5th consecutive failure drops the row (consumed) so a
             # permanently rejected notice can never wedge the outbox.
+            # Real CLI sends are not notices and use the dead-letter path.
             if result["ok"]:
                 self._send_notice_failures.pop(item_id, None)
             elif self._send_notice_should_drop(item_id):
@@ -2155,15 +2305,18 @@ class Gateway:
                 data = f.read()
             consumed = 0
             retry = self._load_retry()
-            for raw_line in data.split(b"\n"):
-                if not raw_line.strip():
+            for raw_line in complete_jsonl_lines(data):
+                parsed = parse_jsonl_line(raw_line)
+                if parsed is None or parsed.get("__invalid__"):
+                    if parsed and parsed.get("__invalid__"):
+                        log(f"outbox: skipping bad line at offset {offset + consumed}")
                     consumed += len(raw_line) + 1
+                    try:
+                        write_offset(OUTBOX_OFFSET, offset + consumed)
+                    except OSError:
+                        pass
                     continue
-                try:
-                    item = json.loads(raw_line.decode("utf-8"))
-                except (json.JSONDecodeError, UnicodeDecodeError):
-                    consumed += len(raw_line) + 1
-                    continue
+                item = parsed
                 item_id = str(item.get("id") or "")
                 rec = retry.get(item_id) if item_id else None
                 if rec and float(rec.get("next") or 0) > time.time():
@@ -2174,7 +2327,7 @@ class Gateway:
                     # "prepare failed" penalty alive and wedged the
                     # whole outbox on 2026-10-05).
                     try:
-                        OUTBOX_OFFSET.write_text(str(offset + consumed))
+                        write_offset(OUTBOX_OFFSET, offset + consumed)
                     except OSError:
                         pass
                     await asyncio.sleep(
@@ -2208,7 +2361,7 @@ class Gateway:
                                 + retry_backoff_secs(attempts)}
                             self._save_retry(retry)
                         try:
-                            OUTBOX_OFFSET.write_text(str(offset + consumed))
+                            write_offset(OUTBOX_OFFSET, offset + consumed)
                         except OSError:
                             pass
                         await asyncio.sleep(2.0)
@@ -2224,7 +2377,7 @@ class Gateway:
                             self._save_partial(partial)
                     consumed += len(raw_line) + 1
                     try:
-                        OUTBOX_OFFSET.write_text(str(offset + consumed))
+                        write_offset(OUTBOX_OFFSET, offset + consumed)
                     except OSError:
                         pass
 
@@ -2277,8 +2430,11 @@ class Gateway:
                         self.write_status()
                         log("session stale (-14); handing back for probe-retry")
                         return "stale_token"
-                    log(f"getupdates ret={ret} errcode={errcode} errmsg={resp.get('errmsg')}")
-                    await asyncio.sleep(3)
+                    failures += 1
+                    log(f"getupdates ret={ret} errcode={errcode} errmsg={resp.get('errmsg')} ({failures})")
+                    if failures >= 5:
+                        return f"getupdates failed repeatedly: ret={ret} errcode={errcode}"
+                    await asyncio.sleep(min(2 * failures, 10))
                     continue
                 new_buf = resp.get("get_updates_buf")
                 msgs = resp.get("msgs") or []

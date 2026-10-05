@@ -11,6 +11,9 @@
 !/weixin-bot/
 !/wecom-bot/
 !/channel-restore/
+!/channel_common.py
+!/tests/
+!/tests/**
 !/slash-commands-2026-10-04.md
 
 # Runtime / local-only — never commit

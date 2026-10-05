@@ -17,7 +17,9 @@ dead batch "alive" for long:
   -> exit;
 - a stop marker appears (CLI `heartbeat-stop`) -> exit;
 - MAX_AGE_SECS elapse -> exit (a still-working worker restarts it).
-On exit it removes its own heartbeat files.
+On exit it removes only the heartbeat files this process owns.
+A newer loop for the same msgid keeps its own pid file, so this
+exit cannot delete the successor's beat.
 
 Robustness (hardened 2026-10-05 after a transition incident where
 a takeover worker started its heartbeat only after its batch had
@@ -32,6 +34,9 @@ ever beating):
   "unknown", never as "gone".
 - Every exit is logged (one line) to heartbeats/loop.log so a
   future incident is diagnosable from disk.
+- Once a msgid is cancelled, the beat file is not refreshed. The
+  grace window still delays the exit so a flap cannot kill the
+  loop instantly, but a stale beat lets the hook fail-stop.
 
 Interval/grace/max-age can be overridden via HATCH_HB_INTERVAL,
 HATCH_HB_GRACE and HATCH_HB_MAXAGE (seconds) for testing; the
@@ -44,11 +49,17 @@ import sys
 import time
 from pathlib import Path
 
+_REPO = Path(__file__).resolve().parent.parent
+if str(_REPO) not in sys.path:
+    sys.path.insert(0, str(_REPO))
+
+from channel_common import read_pid_file, safe_child_path
+
 
 def _env_secs(name: str, default: float) -> float:
     try:
-        v = float(os.environ.get(name) or "")
-        return v if v > 0 else default
+        value = float(os.environ.get(name) or "")
+        return value if value > 0 else default
     except ValueError:
         return default
 
@@ -65,68 +76,97 @@ def _read_json(path: Path):
         return json.loads(path.read_text(encoding="utf-8")), "ok"
     except FileNotFoundError:
         return None, "missing"
-    except Exception:
+    except (OSError, json.JSONDecodeError, UnicodeError):
         return None, "bad"
 
 
+def _sleep_until(seconds: float, stop_paths: list[Path]) -> bool:
+    """Sleep up to seconds. Return True if a stop marker appears."""
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        if any(path.exists() for path in stop_paths):
+            return True
+        time.sleep(min(1.0, max(0.0, deadline - time.time())))
+    return any(path.exists() for path in stop_paths)
+
+
 def main() -> int:
+    """Run until the batch ends, is cancelled, or is explicitly stopped."""
     state_dir = Path(sys.argv[1])
     hook_state_dir = Path(sys.argv[2])
-    msgids = [m for m in sys.argv[3].split(",") if m]
+    msgids = [item for item in sys.argv[3].split(",") if item]
     if not msgids:
         return 2
     hb_dir = state_dir / "heartbeats"
     hb_dir.mkdir(parents=True, exist_ok=True)
+    paths: list[tuple[str, Path, Path, Path]] = []
+    for msgid in msgids:
+        beat = safe_child_path(hb_dir, msgid)
+        if beat is None:
+            continue
+        paths.append((msgid, beat, beat.with_name(beat.name + ".pid"), beat.with_name(beat.name + ".stop")))
+    if not paths:
+        return 2
     started = time.time()
     absent_checks = 0
+    pid = os.getpid()
+
+    def owns(msgid_pid: Path) -> bool:
+        return read_pid_file(msgid_pid) == pid
 
     def cleanup() -> None:
-        for m in msgids:
-            for suffix in ("", ".stop"):
+        for _msgid, beat, pid_path, _stop in paths:
+            if not owns(pid_path):
+                continue
+            for target in (beat, pid_path):
                 try:
-                    (hb_dir / f"{m}{suffix}").unlink()
+                    target.unlink()
                 except OSError:
                     pass
 
     def bail(reason: str) -> int:
         try:
-            with open(hb_dir / "loop.log", "a", encoding="utf-8") as f:
-                f.write(json.dumps({
-                    "ts": time.time(), "msgids": msgids,
+            with open(hb_dir / "loop.log", "a", encoding="utf-8") as handle:
+                handle.write(json.dumps({
+                    "ts": time.time(),
+                    "msgids": [item[0] for item in paths],
+                    "pid": pid,
                     "age_secs": round(time.time() - started, 1),
-                    "exit": reason}, ensure_ascii=False) + "\n")
+                    "exit": reason,
+                }, ensure_ascii=False) + "\n")
         except OSError:
             pass
         cleanup()
         return 0
 
+    stop_paths = [item[3] for item in paths]
     while True:
         now = time.time()
         age = now - started
-        # Exit: stop marker (explicit instruction — honored at once).
-        if any((hb_dir / f"{m}.stop").exists() for m in msgids):
+        if any(path.exists() for path in stop_paths):
             return bail("stop_marker")
-        # Batch membership: 'live' / 'absent' / 'unknown'.
-        batch, bstate = _read_json(hook_state_dir / "active_batch.json")
-        if bstate == "bad":
+        batch, batch_state = _read_json(hook_state_dir / "active_batch.json")
+        if batch_state == "bad":
             membership = "unknown"
-        elif bstate == "missing":
+        elif batch_state == "missing":
             membership = "absent"
         elif isinstance(batch, dict):
-            live = {str(m) for m in (batch.get("msgids") or [])}
-            for d in batch.get("detached") or []:
-                if isinstance(d, dict):
-                    live |= {str(m) for m in (d.get("msgids") or [])}
-            membership = "live" if any(m in live for m in msgids) else "absent"
+            live = {str(item) for item in (batch.get("msgids") or [])}
+            for detached in batch.get("detached") or []:
+                if isinstance(detached, dict):
+                    live |= {str(item) for item in (detached.get("msgids") or [])}
+            membership = "live" if any(item[0] in live for item in paths) else "absent"
         else:
             membership = "unknown"
-        # Cancellation (unreadable file = not cancelled this cycle).
-        canc, _ = _read_json(state_dir / "cancelled.json")
-        canc_ids = set()
+        canc, _state = _read_json(state_dir / "cancelled.json")
+        canc_ids: set[str] = set()
         if isinstance(canc, list):
-            canc_ids = {str(r.get("msgid")) for r in canc
-                        if isinstance(r, dict)}
-        cancelled = any(m in canc_ids for m in msgids)
+            canc_ids = {
+                str(row.get("msgid"))
+                for row in canc
+                if isinstance(row, dict)
+            }
+        cancelled = any(item[0] in canc_ids for item in paths)
         if age >= GRACE_SECS:
             if cancelled:
                 return bail("cancelled")
@@ -136,18 +176,21 @@ def main() -> int:
                     return bail("batch_gone")
             elif membership == "live":
                 absent_checks = 0
-        # Beat.
-        for m in msgids:
-            p = hb_dir / m
-            tmp = p.with_name(f"{m}.tmp.{os.getpid()}")
-            try:
-                tmp.write_text(str(now), encoding="utf-8")
-                tmp.replace(p)
-            except OSError:
-                pass
+        if not cancelled:
+            for _msgid, beat, pid_path, _stop in paths:
+                tmp_pid = pid_path.with_name(f"{pid_path.name}.tmp.{pid}")
+                tmp_beat = beat.with_name(f"{beat.name}.tmp.{pid}")
+                try:
+                    tmp_pid.write_text(str(pid), encoding="utf-8")
+                    os.replace(tmp_pid, pid_path)
+                    tmp_beat.write_text(str(now), encoding="utf-8")
+                    os.replace(tmp_beat, beat)
+                except OSError:
+                    pass
         if age >= MAX_AGE_SECS:
             return bail("max_age")
-        time.sleep(INTERVAL_SECS)
+        if _sleep_until(INTERVAL_SECS, stop_paths):
+            return bail("stop_marker")
 
 
 if __name__ == "__main__":
