@@ -34,11 +34,51 @@ INBOX = STATE / "inbox.jsonl"
 OUTBOX = STATE / "outbox.jsonl"
 OUTBOX_RESULTS = STATE / "outbox_results.jsonl"
 OUTBOX_OFFSET = STATE / "outbox.offset"
+OUTBOX_RETRY = STATE / "outbox_retry.json"
+OUTBOX_PARTIAL = STATE / "outbox_partial.json"
+# Per-item send retry policy (added 2026-10-05 after a poison
+# reply_file row was retried 138 times in 15 minutes and wedged the
+# whole outbox): a transiently failing head item is retried with
+# exponential backoff instead of every ~3s, and after
+# SEND_MAX_ATTEMPTS failures it is dead-lettered (consumed with a
+# recorded failure) so one bad item can never block the channel.
+# The hot loop also appeared to keep the provider's transient
+# "prepare failed" penalty alive; the backoff gives it room to
+# expire.
+SEND_MAX_ATTEMPTS = 10
+
+# Wedge guard for unbound mode="send" notice rows (2026-10-06): the
+# loop-level policy above dead-letters ANY row after 10 attempts, but
+# decorative notices (softack / thinking / started / waitremind /
+# merged / media) carry no information worth 10 attempts of channel
+# blockage, so dispatch drops one after 5 consecutive failures within
+# the process. Formal rows (reply / reply_file / update / send_file)
+# are never dropped by this guard.
+SEND_NOTICE_DROP_AFTER_FAILURES = 5
+
+# Wedge guard for mode="send_file" rows whose delivery dies at the
+# WeChat CDN upload step (2026-10-06): on 2026-10-05/06 the CDN
+# upload endpoint (novac2c.cdn.weixin.qq.com) returned HTTP 500 for
+# every file size — a provider-side outage — and one queued video
+# send_file row sat at the head of the outbox in backoff while text
+# notices and a formal reply queued behind it. A file that cannot
+# even be uploaded gains nothing from the full 10-attempt
+# dead-letter path, so after 3 consecutive CDN-upload-500 failures
+# within the process the row is consumed (the file stays on disk
+# and can be re-sent / rerouted, e.g. via WeCom). ONLY failures
+# whose errmsg names the CDN host AND a 500 count; every other
+# send_file failure keeps the normal backoff / dead-letter policy.
+SEND_FILE_CDN500_DROP_AFTER_FAILURES = 3
+
+
+def retry_backoff_secs(attempt: int) -> float:
+    return min(20.0 * (2 ** max(0, attempt - 1)), 300.0)
 STATUS = STATE / "status.json"
 SYNC_FILE = STATE / "sync.json"
 CONTEXT_FILE = STATE / "context.json"
 LOCK_FILE = STATE / "gateway.lock"
 CANCELLED_FILE = STATE / "cancelled.json"
+FEEDBACK_CLEAR_FILE = STATE / "feedback_clear.jsonl"
 CRED_FILE = Path(
     os.environ.get(
         "ILINK_CRED_FILE", str(Path.home() / ".config" / "weixin-bot" / "credentials.env")
@@ -905,6 +945,15 @@ class Gateway:
         # transition notices from _feedback_scan_once.
         self.feedback_track: dict[str, dict] = {}
         self.merged_notice_at: dict[str, float] = {}
+        # Per-id consecutive dispatch failure counts for unbound
+        # mode="send" notice rows (wedge guard, see
+        # SEND_NOTICE_DROP_AFTER_FAILURES). Process-local on purpose:
+        # after a restart a bad notice gets a fresh 5 attempts before
+        # being dropped again.
+        self._send_notice_failures: dict[str, int] = {}
+        # Same idea for mode="send_file" rows failing at the WeChat
+        # CDN upload step (see SEND_FILE_CDN500_DROP_AFTER_FAILURES).
+        self._send_file_failures: dict[str, int] = {}
         self.sync_buf = ""
         self._lock_fd = None
         self._acquire_instance_lock()
@@ -1136,6 +1185,8 @@ class Gateway:
                         _write_hook_json(HOOK_STATE_DIR, "queue_admin.json",
                                          {"ts": time.time(), "action": "clear",
                                           "msgids": [m for m, _t in pend]})
+                        self._feedback_forget([m for m, _t in pend],
+                                              source="queue-clear")
                         excerpts = "、".join(f"「{_excerpt(texts.get(m, ''))}」" for m, _t in pend)
                         ack = (f"已提交清除排队消息 {len(pend)} 条：{excerpts}。"
                                f"约 5 秒内生效。正在跑的任务不受影响。")
@@ -1150,6 +1201,7 @@ class Gateway:
                         _write_hook_json(HOOK_STATE_DIR, "queue_admin.json",
                                          {"ts": time.time(), "action": "drop",
                                           "msgids": [mid]})
+                        self._feedback_forget([mid], source="queue-drop")
                         ack = f"已提交删除排队第 {n} 条：「{_excerpt(texts.get(mid, ''))}」，约 5 秒内生效。"
                 else:
                     return None  # unknown /queue subcommand: not a command
@@ -1383,6 +1435,65 @@ class Gateway:
         except Exception:
             pass
 
+    def _feedback_forget(self, msgids, source=""):
+        """Drop feedback_track records WITHOUT a delivered reply:
+        the message was disposed of another way (dropped via /queue
+        admin, or skipped by the hook after an outage), so it must
+        stop counting as unanswered — otherwise its record lingers
+        up to the 7200s prune and inflates later queue positions
+        (residue incident 2026-10-05). Returns the number popped.
+        Fail-silent."""
+        popped = []
+        try:
+            for m in (msgids or []):
+                mid = str(m or "")
+                if mid and mid in self.feedback_track:
+                    self.feedback_track.pop(mid, None)
+                    popped.append(mid)
+            if popped:
+                log(f"feedback_track forget ({source or 'manual'}): "
+                    f"popped {len(popped)} record(s): {','.join(popped)}")
+        except Exception as e:
+            log(f"feedback forget failed (ignored): {e!r}")
+        return len(popped)
+
+    def _consume_feedback_clear(self):
+        """Consume STATE/feedback_clear.jsonl (one msgid per line,
+        appended by the inbox hook when it drops pending messages
+        via /queue admin, and by the main session for hook-side
+        skips). The file is renamed aside before reading so a
+        concurrent append can never lose ids: an append landing
+        after the rename creates a fresh file consumed next scan.
+        Any problem -> fail-silent (the records still age out via
+        the 7200s prune). Returns the number of records popped."""
+        try:
+            if not FEEDBACK_CLEAR_FILE.exists():
+                return 0
+            tmp = FEEDBACK_CLEAR_FILE.with_name(
+                f"feedback_clear.consume.{os.getpid()}.tmp")
+            try:
+                os.replace(FEEDBACK_CLEAR_FILE, tmp)
+            except OSError:
+                return 0  # vanished between exists() and replace()
+            ids = []
+            try:
+                raw = tmp.read_bytes().decode("utf-8", "replace")
+                for line in raw.splitlines():
+                    line = line.strip()
+                    if line:
+                        ids.append(line)
+            finally:
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+            if not ids:
+                return 0
+            return self._feedback_forget(ids, source="clear-file")
+        except Exception as e:
+            log(f"feedback clear consume failed (ignored): {e!r}")
+            return 0
+
     def _feedback_scan_once(self, now=None):
         """Transition notices for queued messages (round 2): poll the
         hook state once and queue, per tracked queued message,
@@ -1394,6 +1505,7 @@ class Gateway:
         other notice. Fail-silent; returns the number queued."""
         try:
             now = now or time.time()
+            self._consume_feedback_clear()
             batch, _ids, _p, _d = _queue_summary(HOOK_STATE_DIR)
             active = {str(m) for m in (batch.get("msgids") or [])}
             for d in (batch.get("detached") or []):
@@ -1712,6 +1824,54 @@ class Gateway:
             return 0
 
     @staticmethod
+    def _load_retry() -> dict:
+        try:
+            d = json.loads(OUTBOX_RETRY.read_text(encoding="utf-8"))
+            return d if isinstance(d, dict) else {}
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _save_retry(d: dict) -> None:
+        try:
+            tmp = OUTBOX_RETRY.with_name(OUTBOX_RETRY.name + ".tmp")
+            tmp.write_text(json.dumps(d), encoding="utf-8")
+            tmp.replace(OUTBOX_RETRY)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _load_partial() -> dict:
+        try:
+            d = json.loads(OUTBOX_PARTIAL.read_text(encoding="utf-8"))
+            return d if isinstance(d, dict) else {}
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _save_partial(d: dict) -> None:
+        try:
+            tmp = OUTBOX_PARTIAL.with_name(OUTBOX_PARTIAL.name + ".tmp")
+            tmp.write_text(json.dumps(d), encoding="utf-8")
+            tmp.replace(OUTBOX_PARTIAL)
+        except OSError:
+            pass
+
+    def _caption_already_sent(self, item_id: str) -> bool:
+        if not item_id:
+            return False
+        return bool((self._load_partial().get(item_id) or {}).get("caption_sent"))
+
+    def _mark_caption_sent(self, item_id: str) -> None:
+        if not item_id:
+            return
+        d = self._load_partial()
+        rec = d.get(item_id) or {}
+        rec["caption_sent"] = int(time.time())
+        d[item_id] = rec
+        self._save_partial(d)
+
+    @staticmethod
     def _cancelled_ids() -> set:
         try:
             rows = json.loads(CANCELLED_FILE.read_text(encoding="utf-8"))
@@ -1767,6 +1927,50 @@ class Gateway:
             )
         except Exception as e:
             log(f"sendtyping best-effort failed (ignored): {e}")
+
+    def _send_notice_should_drop(self, item_id: str) -> bool:
+        """Wedge guard (2026-10-06): count consecutive failed
+        dispatches of an unbound mode="send" notice row in this
+        process; return True once it reaches
+        SEND_NOTICE_DROP_AFTER_FAILURES, so the caller treats the
+        row as consumed instead of retrying it forever (the
+        2026-10-05 softack wedge: one stale queue receipt, rejected
+        by iLink with ret=-2 "prepare failed", blocked every later
+        outbox row behind it). Only ever called for mode="send";
+        formal rows are never dropped here."""
+        n = self._send_notice_failures.get(item_id, 0) + 1
+        self._send_notice_failures[item_id] = n
+        if n >= SEND_NOTICE_DROP_AFTER_FAILURES:
+            self._send_notice_failures.pop(item_id, None)
+            log(f"DROPPING unbound send {item_id} after {n} consecutive "
+                f"failed attempts (wedge guard)")
+            return True
+        return False
+
+    def _send_file_should_drop(self, item_id: str, errmsg: str) -> bool:
+        """Wedge guard (2026-10-06): count consecutive failed
+        dispatches of a mode="send_file" row whose failure is the
+        WeChat CDN upload returning HTTP 500 (errmsg names
+        cdn.weixin.qq.com AND a 500 — the provider-side upload
+        outage of 2026-10-05/06, which rejected every file size).
+        Return True once the streak reaches
+        SEND_FILE_CDN500_DROP_AFTER_FAILURES so the caller treats
+        the row as consumed instead of letting it hold the head of
+        the outbox through the whole 10-attempt dead-letter path.
+        Non-CDN-500 failures never count here; they keep the normal
+        backoff / dead-letter handling. Only ever called for
+        mode="send_file"."""
+        err = errmsg or ""
+        if "cdn.weixin.qq.com" not in err or "500" not in err:
+            return False
+        n = self._send_file_failures.get(item_id, 0) + 1
+        self._send_file_failures[item_id] = n
+        if n >= SEND_FILE_CDN500_DROP_AFTER_FAILURES:
+            self._send_file_failures.pop(item_id, None)
+            log(f"DROPPING send_file {item_id} after {n} consecutive "
+                f"CDN upload 500 failures (wedge guard)")
+            return True
+        return False
 
     async def dispatch_outbox_item(self, client: httpx.AsyncClient, creds: dict, item: dict) -> bool:
         """Return True if the item is consumed (success or permanent drop),
@@ -1835,15 +2039,23 @@ class Gateway:
                     log(f"outbox reply_file {item_id}: {result['errmsg']}")
                     return True
                 caption = content or f"📎 {Path(fpath).name}"
-                cap_resp = await self.send_text(
-                    client, creds, to, caption, token_ctx, message_state=2,
-                )
-                if cap_resp.get("ret") not in (None, 0):
-                    result["ret"] = cap_resp.get("ret")
-                    result["errmsg"] = cap_resp.get("errmsg", "")
-                    self.append_jsonl(OUTBOX_RESULTS, result)
-                    log(f"outbox {mode} {item_id}: ok=False err={result.get('errmsg', '')}")
-                    return False
+                # The caption is a separate text message sent BEFORE
+                # the file. If the file step then fails transiently,
+                # a naive retry re-sends the caption every attempt —
+                # on 2026-10-05 the user received the same caption
+                # ~17 times while the upload kept returning 500.
+                # Send the caption at most once per outbox item.
+                if not self._caption_already_sent(item_id):
+                    cap_resp = await self.send_text(
+                        client, creds, to, caption, token_ctx, message_state=2,
+                    )
+                    if cap_resp.get("ret") not in (None, 0):
+                        result["ret"] = cap_resp.get("ret")
+                        result["errmsg"] = cap_resp.get("errmsg", "")
+                        self.append_jsonl(OUTBOX_RESULTS, result)
+                        log(f"outbox {mode} {item_id}: ok=False err={result.get('errmsg', '')}")
+                        return False
+                    self._mark_caption_sent(item_id)
                 resp = await self._deliver_file(client, creds, to, fpath, token_ctx)
                 if resp.get("ret") in (None, 0):
                     typing_after = (to, token_ctx, 2)
@@ -1856,13 +2068,14 @@ class Gateway:
                     result["errmsg"] = f"file not found: {fpath}"
                     self.append_jsonl(OUTBOX_RESULTS, result)
                     return True
-                if content:
+                if content and not self._caption_already_sent(item_id):
                     cap_resp = await self.send_text(client, creds, to, content)
                     if cap_resp.get("ret") not in (None, 0):
                         result["ret"] = cap_resp.get("ret")
                         result["errmsg"] = cap_resp.get("errmsg", "")
                         self.append_jsonl(OUTBOX_RESULTS, result)
                         return False
+                    self._mark_caption_sent(item_id)
                 resp = await self._deliver_file(
                     client, creds, to, item.get("file_path", "")
                 )
@@ -1883,6 +2096,11 @@ class Gateway:
             self.append_jsonl(OUTBOX_RESULTS, result)
             log(f"outbox {mode} {item_id}: ok=False err={result['errmsg']}")
             self.write_status()
+            if mode == "send" and self._send_notice_should_drop(item_id):
+                return True  # wedge guard: dropped, see helper
+            if mode == "send_file" and self._send_file_should_drop(
+                    item_id, result["errmsg"]):
+                return True  # wedge guard: CDN upload 500, see helper
             return False  # transient: retry, do not advance offset
         # Persist the result BEFORE any cosmetic typing call, so a hang /
         # session drop during typing can never cause a resend on restart.
@@ -1900,6 +2118,25 @@ class Gateway:
             asyncio.create_task(
                 self._typing_best_effort(client, creds, typing_after[0], typing_after[1], typing_after[2])
             )
+        if mode == "send":
+            # Wedge guard bookkeeping (result row already persisted
+            # above): a success resets the row's failure streak; the
+            # 5th consecutive failure drops the row (consumed) so a
+            # permanently rejected notice can never wedge the outbox.
+            if result["ok"]:
+                self._send_notice_failures.pop(item_id, None)
+            elif self._send_notice_should_drop(item_id):
+                return True
+        if mode == "send_file":
+            # Same bookkeeping for the CDN-upload-500 wedge guard:
+            # a success resets the streak; the 3rd consecutive CDN
+            # 500 failure drops the row (consumed) so a dead upload
+            # endpoint cannot hold the outbox head hostage.
+            if result["ok"]:
+                self._send_file_failures.pop(item_id, None)
+            elif self._send_file_should_drop(
+                    item_id, result.get("errmsg", "")):
+                return True
         return bool(result["ok"])
 
     async def outbox_loop(self, client: httpx.AsyncClient, creds: dict) -> None:
@@ -1917,6 +2154,7 @@ class Gateway:
                 f.seek(offset)
                 data = f.read()
             consumed = 0
+            retry = self._load_retry()
             for raw_line in data.split(b"\n"):
                 if not raw_line.strip():
                     consumed += len(raw_line) + 1
@@ -1926,22 +2164,69 @@ class Gateway:
                 except (json.JSONDecodeError, UnicodeDecodeError):
                     consumed += len(raw_line) + 1
                     continue
-                consumed_ok = await self.dispatch_outbox_item(client, creds, item)
-                if not consumed_ok:
-                    # Transient failure (incl. chunk ret!=0): do NOT advance
-                    # offset past this item; retry it on the next cycle /
-                    # after restart instead of silently losing it.
+                item_id = str(item.get("id") or "")
+                rec = retry.get(item_id) if item_id else None
+                if rec and float(rec.get("next") or 0) > time.time():
+                    # Head item is in retry backoff: hold the offset
+                    # and wait for its window instead of hammering
+                    # the provider every cycle (see SEND_MAX_ATTEMPTS
+                    # note: a hot retry loop kept a transient
+                    # "prepare failed" penalty alive and wedged the
+                    # whole outbox on 2026-10-05).
                     try:
                         OUTBOX_OFFSET.write_text(str(offset + consumed))
                     except OSError:
                         pass
-                    await asyncio.sleep(2.0)
+                    await asyncio.sleep(
+                        min(float(rec["next"]) - time.time(), 30.0))
                     break
-                consumed += len(raw_line) + 1
-                try:
-                    OUTBOX_OFFSET.write_text(str(offset + consumed))
-                except OSError:
-                    pass
+                consumed_ok = await self.dispatch_outbox_item(client, creds, item)
+                if not consumed_ok:
+                    # Transient failure (incl. chunk ret!=0): do NOT
+                    # advance offset past this item — but count the
+                    # attempt, back off, and dead-letter the item
+                    # after SEND_MAX_ATTEMPTS so a single poison row
+                    # can never block the channel forever.
+                    attempts = int((rec or {}).get("n") or 0) + 1
+                    if item_id and attempts >= SEND_MAX_ATTEMPTS:
+                        self.append_jsonl(OUTBOX_RESULTS, {
+                            "id": item_id, "mode": item.get("mode", ""),
+                            "ts": int(time.time()), "ok": False,
+                            "errmsg": (f"dead-lettered after {attempts} "
+                                       "failed attempts; queue unblocked"),
+                            "deadletter": True})
+                        log(f"outbox {item.get('mode')} {item_id}: "
+                            f"dead-lettered after {attempts} attempts")
+                        retry.pop(item_id, None)
+                        self._save_retry(retry)
+                        consumed_ok = True
+                    else:
+                        if item_id:
+                            retry[item_id] = {
+                                "n": attempts,
+                                "next": time.time()
+                                + retry_backoff_secs(attempts)}
+                            self._save_retry(retry)
+                        try:
+                            OUTBOX_OFFSET.write_text(str(offset + consumed))
+                        except OSError:
+                            pass
+                        await asyncio.sleep(2.0)
+                        break
+                if consumed_ok:
+                    if item_id and item_id in retry:
+                        retry.pop(item_id, None)
+                        self._save_retry(retry)
+                    if item_id:
+                        partial = self._load_partial()
+                        if item_id in partial:
+                            partial.pop(item_id, None)
+                            self._save_partial(partial)
+                    consumed += len(raw_line) + 1
+                    try:
+                        OUTBOX_OFFSET.write_text(str(offset + consumed))
+                    except OSError:
+                        pass
 
     # ---------- session ----------
 
