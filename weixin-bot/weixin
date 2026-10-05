@@ -1,0 +1,2 @@
+#!/bin/sh
+exec /home/hatch/workspace/weixin-bot/.venv/bin/python /home/hatch/workspace/weixin-bot/weixin_cli.py "$@"

@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Thin wrapper so agents/humans can call: wecom <command> ...
+exec /home/hatch/workspace/wecom-bot/.venv/bin/python /home/hatch/workspace/wecom-bot/wecom_cli.py "$@"

@@ -1,0 +1,11 @@
+[Unit]
+Description=Run channel-restore gateway self-heal every 5 minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+Persistent=true
+Unit=channel-restore.service
+
+[Install]
+WantedBy=timers.target

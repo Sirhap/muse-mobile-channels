@@ -1,0 +1,24 @@
+# Workspace repo: only the channel code is tracked. Everything else in
+# ~/workspace (evidence files, research clones, backups, goals) stays out.
+/*
+!/.gitignore
+!/README.md
+!/weixin-bot/
+!/wecom-bot/
+!/channel-restore/
+!/slash-commands-2026-10-04.md
+
+# Runtime / local-only — never commit
+.venv/
+__pycache__/
+*.pyc
+state/
+*.bak-*
+*.bak
+reply-*.txt
+login-qr.png
+credentials.env
+.env
+
+# Upstream reference clones (not our code)
+wecom-bot/reference/

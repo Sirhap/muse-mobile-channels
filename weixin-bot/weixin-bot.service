@@ -1,0 +1,16 @@
+[Unit]
+Description=Weixin (personal WeChat) iLink gateway for Muse
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/hatch/workspace/weixin-bot
+Environment=ILINK_CRED_FILE=/home/hatch/.config/weixin-bot/credentials.env
+EnvironmentFile=-/etc/environment
+ExecStart=/home/hatch/workspace/weixin-bot/.venv/bin/python /home/hatch/workspace/weixin-bot/gateway.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

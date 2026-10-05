@@ -1,0 +1,17 @@
+[Unit]
+Description=WeCom smart robot long-connection gateway for Muse
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/hatch/workspace/wecom-bot
+ExecStart=/home/hatch/workspace/wecom-bot/.venv/bin/python /home/hatch/workspace/wecom-bot/gateway.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+Environment=WECOM_CRED_FILE=/home/hatch/.config/wecom-bot/credentials.env
+EnvironmentFile=-/etc/environment
+
+[Install]
+WantedBy=multi-user.target

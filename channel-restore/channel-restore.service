@@ -1,0 +1,8 @@
+[Unit]
+Description=Self-heal check for WeCom + Weixin gateways (channel-restore)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/home/hatch/workspace/channel-restore/restore.sh
