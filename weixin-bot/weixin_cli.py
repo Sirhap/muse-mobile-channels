@@ -2,22 +2,39 @@
 """CLI for the Weixin gateway: queue replies/sends, inspect state."""
 
 import argparse
-import fcntl
 import json
 import os
+import subprocess
 import sys
 import time
 import uuid
 from pathlib import Path
+
+_REPO = Path(__file__).resolve().parent.parent
+if str(_REPO) not in sys.path:
+    sys.path.insert(0, str(_REPO))
+
+from channel_common import (  # noqa: E402
+    append_jsonl,
+    load_json_dict,
+    muse_home,
+    pid_alive,
+    read_pid_file,
+    register_cancel,
+    reply_block_reason_for_row,
+    safe_child_name,
+    subagent_outcome_default,
+)
 
 BASE = Path(__file__).resolve().parent
 STATE = BASE / "state"
 INBOX = STATE / "inbox.jsonl"
 OUTBOX = STATE / "outbox.jsonl"
 OUTBOX_RESULTS = STATE / "outbox_results.jsonl"
+OUTBOX_RETRY = STATE / "outbox_retry.json"
 STATUS = STATE / "status.json"
 LOGIN_STATE = STATE / "login.json"
-HOOK_STATE = Path(os.path.expanduser("~")) / "hooks" / "state" / "weixin-bot"
+HOOK_STATE = muse_home() / "hooks" / "state" / "weixin-bot"
 
 
 def read_text_arg(args) -> str:
@@ -52,30 +69,19 @@ def reply_block_reason(msgid: str) -> str | None:
                 if r.get("id"):
                     results[r["id"]] = r
         now = time.time()
+        retry = load_json_dict(OUTBOX_RETRY)
         if OUTBOX.exists():
             for line in OUTBOX.read_text(encoding="utf-8").splitlines():
                 try:
                     o = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if o.get("mode") != "reply" or str(o.get("msgid")) != str(msgid):
-                    continue
-                res = results.get(o.get("id"))
-                if res is not None:
-                    if res.get("ok") is True:
-                        return (
-                            f"msgid {msgid} already has a formal reply that was "
-                            f"delivered successfully (outbox id {o.get('id')})"
-                        )
-                    # ok=false: a failed delivery may legitimately be retried.
-                else:
-                    age = now - float(o.get("queued_at") or now)
-                    if age < REPLY_INFLIGHT_WINDOW_S:
-                        return (
-                            f"msgid {msgid} already has a formal reply queued "
-                            f"{int(age)}s ago with no delivery result yet "
-                            f"(likely still in flight, outbox id {o.get('id')})"
-                        )
+                reason = reply_block_reason_for_row(
+                    msgid, o, results.get(o.get("id")), now, retry,
+                    REPLY_INFLIGHT_WINDOW_S,
+                )
+                if reason:
+                    return reason
     except Exception as e:  # guard must never block on its own failure
         print(f"warning: reply idempotency check failed ({e}); allowing reply",
               file=sys.stderr)
@@ -90,11 +96,10 @@ def reply_block_reason(msgid: str) -> str | None:
 # delivery entrance, and again in the gateway before sending.
 # Non-job replies are never touched. Fail-open on read errors.
 
-def _forced_subagent_label(jid, content):
+def _forced_subagent_label(jid, content, status=None):
     """Return content whose first line opens with the authoritative
-    label 【副助手 #<jid> <outcome>】. An existing label keeps its
-    outcome word (完成/失败/已停止) and any text after it, with the job
-    id corrected to jid; a missing label is prepended as 完成."""
+    label 【副助手 #<jid> <outcome>】. A missing label follows the job
+    status and the reply text instead of always claiming 完成."""
     text = content or ""
     if not text.strip():
         return text
@@ -111,7 +116,8 @@ def _forced_subagent_label(jid, content):
                 tail = head[end + 1:].strip()
                 break
     if outcome is None:
-        return f"【副助手 #{jid} 完成】\n" + text
+        outcome = subagent_outcome_default(text, status)
+        return f"【副助手 #{jid} {outcome}】\n" + text
     new_first = f"【副助手 #{jid} {outcome}】" + (f" {tail}" if tail else "")
     return new_first + (sep + rest if sep else "")
 
@@ -120,31 +126,31 @@ def _subagent_job_id_for_msgid(msgid):
     """Authoritative job id for a msgid from the hook-owned jobs file
     (read-only here); None for ordinary (non-job) msgids."""
     try:
-        p = Path.home() / "hooks" / "state" / BASE.name / "subagent_jobs.json"
+        p = HOOK_STATE / "subagent_jobs.json"
         data = json.loads(p.read_text(encoding="utf-8"))
         jobs = data.get("jobs") if isinstance(data, dict) else None
         if isinstance(jobs, dict):
             for jid, rec in jobs.items():
                 if isinstance(rec, dict) and str(rec.get("msgid")) == str(msgid):
-                    return str(jid)
+                    return str(jid), rec.get("status")
     except Exception:
         pass
     return None
 
 
 def normalize_subagent_reply(msgid, content):
-    jid = _subagent_job_id_for_msgid(msgid)
-    if not jid:
+    found = _subagent_job_id_for_msgid(msgid)
+    if not found:
         return content
-    return _forced_subagent_label(jid, content)
+    jid, status = found
+    return _forced_subagent_label(jid, content, status)
 
 def queue(item: dict) -> str:
+    """Append one outbox row under the shared jsonl lock."""
     item_id = uuid.uuid4().hex[:12]
     item["id"] = item_id
     item["queued_at"] = int(time.time())
-    STATE.mkdir(parents=True, exist_ok=True)
-    with OUTBOX.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(item, ensure_ascii=False) + "\n")
+    append_jsonl(OUTBOX, item)
     return item_id
 
 
@@ -297,23 +303,7 @@ def main() -> int:
         item_id = queue(item)
         print(f"queued send-file id={item_id} to {args.to_user_id}")
     elif args.cmd == "cancel":
-        cpath = STATE / "cancelled.json"
-        STATE.mkdir(parents=True, exist_ok=True)
-        lock_path = STATE / "cancelled.lock"
-        with open(lock_path, "a+") as lock_f:
-            fcntl.flock(lock_f, fcntl.LOCK_EX)
-            rows = []
-            if cpath.exists():
-                try:
-                    rows = json.loads(cpath.read_text(encoding="utf-8"))
-                except Exception:
-                    rows = []
-            if not any(r.get("msgid") == args.msgid for r in rows):
-                rows.append({"msgid": args.msgid, "ts": time.time()})
-                tmp = cpath.with_name(f"{cpath.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
-                tmp.write_text(json.dumps(rows, ensure_ascii=False), encoding="utf-8")
-                tmp.replace(cpath)
-            fcntl.flock(lock_f, fcntl.LOCK_UN)
+        register_cancel(STATE / "cancelled.json", args.msgid)
         print(json.dumps({"cancelled": args.msgid}, ensure_ascii=False))
     elif args.cmd == "cancelled":
         cpath = STATE / "cancelled.json"
@@ -329,13 +319,30 @@ def main() -> int:
         # heartbeat.py). While it runs, the inbox hook counts the
         # batch as alive even if the worker sends no progress: death
         # is judged by heartbeat + outbox, not by silence alone.
-        import subprocess
         msgids = [m.strip() for m in args.msgids.split(",") if m.strip()]
         if not msgids:
             print("no msgids given", file=sys.stderr)
             return 2
+        if any(safe_child_name(m) is None for m in msgids):
+            print("refusing msgid that is not a single path segment", file=sys.stderr)
+            return 2
         hb_dir = STATE / "heartbeats"
         hb_dir.mkdir(parents=True, exist_ok=True)
+        for m in msgids:
+            try:
+                (hb_dir / f"{m}.stop").write_text(str(time.time()), encoding="utf-8")
+            except OSError:
+                pass
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            alive = False
+            for m in msgids:
+                pid = read_pid_file(hb_dir / f"{m}.pid") or 0
+                if pid_alive(pid):
+                    alive = True
+            if not alive:
+                break
+            time.sleep(0.1)
         for m in msgids:
             try:
                 (hb_dir / f"{m}.stop").unlink()
@@ -349,7 +356,11 @@ def main() -> int:
         print(json.dumps({"heartbeat_started": msgids}, ensure_ascii=False))
     elif args.cmd == "heartbeat-stop":
         msgids = [m.strip() for m in args.msgids.split(",") if m.strip()]
+        if any(safe_child_name(m) is None for m in msgids):
+            print("refusing msgid that is not a single path segment", file=sys.stderr)
+            return 2
         hb_dir = STATE / "heartbeats"
+        hb_dir.mkdir(parents=True, exist_ok=True)
         for m in msgids:
             try:
                 (hb_dir / f"{m}.stop").write_text(str(time.time()), encoding="utf-8")
