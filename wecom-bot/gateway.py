@@ -76,6 +76,13 @@ STATUS = STATE / "status.json"
 OUTBOX_OFFSET = STATE / "outbox.offset"
 OUTBOX_RETRY = STATE / "outbox_retry.json"
 OUTBOX_PARTIAL = STATE / "outbox_partial.json"
+# Formal replies are NEVER dead-lettered (user decision 2026-10-06,
+# same rule as the Weixin gateway): a reply or reply_file is the
+# answer to something the user asked and must not be silently
+# discarded after SEND_MAX_ATTEMPTS transient failures. Formal rows
+# keep the backoff and retry indefinitely; every other mode keeps
+# the dead-letter so one poison row cannot block the channel.
+FORMAL_MODES = ("reply", "reply_file")
 CANCELLED_FILE = STATE / "cancelled.json"
 SEEN_FILE = STATE / "seen_ids.jsonl"
 LOCK_FILE = STATE / "gateway.lock"
@@ -2068,7 +2075,8 @@ class Gateway:
                 ok = await self.dispatch_outbox_item(item)
                 if not ok:
                     attempts = int((rec or {}).get("n") or 0) + 1
-                    if item_id and attempts >= SEND_MAX_ATTEMPTS:
+                    if (item_id and attempts >= SEND_MAX_ATTEMPTS
+                            and item.get("mode", "") not in FORMAL_MODES):
                         self.append_jsonl(OUTBOX_RESULTS, {
                             "id": item_id,
                             "mode": item.get("mode", ""),

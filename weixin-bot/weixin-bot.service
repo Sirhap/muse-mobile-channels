@@ -7,7 +7,6 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
-User=hatch
 WorkingDirectory=/home/hatch/workspace/weixin-bot
 Environment=ILINK_CRED_FILE=/home/hatch/.config/weixin-bot/credentials.env
 EnvironmentFile=-/etc/environment

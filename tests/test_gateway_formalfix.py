@@ -104,7 +104,8 @@ delivered = {}
 
 
 async def fake_send_text(self, client, creds, to, content,
-                         token_ctx="", message_state=None):
+                         token_ctx="", client_id="",
+                         message_state=2, item_id=""):
     sent_texts.append(content)
     return {"ret": 0}
 
