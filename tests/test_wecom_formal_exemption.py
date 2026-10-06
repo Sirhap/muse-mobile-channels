@@ -46,6 +46,7 @@ def run_scenario(rows, watch_id, min_attempts):
     wc.OUTBOX_RESULTS = loop_dir / "outbox_results.jsonl"
     wc.OUTBOX_RETRY = loop_dir / "outbox_retry.json"
     wc.OUTBOX_PARTIAL = loop_dir / "outbox_partial.json"
+    wc.OUTBOX_PARKED = loop_dir / "outbox_parked.json"
     wc.SEND_MAX_ATTEMPTS = 3
     wc.retry_backoff_secs = lambda attempt: 0.05
 
@@ -110,6 +111,70 @@ dl = [r for r in results if r.get("deadletter")]
 check("reply_file row NEVER dead-lettered", not dl)
 check("reply_file row kept retrying (>=6)",
       int((retry.get("filerow") or {}).get("n") or 0) >= 6)
+
+# C: park-and-continue — a stuck formal head no longer blocks later rows
+def run_park_scenario():
+    import shutil
+    loop_dir = SBX / "loop"
+    shutil.rmtree(loop_dir, ignore_errors=True)
+    loop_dir.mkdir(parents=True)
+    wc.OUTBOX = loop_dir / "outbox.jsonl"
+    wc.OUTBOX_OFFSET = loop_dir / "outbox.offset"
+    wc.OUTBOX_RESULTS = loop_dir / "outbox_results.jsonl"
+    wc.OUTBOX_RETRY = loop_dir / "outbox_retry.json"
+    wc.OUTBOX_PARTIAL = loop_dir / "outbox_partial.json"
+    wc.OUTBOX_PARKED = loop_dir / "outbox_parked.json"
+    wc.SEND_MAX_ATTEMPTS = 10
+    wc.retry_backoff_secs = lambda attempt: 0.05
+
+    g = wc.Gateway.__new__(wc.Gateway)
+    dispatched = []
+
+    async def fail_only_stuck(item):
+        dispatched.append(item.get("id"))
+        return item.get("id") != "stuckreply"
+
+    async def no_watchdog():
+        return None
+
+    g.dispatch_outbox_item = fail_only_stuck
+    g.check_stream_watchdog = no_watchdog
+    rows = [
+        {"id": "stuckreply", "mode": "reply", "msgid": "M10",
+         "content": "卡住的"},
+        {"id": "laterow", "mode": "send", "chatid": "sirhao",
+         "chat_type": 1, "content": "后面的"},
+        {"id": "thirdrow", "mode": "send", "chatid": "sirhao",
+         "chat_type": 1, "content": "第三条"},
+    ]
+    wc.OUTBOX.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    wc.OUTBOX_OFFSET.write_text("0")
+
+    async def run():
+        task = asyncio.create_task(g.outbox_loop())
+        await asyncio.sleep(6)
+        task.cancel()
+
+    asyncio.run(run())
+    off = int(wc.OUTBOX_OFFSET.read_text())
+    parked = json.loads(wc.OUTBOX_PARKED.read_text())
+    retry = json.loads(wc.OUTBOX_RETRY.read_text())
+    return off, dispatched, parked, retry
+
+
+off, dispatched, parked, retry = run_park_scenario()
+check("main queue fully consumed despite stuck head",
+      off >= wc.OUTBOX.stat().st_size)
+check("rows behind the stuck head were dispatched promptly",
+      "laterow" in dispatched and "thirdrow" in dispatched)
+check("stuck formal row is parked with payload, not dropped",
+      "stuckreply" in parked
+      and int(parked["stuckreply"].get("n") or 0) >= 2
+      and parked["stuckreply"]["item"]["id"] == "stuckreply")
+check("parked state survives a fresh instance (restart-proof)",
+      "stuckreply" in wc.Gateway._load_parked())
+check("delivered rows leave no parked/retry residue",
+      "laterow" not in parked and "laterow" not in retry)
 
 fails = [n for n, ok in RESULTS if not ok]
 print(f"\n== {len(RESULTS) - len(fails)}/{len(RESULTS)} passed ==")

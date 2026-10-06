@@ -76,12 +76,18 @@ STATUS = STATE / "status.json"
 OUTBOX_OFFSET = STATE / "outbox.offset"
 OUTBOX_RETRY = STATE / "outbox_retry.json"
 OUTBOX_PARTIAL = STATE / "outbox_partial.json"
+OUTBOX_PARKED = STATE / "outbox_parked.json"
 # Formal replies are NEVER dead-lettered (user decision 2026-10-06,
 # same rule as the Weixin gateway): a reply or reply_file is the
 # answer to something the user asked and must not be silently
 # discarded after SEND_MAX_ATTEMPTS transient failures. Formal rows
 # keep the backoff and retry indefinitely; every other mode keeps
 # the dead-letter so one poison row cannot block the channel.
+# PARK-AND-CONTINUE (2026-10-06, same fix as the Weixin gateway):
+# any row that fails a dispatch is parked — the offset advances
+# past it and the rest of the queue flows in the same cycle — and a
+# retry lane retries parked rows on their own backoff. Parked
+# state is persisted in OUTBOX_PARKED, so a restart resets nothing.
 FORMAL_MODES = ("reply", "reply_file")
 CANCELLED_FILE = STATE / "cancelled.json"
 SEEN_FILE = STATE / "seen_ids.jsonl"
@@ -1134,6 +1140,77 @@ class Gateway:
             stored.pop(str(item_id), None)
             self._save_partial(stored)
 
+    # ---------- park-and-continue (retry lane) ----------
+
+    @staticmethod
+    def _load_parked() -> dict:
+        return load_json_dict(OUTBOX_PARKED)
+
+    @staticmethod
+    def _save_parked(data: dict) -> None:
+        try:
+            atomic_write_text(OUTBOX_PARKED, json.dumps(data, ensure_ascii=False))
+        except OSError:
+            pass
+
+    def _note_failure(self, item: dict) -> str:
+        """Register one failed dispatch and decide the row's fate:
+        "park" (keep retrying in the lane) or "deadletter"
+        (SEND_MAX_ATTEMPTS reached, non-formal modes only — formal
+        rows park forever). State is persisted in OUTBOX_PARKED
+        (item payload, attempt count, next retry time) with a
+        mirror in OUTBOX_RETRY so the CLI reply gate keeps seeing
+        the row as still-retrying; terminal states remove both."""
+        item_id = str(item.get("id") or "")
+        mode = item.get("mode", "")
+        if not item_id:
+            return "park"
+        parked = self._load_parked()
+        rec = parked.get(item_id)
+        if rec is None:
+            rec = {"item": item, "n": 0, "parked_at": int(time.time())}
+        rec["item"] = item
+        rec["n"] = int(rec.get("n") or 0) + 1
+        n = rec["n"]
+        rec["next"] = time.time() + retry_backoff_secs(n)
+        action = "park"
+        if mode not in FORMAL_MODES and n >= SEND_MAX_ATTEMPTS:
+            action = "deadletter"
+            self.append_jsonl(OUTBOX_RESULTS, {
+                "id": item_id,
+                "mode": mode,
+                "ts": int(time.time()),
+                "ok": False,
+                "errmsg": f"dead-lettered after {n} failed attempts; queue unblocked",
+                "deadletter": True,
+            })
+            log(f"outbox {mode} {item_id}: dead-lettered after {n} attempts (retry lane)")
+        retry = self._load_retry()
+        if action == "park":
+            parked[item_id] = rec
+            retry[item_id] = {"n": n, "next": rec["next"]}
+        else:
+            parked.pop(item_id, None)
+            retry.pop(item_id, None)
+        self._save_parked(parked)
+        self._save_retry(retry)
+        return action
+
+    def _cleanup_item(self, item_id: str) -> None:
+        """A row reached a terminal state (delivered): drop its
+        retry mirror, parked record and chunk-partial state."""
+        if not item_id:
+            return
+        retry = self._load_retry()
+        if item_id in retry:
+            retry.pop(item_id, None)
+            self._save_retry(retry)
+        parked = self._load_parked()
+        if item_id in parked:
+            parked.pop(item_id, None)
+            self._save_parked(parked)
+        self._clear_partial(item_id)
+
     async def _send_markdown_chunks(
         self, item_id: str, chatid: str, chat_type: int, chunks: list[str], start: int = 0,
     ) -> dict:
@@ -2026,92 +2103,90 @@ class Gateway:
         return read_offset(OUTBOX_OFFSET)
 
     async def outbox_loop(self) -> None:
-        """Send outbox rows. A transient failure stays at the head and backs off.
-
-        Dead-letter after SEND_MAX_ATTEMPTS so one poison row cannot block
-        the channel, and a single timeout cannot drop the only copy.
-        """
+        """Park-and-continue outbox (2026-10-06): the main queue
+        NEVER waits behind a failing row. Each cycle: (1) drain the
+        main queue — ok rows are consumed; failed rows are parked
+        via _note_failure and the offset still advances past them,
+        so later rows go out in the same cycle; (2) run the retry
+        lane — due parked rows get one dispatch each, in due-time
+        order. Formal rows park forever (never dead-lettered);
+        other modes dead-letter inside the lane at
+        SEND_MAX_ATTEMPTS. Before this, one failing head row froze
+        all outbound behind its backoff (same flaw as Weixin)."""
         while True:
             await asyncio.sleep(1.0)
             await self.check_stream_watchdog()
-            if not OUTBOX.exists():
-                continue
-            offset = self._outbox_offset()
-            try:
-                size = OUTBOX.stat().st_size
-                if size < offset:
-                    offset = 0
-                if size == offset:
-                    continue
-                with OUTBOX.open("rb") as handle:
-                    handle.seek(offset)
-                    data = handle.read()
-            except OSError as e:
-                log(f"outbox read error: {e}")
-                continue
-            consumed = 0
-            retry = self._load_retry()
-            for raw_line in complete_jsonl_lines(data):
-                parsed = parse_jsonl_line(raw_line)
-                if parsed is None or parsed.get("__invalid__"):
-                    if parsed and parsed.get("__invalid__"):
-                        log(f"outbox: skipping bad line at offset {offset + consumed}")
-                    consumed += len(raw_line) + 1
-                    try:
-                        write_offset(OUTBOX_OFFSET, offset + consumed)
-                    except OSError:
-                        pass
-                    continue
-                item = parsed
-                item_id = str(item.get("id") or "")
-                rec = retry.get(item_id) if item_id else None
-                if rec and float(rec.get("next") or 0) > time.time():
-                    try:
-                        write_offset(OUTBOX_OFFSET, offset + consumed)
-                    except OSError:
-                        pass
-                    await asyncio.sleep(min(float(rec["next"]) - time.time(), 30.0))
-                    break
-                ok = await self.dispatch_outbox_item(item)
-                if not ok:
-                    attempts = int((rec or {}).get("n") or 0) + 1
-                    if (item_id and attempts >= SEND_MAX_ATTEMPTS
-                            and item.get("mode", "") not in FORMAL_MODES):
-                        self.append_jsonl(OUTBOX_RESULTS, {
-                            "id": item_id,
-                            "mode": item.get("mode", ""),
-                            "ts": int(time.time()),
-                            "ok": False,
-                            "errmsg": f"dead-lettered after {attempts} failed attempts; queue unblocked",
-                            "deadletter": True,
-                        })
-                        log(f"outbox {item.get('mode')} {item_id}: dead-lettered after {attempts} attempts")
-                        retry.pop(item_id, None)
-                        self._save_retry(retry)
-                        ok = True
-                    else:
-                        if item_id:
-                            retry[item_id] = {
-                                "n": attempts,
-                                "next": time.time() + retry_backoff_secs(attempts),
-                            }
-                            self._save_retry(retry)
+            # ---- main queue pass ----
+            if OUTBOX.exists():
+                offset = self._outbox_offset()
+                data = b""
+                try:
+                    size = OUTBOX.stat().st_size
+                    if size < offset:
+                        offset = 0
+                    if size > offset:
+                        with OUTBOX.open("rb") as handle:
+                            handle.seek(offset)
+                            data = handle.read()
+                except OSError as e:
+                    log(f"outbox read error: {e}")
+                    data = b""
+                if data:
+                    consumed = 0
+                    parked_ids = set(self._load_parked().keys())
+                    for raw_line in complete_jsonl_lines(data):
+                        parsed = parse_jsonl_line(raw_line)
+                        if parsed is None or parsed.get("__invalid__"):
+                            if parsed and parsed.get("__invalid__"):
+                                log(f"outbox: skipping bad line at offset {offset + consumed}")
+                            consumed += len(raw_line) + 1
+                            try:
+                                write_offset(OUTBOX_OFFSET, offset + consumed)
+                            except OSError:
+                                pass
+                            continue
+                        item = parsed
+                        item_id = str(item.get("id") or "")
+                        if item_id and item_id in parked_ids:
+                            # Duplicate row for an already-parked
+                            # id: the lane owns it; consume the copy.
+                            consumed += len(raw_line) + 1
+                            try:
+                                write_offset(OUTBOX_OFFSET, offset + consumed)
+                            except OSError:
+                                pass
+                            continue
+                        ok = await self.dispatch_outbox_item(item)
+                        if ok:
+                            self._cleanup_item(item_id)
+                        else:
+                            self._note_failure(item)
+                        # Success, park and dead-letter ALL advance
+                        # the offset: the main queue moves on.
+                        consumed += len(raw_line) + 1
                         try:
                             write_offset(OUTBOX_OFFSET, offset + consumed)
                         except OSError:
                             pass
-                        await asyncio.sleep(2.0)
-                        break
-                if ok:
-                    if item_id and item_id in retry:
-                        retry.pop(item_id, None)
-                        self._save_retry(retry)
-                    self._clear_partial(item_id)
-                    consumed += len(raw_line) + 1
-                    try:
-                        write_offset(OUTBOX_OFFSET, offset + consumed)
-                    except OSError:
-                        pass
+            # ---- retry lane pass ----
+            try:
+                parked = self._load_parked()
+                now = time.time()
+                due = [rec for rec in parked.values()
+                       if float(rec.get("next") or 0) <= now]
+                due.sort(key=lambda r: float(r.get("next") or 0))
+                for rec in due:
+                    item = rec.get("item") or {}
+                    item_id = str(item.get("id") or "")
+                    if not item_id:
+                        continue
+                    ok = await self.dispatch_outbox_item(item)
+                    if ok:
+                        self._cleanup_item(item_id)
+                    else:
+                        self._note_failure(item)
+            except Exception as e:
+                log(f"retry lane pass failed (continuing): {e}")
 
     async def dispatch_outbox_item(self, item: dict) -> bool:
         item_id = item.get("id", "")
