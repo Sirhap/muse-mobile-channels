@@ -40,6 +40,46 @@ cd ../wecom-bot && python3 -m venv .venv && .venv/bin/pip install -r requirement
 Syntax-verified 2026-10-04: all Python files compile, shell scripts pass
 `bash -n`, hook JSON parses.
 
+## Hooks (message wake layer)
+
+The gateways only move messages; what wakes the agent is a pair of
+inbox hooks, one per channel:
+
+- `hooks/scripts/weixin-inbox.sh`, `hooks/scripts/wecom-inbox.sh` — poll
+  the gateway inbox, batch messages, and supervise the running worker:
+  queueing, preemption, starvation guard, lost-message reconciliation,
+  and fail-stop backed by the worker's internal heartbeat. Wake payloads
+  carry same-chat history under a 30000-char budget (recent turns
+  verbatim, older turns digested). Channel histories stay isolated.
+- `hooks/definitions/weixin-inbox.json`, `hooks/definitions/wecom-inbox.json`
+  — the hook definitions: poll interval plus the worker prompt
+  (channel rules and reply discipline).
+
+Install: copy the scripts to `~/hooks/scripts/` and register the
+definitions through your agent platform's hooks API, adjusting the
+absolute paths (home dir, bot state dirs) to your deployment.
+
+**Hard rule: never set `poll_interval_secs` below 5.** Five seconds is
+the platform minimum; a lower value invalidates the definition,
+suspends BOTH hooks, and silently swallows waiting messages (learned
+twice in production, 2026-10-05). Change definitions only through the
+hooks API, never by editing the JSON in place.
+
+## Tests
+
+Sandbox suites live in `tests/`. They run the real hook scripts and
+gateway module against stubbed state, CLI, and network — no live
+channel is touched:
+
+- `tests/test_hook_replyfile_completion.py` — hook supervision counts
+  `reply_file` as batch completion (regression suite for the
+  2026-10-06 false fail-stop of a delivered image). Plain python3.
+- `tests/test_gateway_formalfix.py` — Weixin gateway: formal replies
+  exempt from the 10-attempt dead-letter, the stuck-formal user
+  notification, and large-file compression (PIL / ffmpeg). Run with
+  the weixin-bot venv python (needs httpx + PIL) and ffmpeg on PATH;
+  a >2MB test video can be supplied via `MUSE_TEST_VIDEO`.
+
 ## Reporting bugs — including via your own Muse / AI agent
 
 The upstream repository is **Sirhap/muse-mobile-channels**
