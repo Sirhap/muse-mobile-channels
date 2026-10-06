@@ -17,6 +17,7 @@ through the CLI (outbox.jsonl). Login is a separate one-shot script
 import asyncio
 import base64
 import fcntl
+import hashlib
 import json
 import os
 import random
@@ -42,6 +43,8 @@ OUTBOX_PARTIAL = STATE / "outbox_partial.json"
 # exponential backoff instead of every ~3s, and after
 # SEND_MAX_ATTEMPTS failures it is dead-lettered (consumed with a
 # recorded failure) so one bad item can never block the channel.
+# (Formal reply/reply_file rows are EXEMPT from this dead-letter
+# since 2026-10-06 — see FORMAL_MODES below.)
 # The hot loop also appeared to keep the provider's transient
 # "prepare failed" penalty alive; the backoff gives it room to
 # expire.
@@ -69,6 +72,39 @@ SEND_NOTICE_DROP_AFTER_FAILURES = 5
 # whose errmsg names the CDN host AND a 500 count; every other
 # send_file failure keeps the normal backoff / dead-letter policy.
 SEND_FILE_CDN500_DROP_AFTER_FAILURES = 3
+
+# Formal replies are NEVER dead-lettered (user decision 2026-10-06,
+# superseding the any-row policy above for these modes): a reply or
+# reply_file is the answer to something the user asked; silently
+# discarding it after 10 transient failures loses the answer without
+# anyone knowing. Formal rows keep the normal backoff and retry
+# indefinitely. If one is still failing after
+# FORMAL_STUCK_NOTIFY_ATTEMPTS attempts the user is told ONCE (see
+# _notify_stuck_formal): in-channel by direct send (bypassing the
+# wedged row) and cross-channel via the WeCom outbox, because a
+# notice queued behind the stuck row would never be seen.
+FORMAL_MODES = ("reply", "reply_file")
+FORMAL_STUCK_NOTIFY_ATTEMPTS = 25
+STUCK_NOTICE_WECOM_OUTBOX = (
+    Path(os.environ.get("HOME") or "/home/hatch")
+    / "workspace" / "wecom-bot" / "state" / "outbox.jsonl")
+STUCK_NOTICE_WECOM_CHATID = os.environ.get(
+    "WEIXIN_STUCK_NOTICE_CHATID", "sirhao")
+
+# Large-file compression (user decision 2026-10-06: "太大就压缩发"):
+# WeChat CDN uploads of multi-MB files fail intermittently (HTTP 500
+# or empty transport errors), so a file larger than
+# FILE_COMPRESS_THRESHOLD is compressed BEFORE the first upload —
+# video via ffmpeg (<=854px wide, CRF 30), image via PIL (<=1600px,
+# JPEG q80) — and the compressed copy is sent instead, with a note
+# appended to the caption. The original file is never modified;
+# compressed copies are cached under STATE/compressed/ keyed by
+# source path+size+mtime. Compression failure or a non-smaller
+# result falls back to sending the original.
+FILE_COMPRESS_THRESHOLD = 2_000_000
+COMPRESSED_DIR = STATE / "compressed"
+VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 
 
 def retry_backoff_secs(attempt: int) -> float:
@@ -1972,6 +2008,102 @@ class Gateway:
             return True
         return False
 
+    async def _notify_stuck_formal(self, client: httpx.AsyncClient,
+                                   creds: dict, item: dict,
+                                   attempts: int) -> None:
+        """A formal reply has failed FORMAL_STUCK_NOTIFY_ATTEMPTS
+        times. It is NOT dropped (see FORMAL_MODES) — but the user
+        must know. The notice cannot ride the outbox behind the
+        stuck row, so it goes (a) in-channel by direct send,
+        bypassing the queue, and (b) cross-channel as an appended
+        row in the WeCom outbox. Both legs are best-effort;
+        failures are only logged. Called once per stuck row (the
+        caller persists a notified flag in the retry record)."""
+        text = (f"⚠️ 微信这边有一条正式回复已连续发送失败 {attempts} 次，"
+                "仍在自动重试、不会丢弃。多半是微信发送通道临时故障；"
+                "你在微信里随便发一句话，有助于恢复发送。")
+        try:
+            info = self.context.get(str(item.get("msgid", "")), {})
+            to = info.get("from_user_id", "")
+            if to:
+                await self.send_text(
+                    client, creds, to, text,
+                    info.get("context_token", ""), message_state=2)
+        except Exception as e:
+            log(f"stuck-formal notice (wechat leg) failed: {e}")
+        try:
+            if STUCK_NOTICE_WECOM_OUTBOX.exists():
+                self.append_jsonl(STUCK_NOTICE_WECOM_OUTBOX, {
+                    "mode": "send", "chatid": STUCK_NOTICE_WECOM_CHATID,
+                    "chat_type": 1, "content": "【微信通道提醒】" + text,
+                    "id": uuid.uuid4().hex[:12],
+                    "queued_at": int(time.time())})
+        except Exception as e:
+            log(f"stuck-formal notice (wecom leg) failed: {e}")
+        log(f"stuck formal {item.get('mode')} {item.get('id')}: "
+            f"user notified at attempt {attempts}")
+
+    def _compress_file_sync(self, src: Path) -> Path | None:
+        """Compress src into COMPRESSED_DIR and return the new path,
+        or None when not applicable / failed / not smaller. Video:
+        ffmpeg <=854px wide, CRF 30. Image: PIL <=1600px, JPEG q80.
+        Never modifies the original."""
+        try:
+            size = src.stat().st_size
+            st = src.stat()
+            key = hashlib.sha256(
+                f"{src}|{size}|{int(st.st_mtime)}".encode()).hexdigest()[:16]
+            COMPRESSED_DIR.mkdir(parents=True, exist_ok=True)
+            ext = src.suffix.lower()
+            if ext in VIDEO_EXTS:
+                out = COMPRESSED_DIR / f"{key}.mp4"
+                if not (out.exists() and out.stat().st_size > 0):
+                    r = subprocess.run(
+                        ["ffmpeg", "-y", "-i", str(src),
+                         "-vf", "scale='min(854,iw)':-2",
+                         "-c:v", "libx264", "-crf", "30",
+                         "-preset", "veryfast",
+                         "-c:a", "aac", "-b:a", "96k",
+                         "-movflags", "+faststart", str(out)],
+                        capture_output=True, timeout=180)
+                    if r.returncode != 0:
+                        log(f"ffmpeg compress failed for {src.name}: "
+                            f"{r.stderr.decode('utf-8', 'replace')[-200:]}")
+                        return None
+            elif ext in IMAGE_EXTS:
+                out = COMPRESSED_DIR / f"{key}.jpg"
+                if not (out.exists() and out.stat().st_size > 0):
+                    from PIL import Image
+                    with Image.open(src) as im:
+                        im = im.convert("RGB")
+                        im.thumbnail((1600, 1600))
+                        im.save(out, "JPEG", quality=80)
+            else:
+                return None
+            if out.exists() and 0 < out.stat().st_size < size:
+                return out
+            return None
+        except Exception as e:
+            log(f"compression failed for {src}: {e}")
+            return None
+
+    async def _prepare_file_for_send(self, fpath: str):
+        """Return (effective_path, was_compressed). Files over
+        FILE_COMPRESS_THRESHOLD are compressed first (cached); any
+        problem falls back to the original path."""
+        try:
+            p = Path(fpath)
+            if (p.exists() and p.stat().st_size > FILE_COMPRESS_THRESHOLD
+                    and COMPRESSED_DIR not in p.parents):
+                out = await asyncio.to_thread(self._compress_file_sync, p)
+                if out is not None:
+                    log(f"compressed for send: {p.name} "
+                        f"{p.stat().st_size} -> {out.stat().st_size} bytes")
+                    return str(out), True
+        except Exception as e:
+            log(f"compression skipped for {fpath}: {e}")
+        return fpath, False
+
     async def dispatch_outbox_item(self, client: httpx.AsyncClient, creds: dict, item: dict) -> bool:
         """Return True if the item is consumed (success or permanent drop),
         False if it failed transiently and must be retried (offset NOT advanced)."""
@@ -2038,7 +2170,12 @@ class Gateway:
                     self.append_jsonl(OUTBOX_RESULTS, result)
                     log(f"outbox reply_file {item_id}: {result['errmsg']}")
                     return True
-                caption = content or f"📎 {Path(fpath).name}"
+                orig_name = Path(fpath).name
+                fpath, was_compressed = \
+                    await self._prepare_file_for_send(fpath)
+                caption = content or f"📎 {orig_name}"
+                if was_compressed:
+                    caption += "\n（文件较大，已自动压缩发送）"
                 # The caption is a separate text message sent BEFORE
                 # the file. If the file step then fails transiently,
                 # a naive retry re-sends the caption every attempt —
@@ -2068,6 +2205,12 @@ class Gateway:
                     result["errmsg"] = f"file not found: {fpath}"
                     self.append_jsonl(OUTBOX_RESULTS, result)
                     return True
+                if fpath:
+                    fpath, was_compressed = \
+                        await self._prepare_file_for_send(fpath)
+                    if was_compressed:
+                        content = (content + "\n" if content else "") \
+                            + "（文件较大，已自动压缩发送）"
                 if content and not self._caption_already_sent(item_id):
                     cap_resp = await self.send_text(client, creds, to, content)
                     if cap_resp.get("ret") not in (None, 0):
@@ -2077,7 +2220,7 @@ class Gateway:
                         return False
                     self._mark_caption_sent(item_id)
                 resp = await self._deliver_file(
-                    client, creds, to, item.get("file_path", "")
+                    client, creds, to, fpath
                 )
             else:
                 result["errmsg"] = f"unknown mode {mode}"
@@ -2188,7 +2331,8 @@ class Gateway:
                     # after SEND_MAX_ATTEMPTS so a single poison row
                     # can never block the channel forever.
                     attempts = int((rec or {}).get("n") or 0) + 1
-                    if item_id and attempts >= SEND_MAX_ATTEMPTS:
+                    if (item_id and attempts >= SEND_MAX_ATTEMPTS
+                            and item.get("mode", "") not in FORMAL_MODES):
                         self.append_jsonl(OUTBOX_RESULTS, {
                             "id": item_id, "mode": item.get("mode", ""),
                             "ts": int(time.time()), "ok": False,
@@ -2202,11 +2346,24 @@ class Gateway:
                         consumed_ok = True
                     else:
                         if item_id:
-                            retry[item_id] = {
+                            rec_out = {
                                 "n": attempts,
                                 "next": time.time()
                                 + retry_backoff_secs(attempts)}
+                            notify = (
+                                item.get("mode", "") in FORMAL_MODES
+                                and attempts >= FORMAL_STUCK_NOTIFY_ATTEMPTS
+                                and not (rec or {}).get("notified"))
+                            if (rec or {}).get("notified"):
+                                rec_out["notified"] = True
+                            if notify:
+                                rec_out["notified"] = True
+                            retry[item_id] = rec_out
                             self._save_retry(retry)
+                            if notify:
+                                asyncio.create_task(
+                                    self._notify_stuck_formal(
+                                        client, creds, item, attempts))
                         try:
                             OUTBOX_OFFSET.write_text(str(offset + consumed))
                         except OSError:
