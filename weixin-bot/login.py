@@ -69,6 +69,29 @@ def write_credentials(token: str, bot_id: str, user_id: str) -> None:
     os.chmod(CRED_FILE, 0o600)
 
 
+def pending_qrcode(max_age_secs: float = 5 * 60) -> str:
+    """QR session that is still waiting, including one that asked for a code.
+
+    A verify code belongs to that session. Fetching a new QR and attaching
+    the old code does not finish the login that asked for it.
+    """
+    try:
+        data = json.loads(LOGIN_STATE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    if data.get("status") not in ("need_verify_code", "waiting_scan", "wait", "scanned"):
+        return ""
+    qrcode = str(data.get("qrcode") or "")
+    stamp = data.get("ts")
+    if not qrcode or not isinstance(stamp, (int, float)):
+        return ""
+    if time.time() - float(stamp) > max_age_secs:
+        return ""
+    return qrcode
+
+
 def status_url(qrcode: str, verify_code: str = "") -> str:
     """Status poll URL. verify_code is included only when the user supplied one."""
     query = {"qrcode": qrcode}
@@ -80,29 +103,33 @@ def status_url(qrcode: str, verify_code: str = "") -> str:
 async def main(verify_code: str = "") -> int:
     proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or None
     async with httpx.AsyncClient(proxy=proxy, trust_env=False) as client:
-        resp = await client.post(
-            f"{BASE_URL}/ilink/bot/get_bot_qrcode?bot_type={BOT_TYPE}",
-            json={"local_token_list": []},
-            headers={"Content-Type": "application/json"},
-            timeout=httpx.Timeout(20.0, connect=15.0),
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        qrcode = data.get("qrcode", "")
-        img_content = data.get("qrcode_img_content", "")
-        if not qrcode or not img_content:
-            note(f"unexpected qrcode response: {json.dumps(data)[:300]}")
-            return 1
-        save_login_state({"status": "waiting_scan", "qrcode": qrcode, "ts": int(time.time())})
-        try:
-            if qr_lib is None:
-                raise ImportError("qrcode is not installed")
-            img = qr_lib.make(img_content)
-            img.save(str(QR_PNG))
-            os.chmod(QR_PNG, 0o600)
-            note(f"QR code rendered to {QR_PNG}")
-        except Exception as e:
-            note(f"QR render failed ({e}); image was not written")
+        qrcode = pending_qrcode() if verify_code else ""
+        if qrcode:
+            note("submitting verify code against the QR session that asked for it")
+        else:
+            resp = await client.post(
+                f"{BASE_URL}/ilink/bot/get_bot_qrcode?bot_type={BOT_TYPE}",
+                json={"local_token_list": []},
+                headers={"Content-Type": "application/json"},
+                timeout=httpx.Timeout(20.0, connect=15.0),
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            qrcode = data.get("qrcode", "")
+            img_content = data.get("qrcode_img_content", "")
+            if not qrcode or not img_content:
+                note(f"unexpected qrcode response: {json.dumps(data)[:300]}")
+                return 1
+            save_login_state({"status": "waiting_scan", "qrcode": qrcode, "ts": int(time.time())})
+            try:
+                if qr_lib is None:
+                    raise ImportError("qrcode is not installed")
+                img = qr_lib.make(img_content)
+                img.save(str(QR_PNG))
+                os.chmod(QR_PNG, 0o600)
+                note(f"QR code rendered to {QR_PNG}")
+            except Exception as e:
+                note(f"QR render failed ({e}); image was not written")
         note("waiting for scan... (valid about 5 minutes)")
 
         deadline = time.time() + 5 * 60
@@ -136,7 +163,11 @@ async def main(verify_code: str = "") -> int:
                 note(f"QR code {status}; run login again for a fresh one")
                 return 2
             if status == "need_verify_code":
-                save_login_state({"status": "need_verify_code", "ts": int(time.time())})
+                save_login_state({
+                    "status": "need_verify_code",
+                    "qrcode": qrcode,
+                    "ts": int(time.time()),
+                })
                 note("WeChat asks for a verify code: rerun with the code as argv[1]")
                 return 3
             if status and status not in ("wait", "scanned"):
@@ -151,5 +182,5 @@ async def main(verify_code: str = "") -> int:
 if __name__ == "__main__":
     vc = sys.argv[1] if len(sys.argv) > 1 else ""
     if vc:
-        print("verify-code flow: submitting the code with the new QR session")
+        print("verify-code flow: submitting the code with the QR session that asked for it")
     sys.exit(asyncio.run(main(vc)))

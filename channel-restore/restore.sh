@@ -48,6 +48,19 @@ install_unit() {
   return 0
 }
 
+ensure_hatch_tree() {
+  local path="$1"
+  local owner=""
+  [[ -e "$path" ]] || return 0
+  if ! id hatch >/dev/null 2>&1; then
+    return 0
+  fi
+  owner="$(stat -c '%U' "$path" 2>/dev/null || true)"
+  if [[ -n "$owner" && "$owner" != "hatch" ]]; then
+    chown -R hatch:hatch "$path" && echo "channel-restore: chown hatch $path"
+  fi
+}
+
 heal_one() {
   local svc="$1" proj="$2" cred="$3"
   local src="$WS/$proj/$svc.service"
@@ -72,9 +85,10 @@ heal_one() {
     systemctl daemon-reload
     RELOAD=0
   fi
-  if id hatch >/dev/null 2>&1; then
-    chown -R hatch:hatch "$WS/$proj/state" 2>/dev/null || true
-  fi
+  # Only the first time the tree is still root-owned. Repeating chown
+  # on a large media directory every 5 minutes stalls the healer.
+  ensure_hatch_tree "$WS/$proj/state"
+  ensure_hatch_tree "$(dirname "$cred")"
   if ! systemctl is-enabled --quiet "$svc" 2>/dev/null; then
     systemctl enable "$svc" >/dev/null 2>&1 && echo "$svc: enabled"
   fi

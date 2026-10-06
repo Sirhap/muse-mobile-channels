@@ -2147,7 +2147,7 @@ class Gateway:
                     result["errmsg"] = f"no context stored for msgid {item.get('msgid')}"
                     self.append_jsonl(OUTBOX_RESULTS, result)
                     log(f"outbox reply {item_id}: {result['errmsg']}")
-                    return False
+                    return True
                 resp = await self.send_text(
                     client, creds, to, content, token_ctx,
                     info.get("client_id", ""), 2, item_id,
@@ -2161,7 +2161,7 @@ class Gateway:
                     result["errmsg"] = f"no context stored for msgid {item.get('msgid')}"
                     self.append_jsonl(OUTBOX_RESULTS, result)
                     log(f"outbox update {item_id}: {result['errmsg']}")
-                    return False
+                    return True
                 resp = await self.send_text(
                     client, creds, to, content, info.get("context_token", ""),
                     info.get("client_id", ""), 2, f"{item_id}:update",
@@ -2174,7 +2174,7 @@ class Gateway:
                     result["errmsg"] = f"no context stored for msgid {item.get('msgid')}"
                     self.append_jsonl(OUTBOX_RESULTS, result)
                     log(f"outbox reply_file {item_id}: {result['errmsg']}")
-                    return False
+                    return True
                 fpath = item.get("file_path", "")
                 if not Path(fpath).exists():
                     result["errmsg"] = f"file not found: {fpath}"
