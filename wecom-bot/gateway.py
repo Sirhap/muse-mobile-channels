@@ -2184,7 +2184,10 @@ class Gateway:
                     target_chatid = info.get("chatid", "")
                     chat_type = 2 if info.get("chattype") == "group" else 1
                     if not target_chatid:
-                        resp = {"errcode": -2, "errmsg": "no chatid stored for overflow chunks"}
+                        result["errmsg"] = "no chatid stored for overflow chunks"
+                        self.append_jsonl(OUTBOX_RESULTS, result)
+                        log(f"outbox reply {item_id}: {result['errmsg']}")
+                        return True
                     else:
                         resp = await self._send_markdown_chunks(
                             item_id, target_chatid, chat_type, chunks, start=1,
