@@ -37,6 +37,7 @@ if str(_REPO) not in sys.path:
 from channel_common import (  # noqa: E402
     allocate_subagent_id,
     append_jsonl as append_jsonl_line,
+    atomic_write_text,
     complete_jsonl_lines,
     load_json_dict,
     media_filename,
@@ -61,26 +62,32 @@ OUTBOX_RESULTS = STATE / "outbox_results.jsonl"
 OUTBOX_OFFSET = STATE / "outbox.offset"
 OUTBOX_RETRY = STATE / "outbox_retry.json"
 OUTBOX_PARTIAL = STATE / "outbox_partial.json"
-# Per-item send retry policy (added 2026-10-05 after a poison
-# reply_file row was retried 138 times in 15 minutes and wedged the
-# whole outbox): a transiently failing head item is retried with
-# exponential backoff instead of every ~3s, and after
-# SEND_MAX_ATTEMPTS failures it is dead-lettered (consumed with a
-# recorded failure) so one bad item can never block the channel.
-# (Formal reply/reply_file rows are EXEMPT from this dead-letter
-# since 2026-10-06 — see FORMAL_MODES below.)
-# The hot loop also appeared to keep the provider's transient
-# "prepare failed" penalty alive; the backoff gives it room to
-# expire.
+OUTBOX_PARKED = STATE / "outbox_parked.json"
+# Per-item send retry policy. PARK-AND-CONTINUE since 2026-10-06
+# (deep-dive: the strict serial FIFO outbox wedged the whole channel
+# behind ONE failing head row four different ways — a formal reply
+# in a "prepare failed" episode froze every later message for
+# 30+ min; evidence ~/workspace/outbox-wedge-deepdive-2026-10-06):
+# any row that fails a dispatch is PARKED — the offset advances
+# past it, the rest of the queue keeps flowing in the same cycle,
+# and a separate retry lane retries the parked row on its own
+# backoff (retry_backoff_secs). Parked state (item payload, attempt
+# count, next time, guard streaks) is PERSISTED in OUTBOX_PARKED so
+# a gateway restart can no longer reset any counter. Non-formal
+# rows are still dead-lettered after SEND_MAX_ATTEMPTS failed
+# attempts — but now inside the lane, off the main queue. Formal
+# reply/reply_file rows are EXEMPT from the dead-letter (see
+# FORMAL_MODES below): parked, they retry forever.
 SEND_MAX_ATTEMPTS = 10
 
-# Wedge guard for unbound mode="send" notice rows (2026-10-06): the
-# loop-level policy above dead-letters ANY row after 10 attempts, but
+# Wedge guard for unbound mode="send" notice rows (2026-10-06):
 # decorative notices (softack / thinking / started / waitremind /
-# merged / media) carry no information worth 10 attempts of channel
-# blockage, so dispatch drops one after 5 consecutive failures within
-# the process. Formal rows (reply / reply_file / update / send_file)
-# are never dropped by this guard.
+# merged / media) carry no information worth 10 attempts, so a
+# parked notice row is dropped after 5 consecutive failures. The
+# streak lives in the persisted parked record (was process-local
+# before park-and-continue; a restart used to reset it). Formal
+# rows (reply / reply_file / update / send_file) are never dropped
+# by this guard.
 SEND_NOTICE_DROP_AFTER_FAILURES = 5
 
 # Wedge guard for mode="send_file" rows whose delivery dies at the
@@ -91,7 +98,7 @@ SEND_NOTICE_DROP_AFTER_FAILURES = 5
 # notices and a formal reply queued behind it. A file that cannot
 # even be uploaded gains nothing from the full 10-attempt
 # dead-letter path, so after 3 consecutive CDN-upload-500 failures
-# within the process the row is consumed (the file stays on disk
+# the row is consumed (the file stays on disk
 # and can be re-sent / rerouted, e.g. via WeCom). ONLY failures
 # whose errmsg names the CDN host AND a 500 count; every other
 # send_file failure keeps the normal backoff / dead-letter policy.
@@ -101,14 +108,16 @@ SEND_FILE_CDN500_DROP_AFTER_FAILURES = 3
 # superseding the any-row policy above for these modes): a reply or
 # reply_file is the answer to something the user asked; silently
 # discarding it after 10 transient failures loses the answer without
-# anyone knowing. Formal rows keep the normal backoff and retry
-# indefinitely. If one is still failing after
-# FORMAL_STUCK_NOTIFY_ATTEMPTS attempts the user is told ONCE (see
-# _notify_stuck_formal): in-channel by direct send (bypassing the
-# wedged row) and cross-channel via the WeCom outbox, because a
-# notice queued behind the stuck row would never be seen.
+# anyone knowing. Parked formal rows keep the normal backoff and
+# retry indefinitely in the retry lane. If one is still failing
+# after FORMAL_STUCK_NOTIFY_ATTEMPTS parked attempts the user is
+# told ONCE (see _notify_stuck_formal): in-channel by direct send
+# (bypassing the outbox) and cross-channel via the WeCom outbox.
+# (Threshold lowered 25 -> 3 with park-and-continue 2026-10-06: in
+# the lane a stuck formal row no longer blocks anyone, but the user
+# should still hear about it within ~1-2 minutes, not ~106.)
 FORMAL_MODES = ("reply", "reply_file")
-FORMAL_STUCK_NOTIFY_ATTEMPTS = 25
+FORMAL_STUCK_NOTIFY_ATTEMPTS = 3
 STUCK_NOTICE_WECOM_OUTBOX = (
     Path(os.environ.get("HOME") or "/home/hatch")
     / "workspace" / "wecom-bot" / "state" / "outbox.jsonl")
@@ -1022,15 +1031,10 @@ class Gateway:
         # transition notices from _feedback_scan_once.
         self.feedback_track: dict[str, dict] = {}
         self.merged_notice_at: dict[str, float] = {}
-        # Per-id consecutive dispatch failure counts for unbound
-        # mode="send" notice rows (wedge guard, see
-        # SEND_NOTICE_DROP_AFTER_FAILURES). Process-local on purpose:
-        # after a restart a bad notice gets a fresh 5 attempts before
-        # being dropped again.
-        self._send_notice_failures: dict[str, int] = {}
-        # Same idea for mode="send_file" rows failing at the WeChat
-        # CDN upload step (see SEND_FILE_CDN500_DROP_AFTER_FAILURES).
-        self._send_file_failures: dict[str, int] = {}
+        # Parked-row failure state (wedge guards, retry lane) is NOT
+        # kept in process memory: it is persisted per row in
+        # OUTBOX_PARKED (see _note_failure), so a gateway restart can
+        # no longer reset any failure counter.
         self.sync_buf = ""
         self._lock_fd = None
         self._acquire_instance_lock()
@@ -2106,49 +2110,131 @@ class Gateway:
         except Exception as e:
             log(f"sendtyping best-effort failed (ignored): {e}")
 
-    def _send_notice_should_drop(self, item_id: str) -> bool:
-        """Wedge guard (2026-10-06): count consecutive failed
-        dispatches of an unbound mode="send" notice row in this
-        process; return True once it reaches
-        SEND_NOTICE_DROP_AFTER_FAILURES, so the caller treats the
-        row as consumed instead of retrying it forever (the
-        2026-10-05 softack wedge: one stale queue receipt, rejected
-        by iLink with ret=-2 "prepare failed", blocked every later
-        outbox row behind it). Only ever called for mode="send";
-        formal rows are never dropped here."""
-        n = self._send_notice_failures.get(item_id, 0) + 1
-        self._send_notice_failures[item_id] = n
-        if n >= SEND_NOTICE_DROP_AFTER_FAILURES:
-            self._send_notice_failures.pop(item_id, None)
-            log(f"DROPPING unbound send {item_id} after {n} consecutive "
-                f"failed attempts (wedge guard)")
-            return True
-        return False
+    # ---------- park-and-continue (retry lane) ----------
 
-    def _send_file_should_drop(self, item_id: str, errmsg: str) -> bool:
-        """Wedge guard (2026-10-06): count consecutive failed
-        dispatches of a mode="send_file" row whose failure is the
-        WeChat CDN upload returning HTTP 500 (errmsg names
-        cdn.weixin.qq.com AND a 500 — the provider-side upload
-        outage of 2026-10-05/06, which rejected every file size).
-        Return True once the streak reaches
-        SEND_FILE_CDN500_DROP_AFTER_FAILURES so the caller treats
-        the row as consumed instead of letting it hold the head of
-        the outbox through the whole 10-attempt dead-letter path.
-        Non-CDN-500 failures never count here; they keep the normal
-        backoff / dead-letter handling. Only ever called for
-        mode="send_file"."""
-        err = errmsg or ""
-        if "cdn.weixin.qq.com" not in err or "500" not in err:
-            return False
-        n = self._send_file_failures.get(item_id, 0) + 1
-        self._send_file_failures[item_id] = n
-        if n >= SEND_FILE_CDN500_DROP_AFTER_FAILURES:
-            self._send_file_failures.pop(item_id, None)
-            log(f"DROPPING send_file {item_id} after {n} consecutive "
-                f"CDN upload 500 failures (wedge guard)")
-            return True
-        return False
+    @staticmethod
+    def _load_parked() -> dict:
+        return load_json_dict(OUTBOX_PARKED)
+
+    @staticmethod
+    def _save_parked(d: dict) -> None:
+        atomic_write_text(OUTBOX_PARKED, json.dumps(d, ensure_ascii=False))
+
+    @staticmethod
+    def _last_errmsg(item_id: str) -> str:
+        """Errmsg of the most recent result row for item_id (the one
+        dispatch_outbox_item just appended). Tail-scans the results
+        file; failure paths are rare, so the scan is cheap enough."""
+        try:
+            lines = OUTBOX_RESULTS.read_bytes().splitlines()[-400:]
+            for raw in reversed(lines):
+                try:
+                    row = json.loads(raw)
+                except Exception:
+                    continue
+                if row.get("id") == item_id:
+                    return str(row.get("errmsg") or "")
+        except OSError:
+            pass
+        return ""
+
+    def _note_failure(self, item: dict, errmsg: str) -> tuple[str, bool]:
+        """Register one failed dispatch of an outbox row and decide
+        its fate. Returns (action, notify): action is "park" (keep
+        retrying in the lane), "drop" (wedge guard) or "deadletter"
+        (attempt cap); notify is True exactly once for a formal row
+        reaching FORMAL_STUCK_NOTIFY_ATTEMPTS.
+
+        ALL failure state is persisted: the parked record in
+        OUTBOX_PARKED (item payload, attempt count n, next retry
+        time, guard streaks, notified flag) and a mirror in
+        OUTBOX_RETRY ({n, next, notified}) so the CLI reply gate
+        and status tooling keep seeing the row as still-retrying.
+        Terminal actions remove both records."""
+        item_id = str(item.get("id") or "")
+        mode = item.get("mode", "")
+        if not item_id:
+            return "park", False
+        parked = self._load_parked()
+        rec = parked.get(item_id)
+        if rec is None:
+            rec = {"item": item, "n": 0, "parked_at": int(time.time()),
+                   "notice_streak": 0, "cdn_streak": 0, "notified": False}
+        rec["item"] = item
+        rec["n"] = int(rec.get("n") or 0) + 1
+        n = rec["n"]
+        rec["next"] = time.time() + retry_backoff_secs(n)
+        if mode == "send" and item.get("notice"):
+            # Wedge guard: unbound notice rows drop after
+            # SEND_NOTICE_DROP_AFTER_FAILURES consecutive failures.
+            rec["notice_streak"] = int(rec.get("notice_streak") or 0) + 1
+        if mode == "send_file":
+            # Wedge guard: only CDN-upload-500 failures count
+            # (errmsg names the CDN host AND a 500).
+            err = errmsg or ""
+            if "cdn.weixin.qq.com" in err and "500" in err:
+                rec["cdn_streak"] = int(rec.get("cdn_streak") or 0) + 1
+        notify = (mode in FORMAL_MODES
+                  and n >= FORMAL_STUCK_NOTIFY_ATTEMPTS
+                  and not rec.get("notified"))
+        if notify:
+            rec["notified"] = True
+        action = "park"
+        if (mode == "send" and item.get("notice")
+                and int(rec.get("notice_streak") or 0)
+                >= SEND_NOTICE_DROP_AFTER_FAILURES):
+            action = "drop"
+            log(f"DROPPING unbound send {item_id} after "
+                f"{rec['notice_streak']} consecutive failed attempts "
+                f"(wedge guard)")
+        elif (mode == "send_file"
+                and int(rec.get("cdn_streak") or 0)
+                >= SEND_FILE_CDN500_DROP_AFTER_FAILURES):
+            action = "drop"
+            log(f"DROPPING send_file {item_id} after "
+                f"{rec['cdn_streak']} consecutive CDN upload 500 "
+                f"failures (wedge guard)")
+        elif mode not in FORMAL_MODES and n >= SEND_MAX_ATTEMPTS:
+            action = "deadletter"
+            self.append_jsonl(OUTBOX_RESULTS, {
+                "id": item_id, "mode": mode, "ts": int(time.time()),
+                "ok": False,
+                "errmsg": (f"dead-lettered after {n} failed attempts; "
+                           "queue unblocked"),
+                "deadletter": True})
+            log(f"outbox {mode} {item_id}: dead-lettered after "
+                f"{n} attempts (retry lane)")
+        retry = self._load_retry()
+        if action == "park":
+            parked[item_id] = rec
+            mirror = {"n": n, "next": rec["next"]}
+            if rec.get("notified"):
+                mirror["notified"] = True
+            retry[item_id] = mirror
+        else:
+            parked.pop(item_id, None)
+            retry.pop(item_id, None)
+        self._save_parked(parked)
+        self._save_retry(retry)
+        return action, notify
+
+    def _cleanup_item(self, item_id: str) -> None:
+        """A row reached a terminal state (delivered): drop its
+        retry mirror, parked record and chunk-partial state."""
+        if not item_id:
+            return
+        retry = self._load_retry()
+        if item_id in retry:
+            retry.pop(item_id, None)
+            self._save_retry(retry)
+        parked = self._load_parked()
+        if item_id in parked:
+            parked.pop(item_id, None)
+            self._save_parked(parked)
+        partial = self._load_partial()
+        if item_id in partial:
+            partial.pop(item_id, None)
+            self._save_partial(partial)
 
     async def _notify_stuck_formal(self, client: httpx.AsyncClient,
                                    creds: dict, item: dict,
@@ -2247,8 +2333,10 @@ class Gateway:
         return fpath, False
 
     async def dispatch_outbox_item(self, client: httpx.AsyncClient, creds: dict, item: dict) -> bool:
-        """Return True if the item is consumed (success or permanent drop),
-        False if it failed transiently and must be retried (offset NOT advanced)."""
+        """Return True if the item is consumed (delivered or a
+        permanent skip: cancelled / suppressed / unroutable),
+        False if it failed transiently — the caller then parks it
+        in the retry lane via _note_failure (park-and-continue)."""
         item_id = item.get("id", "")
         mode = item.get("mode", "")
         content = item.get("content", "")
@@ -2388,12 +2476,10 @@ class Gateway:
             self.append_jsonl(OUTBOX_RESULTS, result)
             log(f"outbox {mode} {item_id}: ok=False err={result['errmsg']}")
             self.write_status()
-            if mode == "send" and item.get("notice") and self._send_notice_should_drop(item_id):
-                return True  # wedge guard: dropped, see helper
-            if mode == "send_file" and self._send_file_should_drop(
-                    item_id, result["errmsg"]):
-                return True  # wedge guard: CDN upload 500, see helper
-            return False  # transient: retry, do not advance offset
+            # Transient failure: the caller (outbox_loop / retry
+            # lane) parks the row via _note_failure; all wedge-guard
+            # and dead-letter decisions live there now.
+            return False
         # Persist the result BEFORE any cosmetic typing call, so a hang /
         # session drop during typing can never cause a resend on restart.
         self.append_jsonl(OUTBOX_RESULTS, result)
@@ -2410,133 +2496,103 @@ class Gateway:
             asyncio.create_task(
                 self._typing_best_effort(client, creds, typing_after[0], typing_after[1], typing_after[2])
             )
-        if mode == "send" and item.get("notice"):
-            # Wedge guard bookkeeping (result row already persisted
-            # above): a success resets the row's failure streak; the
-            # 5th consecutive failure drops the row (consumed) so a
-            # permanently rejected notice can never wedge the outbox.
-            # Real CLI sends are not notices and use the dead-letter path.
-            if result["ok"]:
-                self._send_notice_failures.pop(item_id, None)
-            elif self._send_notice_should_drop(item_id):
-                return True
-        if mode == "send_file":
-            # Same bookkeeping for the CDN-upload-500 wedge guard:
-            # a success resets the streak; the 3rd consecutive CDN
-            # 500 failure drops the row (consumed) so a dead upload
-            # endpoint cannot hold the outbox head hostage.
-            if result["ok"]:
-                self._send_file_failures.pop(item_id, None)
-            elif self._send_file_should_drop(
-                    item_id, result.get("errmsg", "")):
-                return True
+        # Failure bookkeeping (wedge guards, dead-letter, parked
+        # retries) is the caller's job now — see _note_failure.
         return bool(result["ok"])
 
     async def outbox_loop(self, client: httpx.AsyncClient, creds: dict) -> None:
+        """Park-and-continue outbox (2026-10-06): the main queue NEVER
+        waits behind a failing row. Each cycle: (1) drain the main
+        queue — a row that dispatches ok is consumed; a row that
+        fails is registered via _note_failure and the offset still
+        advances past it (parked / dropped / dead-lettered), so the
+        next row goes out in the same cycle; (2) run the retry lane —
+        parked rows whose backoff has expired get one dispatch each,
+        in due-time order; their fate is again decided by
+        _note_failure. Before this, one prepare-failed head row
+        froze ALL outbound for 30+ minutes (deep-dive evidence)."""
         while True:
             await asyncio.sleep(1.0)
-            if not OUTBOX.exists():
-                continue
-            offset = self._outbox_offset()
-            size = OUTBOX.stat().st_size
-            if offset > size:
-                offset = 0
-            if offset >= size:
-                continue
-            with OUTBOX.open("rb") as f:
-                f.seek(offset)
-                data = f.read()
-            consumed = 0
-            retry = self._load_retry()
-            for raw_line in complete_jsonl_lines(data):
-                parsed = parse_jsonl_line(raw_line)
-                if parsed is None or parsed.get("__invalid__"):
-                    if parsed and parsed.get("__invalid__"):
-                        log(f"outbox: skipping bad line at offset {offset + consumed}")
-                    consumed += len(raw_line) + 1
-                    try:
-                        write_offset(OUTBOX_OFFSET, offset + consumed)
-                    except OSError:
-                        pass
-                    continue
-                item = parsed
-                item_id = str(item.get("id") or "")
-                rec = retry.get(item_id) if item_id else None
-                if rec and float(rec.get("next") or 0) > time.time():
-                    # Head item is in retry backoff: hold the offset
-                    # and wait for its window instead of hammering
-                    # the provider every cycle (see SEND_MAX_ATTEMPTS
-                    # note: a hot retry loop kept a transient
-                    # "prepare failed" penalty alive and wedged the
-                    # whole outbox on 2026-10-05).
-                    try:
-                        write_offset(OUTBOX_OFFSET, offset + consumed)
-                    except OSError:
-                        pass
-                    await asyncio.sleep(
-                        min(float(rec["next"]) - time.time(), 30.0))
-                    break
-                consumed_ok = await self.dispatch_outbox_item(client, creds, item)
-                if not consumed_ok:
-                    # Transient failure (incl. chunk ret!=0): do NOT
-                    # advance offset past this item — but count the
-                    # attempt, back off, and dead-letter the item
-                    # after SEND_MAX_ATTEMPTS so a single poison row
-                    # can never block the channel forever.
-                    attempts = int((rec or {}).get("n") or 0) + 1
-                    if (item_id and attempts >= SEND_MAX_ATTEMPTS
-                            and item.get("mode", "") not in FORMAL_MODES):
-                        self.append_jsonl(OUTBOX_RESULTS, {
-                            "id": item_id, "mode": item.get("mode", ""),
-                            "ts": int(time.time()), "ok": False,
-                            "errmsg": (f"dead-lettered after {attempts} "
-                                       "failed attempts; queue unblocked"),
-                            "deadletter": True})
-                        log(f"outbox {item.get('mode')} {item_id}: "
-                            f"dead-lettered after {attempts} attempts")
-                        retry.pop(item_id, None)
-                        self._save_retry(retry)
-                        consumed_ok = True
-                    else:
-                        if item_id:
-                            rec_out = {
-                                "n": attempts,
-                                "next": time.time()
-                                + retry_backoff_secs(attempts)}
-                            notify = (
-                                item.get("mode", "") in FORMAL_MODES
-                                and attempts >= FORMAL_STUCK_NOTIFY_ATTEMPTS
-                                and not (rec or {}).get("notified"))
-                            if (rec or {}).get("notified"):
-                                rec_out["notified"] = True
-                            if notify:
-                                rec_out["notified"] = True
-                            retry[item_id] = rec_out
-                            self._save_retry(retry)
+            # ---- main queue pass ----
+            if OUTBOX.exists():
+                offset = self._outbox_offset()
+                size = OUTBOX.stat().st_size
+                if offset > size:
+                    offset = 0
+                if offset < size:
+                    with OUTBOX.open("rb") as f:
+                        f.seek(offset)
+                        data = f.read()
+                    consumed = 0
+                    parked_ids = set(self._load_parked().keys())
+                    for raw_line in complete_jsonl_lines(data):
+                        parsed = parse_jsonl_line(raw_line)
+                        if parsed is None or parsed.get("__invalid__"):
+                            if parsed and parsed.get("__invalid__"):
+                                log(f"outbox: skipping bad line at offset {offset + consumed}")
+                            consumed += len(raw_line) + 1
+                            try:
+                                write_offset(OUTBOX_OFFSET, offset + consumed)
+                            except OSError:
+                                pass
+                            continue
+                        item = parsed
+                        item_id = str(item.get("id") or "")
+                        if item_id and item_id in parked_ids:
+                            # Duplicate row for an already-parked id:
+                            # the lane owns it; just consume this copy.
+                            consumed += len(raw_line) + 1
+                            try:
+                                write_offset(OUTBOX_OFFSET, offset + consumed)
+                            except OSError:
+                                pass
+                            continue
+                        consumed_ok = await self.dispatch_outbox_item(
+                            client, creds, item)
+                        if consumed_ok:
+                            self._cleanup_item(item_id)
+                        else:
+                            _action, notify = self._note_failure(
+                                item, self._last_errmsg(item_id))
                             if notify:
                                 asyncio.create_task(
                                     self._notify_stuck_formal(
-                                        client, creds, item, attempts))
+                                        client, creds, item,
+                                        FORMAL_STUCK_NOTIFY_ATTEMPTS))
+                        # Success, park, drop and dead-letter ALL
+                        # advance the offset: the main queue moves on
+                        # in the same cycle either way.
+                        consumed += len(raw_line) + 1
                         try:
                             write_offset(OUTBOX_OFFSET, offset + consumed)
                         except OSError:
                             pass
-                        await asyncio.sleep(2.0)
-                        break
-                if consumed_ok:
-                    if item_id and item_id in retry:
-                        retry.pop(item_id, None)
-                        self._save_retry(retry)
-                    if item_id:
-                        partial = self._load_partial()
-                        if item_id in partial:
-                            partial.pop(item_id, None)
-                            self._save_partial(partial)
-                    consumed += len(raw_line) + 1
-                    try:
-                        write_offset(OUTBOX_OFFSET, offset + consumed)
-                    except OSError:
-                        pass
+            # ---- retry lane pass ----
+            try:
+                parked = self._load_parked()
+                now = time.time()
+                due = [rec for rec in parked.values()
+                       if float(rec.get("next") or 0) <= now]
+                due.sort(key=lambda r: float(r.get("next") or 0))
+                for rec in due:
+                    item = rec.get("item") or {}
+                    item_id = str(item.get("id") or "")
+                    if not item_id:
+                        continue
+                    consumed_ok = await self.dispatch_outbox_item(
+                        client, creds, item)
+                    if consumed_ok:
+                        self._cleanup_item(item_id)
+                    else:
+                        _action, notify = self._note_failure(
+                            item, self._last_errmsg(item_id))
+                        if notify:
+                            asyncio.create_task(
+                                self._notify_stuck_formal(
+                                    client, creds, item,
+                                    FORMAL_STUCK_NOTIFY_ATTEMPTS))
+            except Exception as e:
+                log(f"retry lane pass failed (continuing): {e}")
 
     # ---------- session ----------
 

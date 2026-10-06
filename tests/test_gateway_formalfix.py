@@ -159,6 +159,7 @@ gw.OUTBOX_OFFSET = LOOP / "outbox.offset"
 gw.OUTBOX_RESULTS = LOOP / "outbox_results.jsonl"
 gw.OUTBOX_RETRY = LOOP / "outbox_retry.json"
 gw.OUTBOX_PARTIAL = LOOP / "outbox_partial.json"
+gw.OUTBOX_PARKED = LOOP / "outbox_parked.json"
 gw.SEND_MAX_ATTEMPTS = 3
 gw.FORMAL_STUCK_NOTIFY_ATTEMPTS = 5
 gw.retry_backoff_secs = lambda attempt: 0.05
@@ -219,6 +220,64 @@ check("notified flag persisted",
       (retry.get("replyrow") or {}).get("notified") is True)
 check("send row retry record cleaned",
       "sendrow" not in retry)
+
+# ---------- 5. park-and-continue: a stuck head row no longer blocks ----------
+LOOP2 = SBX / "loop2"
+shutil.rmtree(LOOP2, ignore_errors=True)
+LOOP2.mkdir(parents=True, exist_ok=True)
+gw.OUTBOX = LOOP2 / "outbox.jsonl"
+gw.OUTBOX_OFFSET = LOOP2 / "outbox.offset"
+gw.OUTBOX_RESULTS = LOOP2 / "outbox_results.jsonl"
+gw.OUTBOX_RETRY = LOOP2 / "outbox_retry.json"
+gw.OUTBOX_PARTIAL = LOOP2 / "outbox_partial.json"
+gw.OUTBOX_PARKED = LOOP2 / "outbox_parked.json"
+gw.SEND_MAX_ATTEMPTS = 10
+gw.FORMAL_STUCK_NOTIFY_ATTEMPTS = 3
+
+g4 = bare_gateway()
+g4._notify_stuck_formal = fake_notify.__get__(g4)
+dispatched = []
+
+
+async def fail_only_stuck(self, client, creds, item):
+    dispatched.append(item.get("id"))
+    return item.get("id") != "stuckreply"
+
+
+g4.dispatch_outbox_item = fail_only_stuck.__get__(g4)
+rows2 = [
+    {"id": "stuckreply", "mode": "reply", "msgid": "M10", "content": "卡住的"},
+    {"id": "laterow", "mode": "send", "to_user_id": "u1", "content": "后面的"},
+    {"id": "thirdrow", "mode": "send", "to_user_id": "u1", "content": "第三条"},
+]
+gw.OUTBOX.write_text("".join(json.dumps(r) + "\n" for r in rows2))
+gw.OUTBOX_OFFSET.write_text("0")
+
+
+async def run_loop2():
+    task = asyncio.create_task(g4.outbox_loop(None, {}))
+    await asyncio.sleep(6)
+    task.cancel()
+
+
+asyncio.run(run_loop2())
+off2 = int(gw.OUTBOX_OFFSET.read_text())
+check("main queue fully consumed despite stuck head",
+      off2 >= gw.OUTBOX.stat().st_size)
+check("rows behind the stuck head were dispatched promptly",
+      "laterow" in dispatched and "thirdrow" in dispatched)
+parked2 = json.loads(gw.OUTBOX_PARKED.read_text())
+check("stuck formal row is parked, not dropped",
+      "stuckreply" in parked2
+      and int(parked2["stuckreply"].get("n") or 0) >= 2
+      and parked2["stuckreply"]["item"]["id"] == "stuckreply")
+check("parked state survives a fresh instance (restart-proof)",
+      "stuckreply" in bare_gateway()._load_parked())
+retry2 = json.loads(gw.OUTBOX_RETRY.read_text())
+check("retry mirror tracks the parked row",
+      int((retry2.get("stuckreply") or {}).get("n") or 0) >= 2)
+check("delivered rows leave no parked/retry residue",
+      "laterow" not in parked2 and "laterow" not in retry2)
 
 fails = [n for n, ok_ in RESULTS if not ok_]
 print(f"\n== {len(RESULTS) - len(fails)}/{len(RESULTS)} passed ==")
