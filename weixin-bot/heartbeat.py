@@ -110,6 +110,22 @@ def main() -> int:
     started = time.time()
     absent_checks = 0
     pid = os.getpid()
+    # Start record (2026-10-06): exits were already logged, but a
+    # loop that died before its first controlled exit left NO trace
+    # at all — one batch was fail-stopped as heartbeat-less while
+    # its worker insisted heartbeat-start had succeeded, and there
+    # was nothing to check. A start line makes "never started"
+    # vs "started then vanished" distinguishable.
+    try:
+        with open(hb_dir / "loop.log", "a", encoding="utf-8") as handle:
+            handle.write(json.dumps({
+                "ts": started,
+                "msgids": [item[0] for item in paths],
+                "pid": pid,
+                "event": "start",
+            }, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
 
     def owns(msgid_pid: Path) -> bool:
         return read_pid_file(msgid_pid) == pid
