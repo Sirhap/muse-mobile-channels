@@ -17,6 +17,12 @@ dead batch "alive" for long:
   -> exit;
 - a stop marker appears (CLI `heartbeat-stop`) -> exit;
 - MAX_AGE_SECS elapse -> exit (a still-working worker restarts it).
+  (Repriced 20 -> 15 min on 2026-10-07: a worker died silently at
+  a TTS step -- six 0-byte outputs, no error -- and the loop kept
+  beating for its full 20 minutes, masking the death until the
+  hook could declare it. 15 min caps the worst-case masking while
+  keeping tolerance for a genuinely long silent stretch; workers
+  re-arm with heartbeat-start on very long tasks.)
 On exit it removes only the heartbeat files this process owns.
 A newer loop for the same msgid keeps its own pid file, so this
 exit cannot delete the successor's beat.
@@ -66,7 +72,7 @@ def _env_secs(name: str, default: float) -> float:
 
 INTERVAL_SECS = _env_secs("HATCH_HB_INTERVAL", 60)
 GRACE_SECS = _env_secs("HATCH_HB_GRACE", 150)
-MAX_AGE_SECS = _env_secs("HATCH_HB_MAXAGE", 20 * 60)
+MAX_AGE_SECS = _env_secs("HATCH_HB_MAXAGE", 15 * 60)
 ABSENT_CHECKS_TO_EXIT = 2
 
 
