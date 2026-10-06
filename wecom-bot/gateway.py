@@ -1104,6 +1104,58 @@ class Gateway:
         except OSError:
             pass
 
+    def _partial_for(self, item_id: str) -> dict:
+        record = self._load_partial().get(str(item_id)) or {}
+        return dict(record) if isinstance(record, dict) else {}
+
+    def _mark_partial(self, item_id: str, fields: dict) -> None:
+        """Remember how far a multi-chunk send got, so a retry does not repeat it."""
+        if not item_id:
+            return
+        stored = self._load_partial()
+        previous = stored.get(str(item_id)) or {}
+        merged = dict(previous) if isinstance(previous, dict) else {}
+        merged.update(fields)
+        stored[str(item_id)] = merged
+        self._save_partial(stored)
+
+    def _clear_partial(self, item_id: str) -> None:
+        if not item_id:
+            return
+        stored = self._load_partial()
+        if str(item_id) in stored:
+            stored.pop(str(item_id), None)
+            self._save_partial(stored)
+
+    async def _send_markdown_chunks(
+        self, item_id: str, chatid: str, chat_type: int, chunks: list[str], start: int = 0,
+    ) -> dict:
+        """Send markdown chunks, skipping indexes already marked sent."""
+        sent = int(self._partial_for(item_id).get("sent_chunks") or 0)
+        begin = max(start, sent)
+        resp: dict = {"errcode": 0}
+        for index, part in enumerate(chunks):
+            if index < begin:
+                continue
+            frame = await self.send_frame(
+                {
+                    "cmd": "aibot_send_msg",
+                    "headers": {"req_id": self.new_req_id("send")},
+                    "body": {
+                        "chatid": chatid,
+                        "chat_type": chat_type,
+                        "msgtype": "markdown",
+                        "markdown": {"content": part},
+                    },
+                },
+                wait_response=True,
+            )
+            resp = frame if isinstance(frame, dict) else {"errcode": -1, "errmsg": "no response"}
+            if resp.get("errcode") != 0:
+                return resp
+            self._mark_partial(item_id, {"sent_chunks": index + 1})
+        return resp
+
     @staticmethod
     def _delivered_reply_before(item: dict) -> bool:
         """Sending-layer late suppression (fix, 2026-10-04 evening,
@@ -2046,6 +2098,7 @@ class Gateway:
                     if item_id and item_id in retry:
                         retry.pop(item_id, None)
                         self._save_retry(retry)
+                    self._clear_partial(item_id)
                     consumed += len(raw_line) + 1
                     try:
                         write_offset(OUTBOX_OFFSET, offset + consumed)
@@ -2071,7 +2124,7 @@ class Gateway:
             result["suppressed"] = True
             self.append_jsonl(OUTBOX_RESULTS, result)
             log(f"outbox {mode} {item_id}: skipped, already replied msgid={_mid}")
-            return False  # consumed by the outbox loop; never reaches the user
+            return True
         try:
             if mode == "reply" and self.reqinfo(item.get("msgid", "")).get("event"):
                 # Follow-up to a template_card_event: the event req_id has
@@ -2083,25 +2136,11 @@ class Gateway:
                     result["errmsg"] = f"no chatid stored for event msgid {item.get('msgid')}"
                     self.append_jsonl(OUTBOX_RESULTS, result)
                     log(f"outbox reply {item_id}: {result['errmsg']}")
-                    return False
+                    return True
                 chat_type = 2 if info.get("chattype") == "group" else 1
-                resp = {"errcode": 0}
-                for part in split_chunks(content):
-                    resp = await self.send_frame(
-                        {
-                            "cmd": "aibot_send_msg",
-                            "headers": {"req_id": self.new_req_id("send")},
-                            "body": {
-                                "chatid": target_chatid,
-                                "chat_type": chat_type,
-                                "msgtype": "markdown",
-                                "markdown": {"content": part},
-                            },
-                        },
-                        wait_response=True,
-                    )
-                    if resp.get("errcode") != 0:
-                        break
+                resp = await self._send_markdown_chunks(
+                    item_id, target_chatid, chat_type, split_chunks(content) or [""],
+                )
             elif mode == "reply":
                 info = self.reqinfo(item.get("msgid", ""))
                 orig_req_id = info.get("req_id", "")
@@ -2109,11 +2148,12 @@ class Gateway:
                     result["errmsg"] = f"no req_id stored for msgid {item.get('msgid')}"
                     self.append_jsonl(OUTBOX_RESULTS, result)
                     log(f"outbox reply {item_id}: {result['errmsg']}")
-                    return False
+                    return True
                 stream_id = info.get("stream_id", "")
-                chunks = split_chunks(content)
-                resp = None
-                if stream_id:
+                chunks = split_chunks(content) or [""]
+                partial = self._partial_for(item_id)
+                resp = {"errcode": 0} if partial.get("stream_finish_sent") else None
+                if stream_id and resp is None:
                     # Close the stream opened when the message arrived: this
                     # replaces the "thinking" placeholder with the answer.
                     resp = await self.respond(
@@ -2123,7 +2163,9 @@ class Gateway:
                             "stream": {"id": stream_id, "finish": True, "content": chunks[0]},
                         },
                     )
-                    if resp.get("errcode") == -1:
+                    if resp.get("errcode") == 0:
+                        self._mark_partial(item_id, {"stream_finish_sent": True, "sent_chunks": 1})
+                    elif resp.get("errcode") == -1:
                         log(f"outbox reply {item_id}: stream finish ack timed out; retrying the stream, not a second markdown")
                     elif resp.get("errcode") != 0:
                         log(f"outbox reply {item_id}: stream finish failed errcode={resp.get('errcode')}, falling back to markdown")
@@ -2133,30 +2175,20 @@ class Gateway:
                         orig_req_id,
                         {"msgtype": "markdown", "markdown": {"content": chunks[0]}},
                     )
+                    if isinstance(resp, dict) and resp.get("errcode") == 0:
+                        self._mark_partial(item_id, {"stream_finish_sent": True, "sent_chunks": 1})
                 # Overflow chunks (reply longer than CHUNK_LIMIT) follow as
-                # active messages to the same chat.
-                if resp.get("errcode") == 0 and len(chunks) > 1:
+                # active messages to the same chat. A retry skips chunks
+                # whose send already returned success.
+                if isinstance(resp, dict) and resp.get("errcode") == 0 and len(chunks) > 1:
                     target_chatid = info.get("chatid", "")
                     chat_type = 2 if info.get("chattype") == "group" else 1
                     if not target_chatid:
                         resp = {"errcode": -2, "errmsg": "no chatid stored for overflow chunks"}
                     else:
-                        for extra in chunks[1:]:
-                            resp = await self.send_frame(
-                                {
-                                    "cmd": "aibot_send_msg",
-                                    "headers": {"req_id": self.new_req_id("send")},
-                                    "body": {
-                                        "chatid": target_chatid,
-                                        "chat_type": chat_type,
-                                        "msgtype": "markdown",
-                                        "markdown": {"content": extra},
-                                    },
-                                },
-                                wait_response=True,
-                            )
-                            if resp.get("errcode") != 0:
-                                break
+                        resp = await self._send_markdown_chunks(
+                            item_id, target_chatid, chat_type, chunks, start=1,
+                        )
             elif mode == "update":
                 info = self.reqinfo(item.get("msgid", ""))
                 orig_req_id = info.get("req_id", "")
@@ -2165,7 +2197,7 @@ class Gateway:
                     result["errmsg"] = f"no open stream for msgid {item.get('msgid')}"
                     self.append_jsonl(OUTBOX_RESULTS, result)
                     log(f"outbox update {item_id}: {result['errmsg']}")
-                    return False
+                    return True
                 resp = await self.respond(
                     orig_req_id,
                     {
@@ -2180,7 +2212,7 @@ class Gateway:
                     result["errmsg"] = f"no req_id stored for msgid {item.get('msgid')}"
                     self.append_jsonl(OUTBOX_RESULTS, result)
                     log(f"outbox reply_file {item_id}: {result['errmsg']}")
-                    return False
+                    return True
                 fpath = item.get("file_path", "")
                 file_path = Path(fpath)
                 if not outbound_file_allowed(file_path, CRED_FILE, [muse_home(), STATE, BASE, Path("/tmp")]):
@@ -2278,7 +2310,7 @@ class Gateway:
                     result["errmsg"] = f"no req_id stored for msgid {item.get('msgid')}"
                     self.append_jsonl(OUTBOX_RESULTS, result)
                     log(f"outbox reply_confirm {item_id}: {result['errmsg']}")
-                    return False
+                    return True
                 card = build_confirm_card(
                     item.get("title", "") or "请确认",
                     item.get("desc", ""),
@@ -2358,7 +2390,7 @@ class Gateway:
             else:
                 result["errmsg"] = f"unknown mode {mode}"
                 self.append_jsonl(OUTBOX_RESULTS, result)
-                return False
+                return True
             result["errcode"] = resp.get("errcode")
             result["errmsg"] = resp.get("errmsg", "")
             result["ok"] = resp.get("errcode") == 0

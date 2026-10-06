@@ -8,7 +8,6 @@ StartLimitBurst=5
 [Service]
 Type=simple
 User=hatch
-Group=hatch
 WorkingDirectory=/home/hatch/workspace/wecom-bot
 Environment=PYTHONUNBUFFERED=1
 Environment=WECOM_CRED_FILE=/home/hatch/.config/wecom-bot/credentials.env

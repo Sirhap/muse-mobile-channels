@@ -176,10 +176,23 @@ def reply_block_reason_for_row(
         )
     if result.get("deadletter") is True or attempts >= SEND_MAX_ATTEMPTS:
         return None
-    return (
-        f"msgid {msgid} already has a formal reply still retrying "
-        f"after a transient failure (outbox id {row_id})"
-    )
+    if attempts and attempts < SEND_MAX_ATTEMPTS:
+        return (
+            f"msgid {msgid} already has a formal reply still retrying "
+            f"after a transient failure (outbox id {row_id})"
+        )
+    # A failed result with no live retry record is in flight only while it
+    # is recent. Older ok=false rows are finished history (the previous
+    # WeCom gateway consumed those failures) and must not block a new reply.
+    stamp = result.get("ts")
+    if not isinstance(stamp, (int, float)):
+        stamp = row.get("queued_at") or now
+    if now - float(stamp) < window:
+        return (
+            f"msgid {msgid} already has a formal reply still retrying "
+            f"after a transient failure (outbox id {row_id})"
+        )
+    return None
 
 
 def merge_queue_admin(
@@ -291,6 +304,10 @@ def outbound_file_allowed(path: Path, cred_file: Path, roots: list[Path]) -> boo
         return False
     if ".ssh" in resolved.parts:
         return False
+    parts = resolved.parts
+    for index, part in enumerate(parts[:-1]):
+        if part == ".config" and parts[index + 1] in ("weixin-bot", "wecom-bot"):
+            return False
     try:
         cred = cred_file.expanduser().resolve(strict=False)
     except OSError:
