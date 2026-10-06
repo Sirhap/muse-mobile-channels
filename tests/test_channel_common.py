@@ -3,6 +3,7 @@
 import json
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -29,6 +30,7 @@ from channel_common import (  # noqa: E402
     write_offset,
     read_offset,
 )
+import login  # noqa: E402
 from login import status_url  # noqa: E402
 
 
@@ -90,12 +92,31 @@ class OutboxTests(unittest.TestCase):
             self.assertEqual(read_offset(path), 42)
             self.assertTrue(path.read_text(encoding="utf-8").strip())
 
-    def test_transient_failure_blocks_a_second_reply(self) -> None:
+    def test_recent_failure_blocks_a_second_reply(self) -> None:
+        reason = reply_block_reason_for_row(
+            "m1",
+            {"id": "row", "mode": "reply", "msgid": "m1", "queued_at": 9_990},
+            {"id": "row", "ok": False, "ts": 9_990},
+            now=10_000,
+        )
+        self.assertIn("still retrying", reason or "")
+
+    def test_old_failure_without_retry_allows_another_reply(self) -> None:
         reason = reply_block_reason_for_row(
             "m1",
             {"id": "row", "mode": "reply", "msgid": "m1", "queued_at": 0},
-            {"id": "row", "ok": False},
+            {"id": "row", "ok": False, "ts": 0},
             now=10_000,
+        )
+        self.assertIsNone(reason)
+
+    def test_active_retry_record_keeps_blocking(self) -> None:
+        reason = reply_block_reason_for_row(
+            "m1",
+            {"id": "row", "mode": "reply", "msgid": "m1", "queued_at": 0},
+            {"id": "row", "ok": False, "ts": 0},
+            now=10_000,
+            retry={"row": {"n": 2, "next": 10_100}},
         )
         self.assertIn("still retrying", reason or "")
 
@@ -177,6 +198,10 @@ class SafetyTests(unittest.TestCase):
             note.parent.mkdir()
             note.write_text("hello\n", encoding="utf-8")
             self.assertFalse(outbound_file_allowed(cred, cred, [root]))
+            other = root / ".config" / "wecom-bot" / "credentials.env"
+            other.parent.mkdir(parents=True)
+            other.write_text("SECRET=1\n", encoding="utf-8")
+            self.assertFalse(outbound_file_allowed(other, cred, [root]))
             self.assertTrue(outbound_file_allowed(note, cred, [root]))
 
     def test_feedback_clear_accepts_json_or_bare_msgid(self) -> None:
@@ -204,6 +229,21 @@ class SafetyTests(unittest.TestCase):
         self.assertIn("0", kept)
         self.assertIn("4", kept)
         self.assertNotIn("1", kept)
+
+    def test_pending_qrcode_keeps_the_session_that_asked_for_a_code(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "login.json"
+            path.write_text(json.dumps({
+                "status": "need_verify_code",
+                "qrcode": "qr-session",
+                "ts": time.time(),
+            }), encoding="utf-8")
+            previous = login.LOGIN_STATE
+            login.LOGIN_STATE = path
+            try:
+                self.assertEqual(login.pending_qrcode(), "qr-session")
+            finally:
+                login.LOGIN_STATE = previous
 
     def test_verify_code_is_on_the_status_url(self) -> None:
         url = status_url("qr-session", "2468")
