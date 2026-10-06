@@ -283,6 +283,45 @@ batch_since = batch.get("since")
 batch_since = float(batch_since) if isinstance(batch_since, (int, float)) else 0.0
 batch_active = bool(batch_ids) and batch_since > 0
 
+# --- delivered-reply evidence (2026-10-07) ---
+# Batch completion counts only replies the gateway actually
+# DELIVERED (ok=true rows in outbox_results.jsonl, mapped back to
+# msgids through the queue rows' ids) -- a reply that was merely
+# queued and later cancelled/suppressed must not silently close
+# its batch. And a reply still retrying in the gateway's park
+# lane (state/outbox_parked.json) counts as batch activity: its
+# worker HAS answered, delivery is the gateway's job, and the
+# batch must not be fail-stopped out from under the lane (the
+# gateway would then suppress the parked answer as cancelled).
+_delivered_modes = {}
+_parked_msgids = set()
+_parked_mtime = 0.0
+try:
+    _id2msgid = {}
+    for _qr in load_jsonl(outbox_path):
+        if _qr.get("id"):
+            _id2msgid[str(_qr.get("id"))] = str(_qr.get("msgid") or "")
+    _state_dir = os.path.dirname(outbox_path)
+    for _rr in load_jsonl(os.path.join(_state_dir, "outbox_results.jsonl")):
+        if _rr.get("ok") and _rr.get("mode") in ("reply", "reply_file", "send"):
+            _m = _id2msgid.get(str(_rr.get("id") or ""))
+            if _m:
+                _delivered_modes.setdefault(_m, set()).add(_rr.get("mode"))
+except (OSError, json.JSONDecodeError, AttributeError):
+    _delivered_modes = {}
+try:
+    _ppath = os.path.join(os.path.dirname(outbox_path), "outbox_parked.json")
+    _parked_mtime = os.path.getmtime(_ppath)
+    with open(_ppath, encoding="utf-8") as _pf:
+        for _prec in (json.load(_pf) or {}).values():
+            _pm = ((_prec.get("item") or {}).get("msgid")
+                   if isinstance(_prec, dict) else None)
+            if _pm:
+                _parked_msgids.add(str(_pm))
+except (OSError, json.JSONDecodeError, AttributeError):
+    _parked_msgids = set()
+    _parked_mtime = 0.0
+
 batch_done = False
 orphaned_entries = []
 orphan_info = []
@@ -318,8 +357,6 @@ if batch_active:
     last_activity = batch_since
     for r in outbox_rows:
         rt = row_ts(r)
-        if r.get("mode") in ("reply", "reply_file") and r.get("msgid") in batch_ids:
-            batch_replied = True
         if rt >= batch_since - 2 and r.get("msgid") in batch_ids:
             if rt > last_activity:
                 last_activity = rt
@@ -327,6 +364,12 @@ if batch_active:
         _hb = _hb_ts(_mid)
         if _hb > last_activity:
             last_activity = _hb
+    if any({"reply", "reply_file"} & _delivered_modes.get(str(_m), set())
+           for _m in batch_ids):
+        batch_replied = True
+    if _parked_msgids & {str(_m) for _m in batch_ids}:
+        if _parked_mtime > last_activity:
+            last_activity = _parked_mtime
     if batch_replied:
         batch_done = True
     elif now - last_activity >= BATCH_CAP_SECS:
@@ -398,14 +441,18 @@ if detached:
         for r in drows:
             rt = dts(r)
             if r.get("msgid") in dids and rt >= dsince - 2:
-                if r.get("mode") in ("reply", "reply_file", "send"):
-                    dreplied = True
                 if rt > dlast:
                     dlast = rt
         for _mid in dids:
             _hb = _hb_ts(_mid)
             if _hb > dlast:
                 dlast = _hb
+        if any({"reply", "reply_file", "send"}
+               & _delivered_modes.get(str(_m), set()) for _m in dids):
+            dreplied = True
+        if _parked_msgids & {str(_m) for _m in dids}:
+            if _parked_mtime > dlast:
+                dlast = _parked_mtime
         if dreplied:
             continue
         if now - dlast >= BATCH_CAP_SECS:
