@@ -11,6 +11,13 @@
 !/weixin-bot/
 !/wecom-bot/
 !/channel-restore/
+!/hooks/
+!/hooks/scripts/
+!/hooks/scripts/*.sh
+!/hooks/definitions/
+!/hooks/definitions/*.json
+!/tests/
+!/tests/*.py
 !/slash-commands-2026-10-04.md
 
 # Runtime / local-only — never commit
