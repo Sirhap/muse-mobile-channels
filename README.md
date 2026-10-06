@@ -37,11 +37,12 @@ cd ../wecom-bot && python3 -m venv .venv && .venv/bin/pip install -r requirement
 # then install the systemd units from each bot dir / channel-restore/
 ```
 
-The gateway units run as user `hatch` with `HOME` and `MUSE_HOME` set to
-`/home/hatch`, so slash commands and the inbox hook share one state
-directory. `channel-restore` stays root so it can reinstall systemd
-units; it still resolves the install home to `/home/hatch` when the
-process home is `/root`.
+The gateway units set `HOME` and `MUSE_HOME` to `/home/hatch`, so the
+gateways, slash commands, and the inbox hooks share one state
+directory even when a unit's process home would otherwise be `/root`
+(`channel_common.muse_home()` resolves the install home the same
+way). `channel-restore` runs as root so it can reinstall systemd
+units, including its own timer.
 
 Syntax-verified 2026-10-04: all Python files compile, shell scripts pass
 `bash -n`, hook JSON parses.
@@ -85,6 +86,13 @@ channel is touched:
   notification, and large-file compression (PIL / ffmpeg). Run with
   the weixin-bot venv python (needs httpx + PIL) and ffmpeg on PATH;
   a >2MB test video can be supplied via `MUSE_TEST_VIDEO`.
+- `tests/test_wecom_formal_exemption.py` — WeCom gateway: formal
+  replies are likewise never dead-lettered. Run with the wecom-bot
+  venv python.
+- `tests/test_channel_common.py` — the shared `channel_common.py`
+  guards (atomic writes, JSONL half-line handling, queue-admin
+  merging, reply gate, path/URL allowlists). Run with the weixin-bot
+  venv python (one case imports `login.py`).
 
 ## Reporting bugs — including via your own Muse / AI agent
 
