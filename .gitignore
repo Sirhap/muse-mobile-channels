@@ -20,8 +20,20 @@
 !/tests/
 !/tests/*.py
 !/slash-commands-2026-10-04.md
+!/native-bridge/
+!/native-bridge/native_bridge.py
+!/native-bridge/config.json
+!/native-bridge/native-bridge.service
 
 # Runtime / local-only — never commit
+native-bridge/state.json
+native-bridge/status.json
+native-bridge/spool/
+native-bridge/shadow/
+native-bridge/enabled-*
+native-bridge/divert-*
+native-bridge/queue_admin-*.jsonl
+native-bridge/probe_*.py
 .venv/
 __pycache__/
 *.pyc

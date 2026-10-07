@@ -321,7 +321,7 @@ def log(msg: str) -> None:
 
 
 # ---------- slash commands (gateway-intercepted) ----------
-# The user can send /ping, /status, /stop, /new, /jump, /check,
+# The user can send /ping, /status, /stop, /new, /check,
 # /queue, /help and /subagent in chat. Commands are intercepted
 # after the allowlist +
 # dedupe checks and BEFORE the inbox write: they never wake a worker;
@@ -332,8 +332,8 @@ HOOK_STATE_DIR = muse_home() / "hooks" / "state" / "wecom-bot"
 CLI_WRAPPER = BASE / "wecom"
 CHAN_LABEL = "企业微信"
 
-SLASH_COMMANDS = {"ping", "status", "stop", "new", "jump", "check", "queue", "help", "subagent"}
-SLASH_ALIASES = {"插队": "jump", "自检": "check", "命令": "help", "副助手": "subagent"}
+SLASH_COMMANDS = {"ping", "status", "stop", "new", "check", "queue", "help", "subagent"}
+SLASH_ALIASES = {"自检": "check", "命令": "help", "副助手": "subagent", "新会话": "new"}
 
 # User-facing times in acks are rendered in the user's timezone; the VM
 # itself runs UTC, so plain localtime would show times 8h off.
@@ -358,7 +358,7 @@ def parse_slash_command(text):
 
     Normalizes a leading fullwidth slash and matches the command name
     case-insensitively. arg is the remainder after the command token
-    (only /jump uses it)."""
+    (used by /subagent, /queue drop and similar flows)."""
     if not text:
         return None
     t = text.strip()
@@ -441,6 +441,173 @@ def enqueue_queue_admin(hook_state_dir, action, msgids) -> bool:
         return False
 
 
+def _bridge_queue_lines(channel):
+    """Native-bridge queue snapshot: (display_text, active_msgids).
+
+    Reads ~/workspace/native-bridge/state.json; fail-silent so /queue and
+    /stop keep working when the bridge is down or has nothing."""
+    try:
+        st = json.loads(Path(
+            "/home/hatch/workspace/native-bridge/state.json"
+        ).read_text(encoding="utf-8"))
+        snap = (st.get("channels", {}).get(channel, {})
+                or {}).get("queue_snapshot", {}) or {}
+        act = snap.get("active", [])
+        q = snap.get("queued", [])
+        if not act and not q:
+            return "", []
+        text = f"\n原生桥：进行中 {len(act)} 条"
+        if act:
+            text += "（" + "、".join(
+                f"{a.get('lane', 'main')} {a.get('secs', 0)}s"
+                for a in act) + "）"
+        text += f"，排队 {len(q)} 条"
+        return text, [a.get("msgid") for a in act if a.get("msgid")]
+    except Exception:
+        return "", []
+
+
+def _fmt_dur(secs):
+    secs = int(secs or 0)
+    if secs < 60:
+        return f"{secs}秒"
+    if secs < 3600:
+        return f"{secs // 60}分钟"
+    return f"{secs // 3600}小时{(secs % 3600) // 60}分"
+
+
+def _spool_texts(channel):
+    """{msgid: text} from the bridge spool (tail-read, fail-silent)."""
+    try:
+        p = Path(f"/home/hatch/workspace/native-bridge/"
+                 f"spool/{channel}.jsonl")
+        with open(p, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 524288))
+            data = f.read().decode("utf-8", "replace")
+        out = {}
+        for line in data.splitlines():
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if r.get("msgid"):
+                out[r["msgid"]] = r.get("text", "")
+        return out
+    except Exception:
+        return {}
+
+
+def _task_overview_text(channel, state_dir, hook_state_dir):
+    """Unified task board appended to /status: every in-flight or queued
+    task across the native bridge, the cold hook path and subagent jobs,
+    plus bridge lifetime counters. Fail-silent per section."""
+    try:
+        lines = []
+        st = json.loads(Path(
+            "/home/hatch/workspace/native-bridge/state.json"
+        ).read_text(encoding="utf-8"))
+        ch = st.get("channels", {}).get(channel, {}) or {}
+        snap = ch.get("queue_snapshot", {}) or {}
+        texts = _spool_texts(channel)
+        inbox_texts = _inbox_texts(state_dir)
+        for a in snap.get("active", []):
+            mid = a.get("msgid", "")
+            txt = texts.get(mid) or inbox_texts.get(mid, "")
+            lines.append(f"▶ 桥 {_fmt_dur(a.get('secs', 0))} "
+                         f"「{_excerpt(txt)}」")
+        batch, _ids, pcount, dcount = _queue_summary(hook_state_dir)
+        mids = batch.get("msgids") or []
+        if mids:
+            since = batch.get("since")
+            age = (time.time() - float(since)) \
+                if isinstance(since, (int, float)) else 0
+            lines.append(f"▶ 冷通道 {_fmt_dur(age)} "
+                         f"「{_excerpt(inbox_texts.get(mids[0], ''))}」"
+                         f"（本批 {len(mids)} 条）")
+        qparts = []
+        bq = snap.get("queued", [])
+        if bq:
+            qparts.append(f"桥 {len(bq)} 条")
+        if pcount:
+            qparts.append(f"冷通道 {pcount} 条")
+        if dcount:
+            qparts.append(f"冷通道并行 {dcount} 条")
+        if qparts:
+            lines.append("⏳ 排队：" + "、".join(qparts))
+        jobs = _read_json_file(hook_state_dir / "subagent_jobs.json", {}) or {}
+        jmap = jobs.get("jobs", {}) if isinstance(jobs, dict) else {}
+        running = sum(1 for j in jmap.values()
+                      if isinstance(j, dict) and j.get("status") == "running")
+        queued = sum(1 for j in jmap.values()
+                     if isinstance(j, dict) and j.get("status") == "queued")
+        if running or queued:
+            lines.append(f"🤖 副助手：运行 {running} · 排队 {queued}")
+        proc = ch.get("processed")
+        if proc is not None:
+            lines.append(f"📈 桥累计：已答 {proc} 条 · "
+                         f"回落 {ch.get('fallbacks', 0)} 条 · "
+                         f"取消 {ch.get('cancels', 0)} 条")
+        if not lines:
+            return "\n🧭 任务总览：当前没有进行中或排队的任务"
+        return "\n🧭 任务总览\n" + "\n".join(lines)
+    except Exception:
+        return ""
+
+
+BRIDGE_ACK_TEMPLATE = "已收到，排队第 {n} 位（原生通道），前面有任务在跑；/stop 取消"
+
+
+def _bridge_snapshot(channel):
+    """(active_list, queued_list) from the bridge queue_snapshot.
+    Fail-silent ([], [])."""
+    try:
+        st = json.loads(Path(
+            "/home/hatch/workspace/native-bridge/state.json"
+        ).read_text(encoding="utf-8"))
+        snap = (st.get("channels", {}).get(channel, {})
+                or {}).get("queue_snapshot", {}) or {}
+        return snap.get("active", []) or [], snap.get("queued", []) or []
+    except Exception:
+        return [], []
+
+
+def _bridge_queued_rows(channel):
+    """[(msgid, text)] for rows currently queued in the native bridge,
+    in queue order, from the bridge snapshot + spool texts. Fail-silent."""
+    try:
+        st = json.loads(Path(
+            "/home/hatch/workspace/native-bridge/state.json"
+        ).read_text(encoding="utf-8"))
+        snap = (st.get("channels", {}).get(channel, {})
+                or {}).get("queue_snapshot", {}) or {}
+        qids = snap.get("queued", [])
+        if not qids:
+            return []
+        texts = {}
+        spool = Path(f"/home/hatch/workspace/native-bridge/"
+                     f"spool/{channel}.jsonl")
+        for line in spool.read_text(encoding="utf-8").splitlines():
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if r.get("msgid"):
+                texts[r["msgid"]] = r.get("text", "")
+        return [(m, texts.get(m, "")) for m in qids]
+    except Exception:
+        return []
+
+
+def _bridge_admin(channel, action, msgids):
+    """Append a queue-admin instruction for the native bridge."""
+    return _append_jsonl_file(
+        Path(f"/home/hatch/workspace/native-bridge/"
+             f"queue_admin-{channel}.jsonl"),
+        {"action": action, "msgids": list(msgids), "ts": time.time()})
+
+
 def _queue_summary(hook_state_dir):
     """(batch, running_ids, pending_count, detached_count) read from the
     hook state files; tolerant of missing/corrupt files."""
@@ -477,7 +644,7 @@ def is_stop_request(text):
     return False
 
 
-SOFT_ACK_TEMPLATE = "已收到，排队第 {n} 位，当前任务进行中；/jump 插队、/stop 取消"
+SOFT_ACK_TEMPLATE = "已收到，排队第 {n} 位，当前任务进行中；/stop 取消"
 
 
 def soft_ack_text(state_dir, hook_state_dir, text):
@@ -537,15 +704,15 @@ def soft_ack_text(state_dir, hook_state_dir, text):
 
 
 SLASH_HELP_TEXT = """【命令表】在聊天里直接发，网关秒回、不排队
+普通消息走原生通道秒回；长任务在原生通道排队，冷通道保底
 /ping 连通自检
-/status 渠道状态汇总（计数版）
-/queue 队列明细（逐条版）
-/queue clear 清掉排队中未开工的消息
-/queue drop N 只删排队中第 N 条
-/jump [文本] 强制插队：不等阈值、不取消长任务（别名 /插队）
-/stop 取消正在跑的全部任务
+/status 渠道状态 + 任务总览（谁在跑、谁在排队、副助手、累计）
+/queue 队列明细（冷通道 + 原生桥都列）
+/queue clear 清掉排队中未开工的消息（桥和冷通道一起清）
+/queue drop N 只删冷通道排队第 N 条；/queue drop 桥N 删原生桥排队第 N 条
+/stop 取消正在跑的任务
 /subagent <任务> 派副助手并行执行（别名 /副助手）；/subagent list 查、/subagent stop <编号> 停
-/new 开新话题：清会话上下文
+/new 开新会话：换一个全新的原生会话，之前的对话不再带入（别名 /新会话）
 /check 一次性自检，跑完即结束（别名 /自检）
 /help 本命令表（别名 /命令）
 注：只有以上是命令；其他以 / 开头的话会当普通消息处理。"""
@@ -659,6 +826,20 @@ def slash_run_check(chan_label, state_dir, hook_state_dir):
     else:
         items.append(("取消登记文件", True, "无登记（正常）"))
 
+    try:
+        bkey = "weixin" if "weixin" in hook_state_dir.name else "wecom"
+        bmode = _read_json_file(
+            Path("/home/hatch/workspace/native-bridge/status.json"), {}) or {}
+        bts = bmode.get("ts")
+        balive = isinstance(bts, (int, float)) and (now - float(bts) <= 30)
+        blive = (bmode.get("mode", {}) or {}).get(bkey) == "live"
+        items.append(("原生桥", bool(balive),
+                      "运行中（live）" if balive and blive else
+                      ("运行中（shadow，未接管）" if balive
+                       else "无心跳，桥可能未运行")))
+    except Exception:
+        items.append(("原生桥", False, "状态不可读"))
+
     fails = [label for label, ok, _d in items if not ok]
     lines = [f"🩺 {chan_label}自检（{_now_str('%H:%M:%S')}）"]
     for label, ok, detail in items:
@@ -740,7 +921,7 @@ def slash_queue_text(chan_label, state_dir, hook_state_dir):
             age = _dur_str(now - float(dsince)) if isinstance(dsince, (int, float)) else "未知"
             for m in (d.get("msgids") or []):
                 lines.append(f"·「{_excerpt(texts.get(str(m), ''))}」已跑{age}")
-    lines.append("（停正在跑的用 /stop；让排队的提前用 /jump）")
+    lines.append("（停正在跑的用 /stop）")
     return "\n".join(lines)
 
 
@@ -1363,10 +1544,6 @@ class Gateway:
         """Handle a slash command. Returns:
         - None: not a command — caller proceeds with the normal flow.
         - "handled": command done, ack sent — caller returns early.
-        - ("rewrite", new_text): /jump with text — side effects done and
-          ack sent; caller proceeds with the normal flow using new_text
-          as the message text (the /jump message itself becomes a normal
-          inbox message under its own msgid).
         Never raises: on an unexpected error it logs and returns None so
         the message falls back to the ordinary worker flow."""
         try:
@@ -1381,10 +1558,13 @@ class Gateway:
                 ack = slash_help_text()
             elif name == "status":
                 ack = slash_status_text(CHAN_LABEL, STATE, HOOK_STATE_DIR)
+                ack += _task_overview_text("wecom", STATE, HOOK_STATE_DIR)
             elif name == "check":
                 ack = slash_run_check(CHAN_LABEL, STATE, HOOK_STATE_DIR)
             elif name == "stop":
                 _b, ids, _p, _d = _queue_summary(HOOK_STATE_DIR)
+                _btxt, _bids = _bridge_queue_lines("wecom")
+                ids = list(ids) + [i for i in _bids if i not in ids]
                 if not ids:
                     ack = "当前没有正在跑的任务。"
                 else:
@@ -1394,25 +1574,64 @@ class Gateway:
                         ack += f"（另有 {fail} 条登记失败）"
             elif name == "new":
                 _write_hook_json(HOOK_STATE_DIR, "topic_boundary.json", {"ts": time.time()})
-                ack = "已开启新话题，之前的对话不会再带入上下文。"
+                ack = "已开新会话：之前的对话不会再带入上下文。"
             elif name == "queue":
                 qtokens = arg.split()
                 if not qtokens:
                     ack = slash_queue_text(CHAN_LABEL, STATE, HOOK_STATE_DIR)
+                    ack += _bridge_queue_lines("wecom")[0]
+                    for _i, (_m, _t) in enumerate(
+                            _bridge_queued_rows("wecom"), 1):
+                        ack += f"\n  桥{_i}. 「{_excerpt(_t)}」"
                 elif qtokens[0] == "clear":
                     pend = _pending_sorted(HOOK_STATE_DIR)
-                    if not pend:
+                    brows = _bridge_queued_rows("wecom")
+                    if not pend and not brows:
                         ack = "排队中没有消息可清。"
                     else:
-                        texts = _inbox_texts(STATE)
-                        wrote = enqueue_queue_admin(
-                            HOOK_STATE_DIR, "clear", [m for m, _t in pend])
-                        excerpts = "、".join(f"「{_excerpt(texts.get(m, ''))}」" for m, _t in pend)
-                        if wrote:
-                            ack = (f"已提交清除排队消息 {len(pend)} 条：{excerpts}。"
-                                   f"约 5 秒内生效。正在跑的任务不受影响。")
+                        parts = []
+                        ok_all = True
+                        if pend:
+                            texts = _inbox_texts(STATE)
+                            wrote = enqueue_queue_admin(
+                                HOOK_STATE_DIR, "clear", [m for m, _t in pend])
+                            if wrote:
+                                excerpts = "、".join(
+                                    f"「{_excerpt(texts.get(m, ''))}」"
+                                    for m, _t in pend)
+                                parts.append(f"冷通道 {len(pend)} 条：{excerpts}")
+                            else:
+                                ok_all = False
+                        if brows:
+                            if _bridge_admin("wecom", "clear",
+                                             [m for m, _t in brows]):
+                                bexcerpts = "、".join(
+                                    f"「{_excerpt(t)}」" for _m, t in brows)
+                                parts.append(f"原生桥 {len(brows)} 条：{bexcerpts}")
+                            else:
+                                ok_all = False
+                        if parts:
+                            ack = ("已提交清除排队消息（" + "；".join(parts) +
+                                   "）。约 5 秒内生效。正在跑的任务不受影响。")
+                            if not ok_all:
+                                ack += "（部分清除失败，请稍后再试）"
                         else:
                             ack = "清除排队失败：暂时写不了队列指令，请稍后再试。"
+                elif qtokens[0] == "drop" and len(qtokens) == 2 and (
+                        qtokens[1].startswith("桥")
+                        or qtokens[1].lower().startswith("b")):
+                    num = qtokens[1][1:]
+                    brows = _bridge_queued_rows("wecom")
+                    if not num.isdigit() or int(num) < 1 or int(num) > len(brows):
+                        ack = (f"原生桥排队里没有这一条（当前共 {len(brows)} 条）。"
+                               f"用法：/queue drop 桥1")
+                    else:
+                        mid, mtext = brows[int(num) - 1]
+                        if _bridge_admin("wecom", "drop", [mid]):
+                            ack = (f"已提交删除原生桥排队第 {int(num)} 条："
+                                   f"「{_excerpt(mtext)}」，约 5 秒内生效。")
+                        else:
+                            ack = "删除排队失败：暂时写不了队列指令，请稍后再试。"
                 elif qtokens[0] == "drop" and len(qtokens) == 2 and qtokens[1].isdigit():
                     pend = _pending_sorted(HOOK_STATE_DIR)
                     n = int(qtokens[1])
@@ -1472,30 +1691,6 @@ class Gateway:
                                "后台执行中，主对话不受影响；查进度：/subagent list")
                     else:
                         ack = "派发失败：暂时无法登记副助手任务，请稍后再试。"
-            elif name == "jump":
-                batch, _ids, pcount, _d = _queue_summary(HOOK_STATE_DIR)
-                active = bool(batch.get("msgids"))
-                if not active:
-                    if arg:
-                        await self._send_slash_ack(
-                            chatid, chattype,
-                            "当前没有任务在跑，这条会直接处理。", req_id)
-                        return ("rewrite", arg)
-                    ack = "当前没有任务在跑，下一条消息会直接处理。"
-                elif arg:
-                    _write_hook_json(HOOK_STATE_DIR, "jump_request.json", {"ts": time.time()})
-                    await self._send_slash_ack(
-                        chatid, chattype,
-                        f"已强制插队：排队的 {pcount + 1} 条立即处理，前面的长任务继续在跑。",
-                        req_id)
-                    return ("rewrite", arg)
-                elif pcount > 0:
-                    _write_hook_json(HOOK_STATE_DIR, "jump_request.json", {"ts": time.time()})
-                    ack = f"已强制插队：排队的 {pcount} 条立即处理，前面的长任务继续在跑。"
-                else:
-                    _write_hook_json(HOOK_STATE_DIR, "jump_request.json",
-                                     {"ts": time.time(), "armed": True})
-                    ack = "已武装插队：你下一条消息会立即插队处理，前面的长任务继续在跑。"
             if ack is not None:
                 await self._send_slash_ack(chatid, chattype, ack, req_id)
             log(f"slash /{name} handled for chat {chatid}")
@@ -1525,6 +1720,30 @@ class Gateway:
             log(f"soft ack queued for chat {chatid}: {ack}")
         except Exception as e:
             log(f"soft ack failed (ignored): {e!r}")
+
+    def _maybe_bridge_ack(self, chatid, chattype, msgid):
+        """Bridge-lane arrival ack for diverted messages: when the
+        native bridge already has work running or queued, tell the
+        user this message is queued on the bridge (position counts
+        ONLY bridge work). Idle bridge -> no ack (the think stream
+        already signals receipt). Fire-and-forget like _maybe_soft_ack."""
+        try:
+            active, queued = _bridge_snapshot("wecom")
+            if not active and not queued:
+                return
+            mid = str(msgid or "")
+            ahead = queued.index(mid) if mid in queued else len(queued)
+            ack = BRIDGE_ACK_TEMPLATE.format(n=ahead + 1)
+            self.append_jsonl(OUTBOX, {
+                "id": f"softack-{uuid.uuid4().hex}",
+                "mode": "send",
+                "chatid": chatid,
+                "chat_type": 2 if chattype == "group" else 1,
+                "content": ack,
+            })
+            log(f"bridge ack queued for chat {chatid}: {ack}")
+        except Exception as e:
+            log(f"bridge ack failed (ignored): {e!r}")
 
     async def handle_message_callback(self, frame: dict) -> None:
         body = frame.get("body", {}) or {}
@@ -1588,7 +1807,6 @@ class Gateway:
         if self.allow_users and from_userid not in self.allow_users:
             log(f"ignored message from non-allowlisted user {from_userid}")
             return
-        slash_rewritten = False
         if msgtype == "text" and not media:
             # Slash commands: intercepted after allowlist + dedupe,
             # before the inbox write — they never wake a worker.
@@ -1598,9 +1816,6 @@ class Gateway:
                 self.msgs_received += 1
                 self.write_status()
                 return
-            if isinstance(slash, tuple):
-                text = slash[1]
-                slash_rewritten = True
         entry = {
             "msgid": msgid,
             "ts": int(time.time()),
@@ -1643,15 +1858,42 @@ class Gateway:
             if resp.get("errcode") == 0:
                 self.msgs_sent += 1
         else:
-            self.append_jsonl(INBOX, entry)
+            # Native bridge divert (2026-10-07): plain single-chat text
+            # goes to the bridge spool when the divert flag exists. The
+            # reqmap entry and the think stream below are still opened,
+            # so the bridge's bound reply finishes the stream in place
+            # exactly like a worker reply. Any divert failure (or the
+            # bridge itself failing pre-send) falls back to the inbox.
+            diverted = False
+            if (msgid and msgtype == "text" and not media
+                    and chattype == "single"
+                    and os.path.exists(
+                        "/home/hatch/workspace/native-bridge/divert-wecom")):
+                try:
+                    self.append_jsonl(
+                        Path("/home/hatch/workspace/native-bridge/"
+                             "spool/wecom.jsonl"),
+                        {"msgid": msgid, "text": text,
+                         "chatid": chatid, "chattype": chattype,
+                         "ts": int(time.time())})
+                    diverted = True
+                    log(f"msg {msgid} diverted to native bridge")
+                except Exception as e:
+                    log(f"native divert failed, using inbox: {e}")
+            if not diverted:
+                self.append_jsonl(INBOX, entry)
             self._mark_seen(msgid)
-            if not slash_rewritten:
+            if not diverted:
                 # Soft ack: if a batch is in flight this message just
                 # joined the pending queue — acknowledge immediately
-                # instead of leaving the user in silence. A /jump
-                # rewrite already got its own ack from the slash
-                # layer. Never raises; queue semantics are unchanged.
+                # instead of leaving the user in silence. Never
+                # raises; queue semantics are unchanged.
                 self._maybe_soft_ack(chatid, chattype, text)
+            elif diverted:
+                # Bridge lane: no cold soft ack, but if the bridge is
+                # busy the user still deserves a queue notice in
+                # bridge terms.
+                self._maybe_bridge_ack(chatid, chattype, msgid)
             # Official pattern (SDK example + OpenClaw plugin): open a
             # stream reply immediately whose content is the native think
             # marker "<think></think>" — the WeCom client renders its own
@@ -2264,6 +2506,27 @@ class Gateway:
                     )
                     if isinstance(resp, dict) and resp.get("errcode") == 0:
                         self._mark_partial(item_id, {"stream_finish_sent": True, "sent_chunks": 1})
+                if isinstance(resp, dict) and resp.get("errcode") not in (0, -1):
+                    # Stream finish AND markdown respond on the original
+                    # req_id both failed — e.g. the stream was watchdog-
+                    # finished while a long (bridge) turn was running.
+                    # The watchdog told the user a follow-up message
+                    # would come; deliver proactively to keep that
+                    # promise. (_send_markdown_chunks skips chunks the
+                    # partial record already counts as sent, so the
+                    # overflow block below stays duplicate-free.)
+                    target_chatid = info.get("chatid", "")
+                    if target_chatid:
+                        chat_type = 2 if info.get("chattype") == "group" else 1
+                        resp2 = await self._send_markdown_chunks(
+                            item_id, target_chatid, chat_type, chunks)
+                        if isinstance(resp2, dict) \
+                                and resp2.get("errcode") == 0:
+                            resp = resp2
+                            self._mark_partial(
+                                item_id, {"stream_finish_sent": True})
+                            log(f"outbox reply {item_id}: delivered via "
+                                f"proactive fallback (req_id dead)")
                 # Overflow chunks (reply longer than CHUNK_LIMIT) follow as
                 # active messages to the same chat. A retry skips chunks
                 # whose send already returned success.
