@@ -56,9 +56,12 @@ PAYLOAD="$(python3 - "$SEEN" "$INBOX" "$OUTBOX" "$PENDING" "$BATCH" "$JUMP" "$BO
 import json, os, subprocess, sys, time
 
 seen_path, inbox_path, outbox_path, pending_path, batch_path, jump_path, boundary_path, claims_path, qa_path, starve_path, subjobs_path, subreq_path, subcmd_path, cli_path, context_path, carried_path, cleared_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7], sys.argv[8], sys.argv[9], sys.argv[10], sys.argv[11], sys.argv[12], sys.argv[13], sys.argv[14], sys.argv[15], sys.argv[16], sys.argv[17]
-BATCH_CAP_SECS = 600
+BATCH_CAP_SECS = 3600
 # Silence cap history: 180 -> 360 (2026-10-04 evening) -> 600
-# (2026-10-05, user spec). Two changes came with the 600 bump:
+# (2026-10-05, user spec) -> 3600 (2026-10-07, user spec: tasks
+# kept getting stopped at the 10-min line; the user accepts that
+# a truly dead task now takes ~1h to declare — worst case ~1h15m
+# counting the heartbeat's 15-min max-age tail). Two changes came with the 600 bump:
 # (1) workers now run an internal heartbeat (heartbeat.py, started
 # via the CLI at batch start) whose per-msgid files count as batch
 # activity, so the cap no longer judges life by visible progress

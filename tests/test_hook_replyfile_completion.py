@@ -25,6 +25,10 @@ S15 detached batch + reply queued but cancelled, old
     -> fail-stop fires for the detached msgid
 S1c control: silent batch, no outbox rows -> fail-stop still fires
 
+Fixture ages were rescaled on 2026-10-07 when the user raised
+BATCH_CAP_SECS 600 -> 3600: "aged past cap" fixtures now use
+3700s / 5000s so every scenario keeps its original meaning.
+
 The hook scripts are copied into a sandbox with state paths and the
 channel CLI redirected to a stub, then executed for real.
 Hook script location: MUSE_HOOK_SCRIPTS_DIR env, defaulting to the
@@ -116,12 +120,12 @@ def run_channel(chan, botdir, hookst, script_name, cli_relpath, entry_fn):
 
     # S9 active batch completed by DELIVERED reply_file
     reset()
-    inbox([entry_fn("F1", NOW - 700)])
+    inbox([entry_fn("F1", NOW - 3700)])
     hookst_w("seen_msgids.txt", "F1\n")
     hookst_w("carried_msgids.txt", "F1\n")
-    hookst_w("active_batch.json", {"msgids": ["F1"], "since": NOW - 700, "detached": []})
-    outbox([{"id": "RF1", "mode": "reply_file", "msgid": "F1", "queued_at": NOW - 650}])
-    results([{"id": "RF1", "mode": "reply_file", "ok": True, "ts": NOW - 640}])
+    hookst_w("active_batch.json", {"msgids": ["F1"], "since": NOW - 3700, "detached": []})
+    outbox([{"id": "RF1", "mode": "reply_file", "msgid": "F1", "queued_at": NOW - 3650}])
+    results([{"id": "RF1", "mode": "reply_file", "ok": True, "ts": NOW - 3640}])
     out = run_hook()
     check("S9 no fail-stop calls", calls() == "")
     check("S9 silent", "DECISION silent" in out)
@@ -129,38 +133,38 @@ def run_channel(chan, botdir, hookst, script_name, cli_relpath, entry_fn):
 
     # S10 detached batch completed by DELIVERED reply_file
     reset()
-    inbox([entry_fn("F2", NOW - 700)])
+    inbox([entry_fn("F2", NOW - 3700)])
     hookst_w("seen_msgids.txt", "F2\n")
     hookst_w("carried_msgids.txt", "F2\n")
     hookst_w("active_batch.json",
-             {"msgids": [], "since": NOW - 700,
-              "detached": [{"msgids": ["F2"], "since": NOW - 700}]})
-    outbox([{"id": "RF2", "mode": "reply_file", "msgid": "F2", "queued_at": NOW - 650}])
-    results([{"id": "RF2", "mode": "reply_file", "ok": True, "ts": NOW - 640}])
+             {"msgids": [], "since": NOW - 3700,
+              "detached": [{"msgids": ["F2"], "since": NOW - 3700}]})
+    outbox([{"id": "RF2", "mode": "reply_file", "msgid": "F2", "queued_at": NOW - 3650}])
+    results([{"id": "RF2", "mode": "reply_file", "ok": True, "ts": NOW - 3640}])
     out = run_hook()
     check("S10 no fail-stop calls", calls() == "")
     check("S10 detached dropped", not batch().get("detached"))
 
     # S12 queued-but-cancelled reply is NOT completion -> fail-stop
     reset()
-    inbox([entry_fn("F5", NOW - 1400)])
+    inbox([entry_fn("F5", NOW - 5000)])
     hookst_w("seen_msgids.txt", "F5\n")
     hookst_w("carried_msgids.txt", "F5\n")
-    hookst_w("active_batch.json", {"msgids": ["F5"], "since": NOW - 1400, "detached": []})
-    outbox([{"id": "RF5", "mode": "reply_file", "msgid": "F5", "queued_at": NOW - 1350}])
+    hookst_w("active_batch.json", {"msgids": ["F5"], "since": NOW - 5000, "detached": []})
+    outbox([{"id": "RF5", "mode": "reply_file", "msgid": "F5", "queued_at": NOW - 4950}])
     results([{"id": "RF5", "mode": "reply_file", "ok": False,
-              "errmsg": "cancelled", "ts": NOW - 1340}])
+              "errmsg": "cancelled", "ts": NOW - 4940}])
     out = run_hook()
     check("S12 fail-stop fires on cancelled reply",
           "cancel --msgid F5" in calls() and calls().count("CALL: send") == 1)
 
     # S13 formal reply parked in the retry lane keeps the batch alive
     reset()
-    inbox([entry_fn("F6", NOW - 700)])
+    inbox([entry_fn("F6", NOW - 3700)])
     hookst_w("seen_msgids.txt", "F6\n")
     hookst_w("carried_msgids.txt", "F6\n")
-    hookst_w("active_batch.json", {"msgids": ["F6"], "since": NOW - 700, "detached": []})
-    outbox([{"id": "PK6", "mode": "reply", "msgid": "F6", "queued_at": NOW - 650}])
+    hookst_w("active_batch.json", {"msgids": ["F6"], "since": NOW - 3700, "detached": []})
+    outbox([{"id": "PK6", "mode": "reply", "msgid": "F6", "queued_at": NOW - 3650}])
     results([{"id": "PK6", "mode": "reply", "ok": False,
               "errmsg": "prepare failed", "ts": NOW - 300}])
     parked({"PK6": {"item": {"id": "PK6", "mode": "reply", "msgid": "F6"},
@@ -172,29 +176,29 @@ def run_channel(chan, botdir, hookst, script_name, cli_relpath, entry_fn):
 
     # S14 detached batch completed by DELIVERED bound send row
     reset()
-    inbox([entry_fn("F7", NOW - 700)])
+    inbox([entry_fn("F7", NOW - 3700)])
     hookst_w("seen_msgids.txt", "F7\n")
     hookst_w("carried_msgids.txt", "F7\n")
     hookst_w("active_batch.json",
-             {"msgids": [], "since": NOW - 700,
-              "detached": [{"msgids": ["F7"], "since": NOW - 700}]})
-    outbox([{"id": "SD7", "mode": "send", "msgid": "F7", "queued_at": NOW - 650}])
-    results([{"id": "SD7", "mode": "send", "ok": True, "ts": NOW - 640}])
+             {"msgids": [], "since": NOW - 3700,
+              "detached": [{"msgids": ["F7"], "since": NOW - 3700}]})
+    outbox([{"id": "SD7", "mode": "send", "msgid": "F7", "queued_at": NOW - 3650}])
+    results([{"id": "SD7", "mode": "send", "ok": True, "ts": NOW - 3640}])
     out = run_hook()
     check("S14 no fail-stop calls", calls() == "")
     check("S14 detached dropped", not batch().get("detached"))
 
     # S15 detached reply queued but cancelled, old -> fail-stop
     reset()
-    inbox([entry_fn("F8", NOW - 1400)])
+    inbox([entry_fn("F8", NOW - 5000)])
     hookst_w("seen_msgids.txt", "F8\n")
     hookst_w("carried_msgids.txt", "F8\n")
     hookst_w("active_batch.json",
-             {"msgids": [], "since": NOW - 1400,
-              "detached": [{"msgids": ["F8"], "since": NOW - 1400}]})
-    outbox([{"id": "RF8", "mode": "reply", "msgid": "F8", "queued_at": NOW - 1350}])
+             {"msgids": [], "since": NOW - 5000,
+              "detached": [{"msgids": ["F8"], "since": NOW - 5000}]})
+    outbox([{"id": "RF8", "mode": "reply", "msgid": "F8", "queued_at": NOW - 4950}])
     results([{"id": "RF8", "mode": "reply", "ok": False,
-              "errmsg": "cancelled", "ts": NOW - 1340}])
+              "errmsg": "cancelled", "ts": NOW - 4940}])
     out = run_hook()
     check("S15 detached fail-stop fires on cancelled reply",
           "cancel --msgid F8" in calls())
@@ -211,10 +215,10 @@ def run_channel(chan, botdir, hookst, script_name, cli_relpath, entry_fn):
 
     # S1c control: silent batch still fail-stops
     reset()
-    inbox([entry_fn("D1", NOW - 700)])
+    inbox([entry_fn("D1", NOW - 3700)])
     hookst_w("seen_msgids.txt", "D1\n")
     hookst_w("carried_msgids.txt", "D1\n")
-    hookst_w("active_batch.json", {"msgids": ["D1"], "since": NOW - 700, "detached": []})
+    hookst_w("active_batch.json", {"msgids": ["D1"], "since": NOW - 3700, "detached": []})
     out = run_hook()
     check("S1c fail-stop still fires", "cancel --msgid D1" in calls()
           and calls().count("CALL: send") == 1)
