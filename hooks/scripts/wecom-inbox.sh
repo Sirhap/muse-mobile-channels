@@ -411,6 +411,7 @@ detached = batch.get("detached") or []
 if not isinstance(detached, list):
     detached = []
 detached_orig = list(detached)
+detached_activity = []
 detached_orphan_sources = []
 preempt_info = None
 detached_dirty = False
@@ -467,6 +468,7 @@ if detached:
                 if e is not None and e not in failed_entries:
                     failed_entries.append(e)
             continue
+        detached_activity.append((list(dids), dsince, dlast))
         kept_detached.append(d)
     detached = kept_detached
 
@@ -497,6 +499,82 @@ if orphaned_entries:
         orphan_info = [o for o in orphan_info if o.get("msgid") in _keep_ids]
         if not orphaned_entries:
             detached_orphan_sources = []
+
+
+# --- stall notice (NOT a fail-stop) ---
+# Since the 2026-10-07 no-cap order a silent batch is never
+# cancelled -- but silence itself became invisible: a worker that
+# vanished left the user with no reply and no signal at all (real
+# incident 2026-10-07: homepage-image batch last activity 16:31,
+# heartbeat aged out 16:45, user still uninformed at 16:52).
+# So a batch (active or detached) with no delivered reply, no bound
+# outbox activity and no heartbeat for STALL_NOTICE_SECS gets ONE
+# unbound stall notice per hour. The batch is NOT cancelled, NOT
+# orphaned, and the notice (unbound, no msgid) never counts as
+# batch activity.
+STALL_NOTICE_SECS = 1200
+if not dry:
+    _stall_candidates = []
+    if batch_active and not batch_done:
+        if now - last_activity >= STALL_NOTICE_SECS:
+            _stall_candidates.append(
+                (list(batch_ids), batch_since, last_activity))
+    for _dids, _dsince, _dlast in detached_activity:
+        if now - _dlast >= STALL_NOTICE_SECS:
+            _stall_candidates.append((_dids, _dsince, _dlast))
+    if _stall_candidates:
+        _sn_path = os.path.join(os.path.dirname(pending_path),
+                                "stall_notices.json")
+        try:
+            with open(_sn_path, encoding="utf-8") as f:
+                _sn = json.load(f)
+            if not isinstance(_sn, dict):
+                _sn = {}
+        except (OSError, json.JSONDecodeError):
+            _sn = {}
+        _sn = {k: float(v) for k, v in _sn.items()
+               if isinstance(v, (int, float)) and now - float(v) < 7200}
+        _sn_by_id = {e["msgid"]: e for e in entries}
+        _sn_dirty = False
+        for _mids, _since, _last in _stall_candidates:
+            _key = str(int(_since)) + ":" + ",".join(
+                str(m) for m in _mids)
+            if now - _sn.get(_key, 0) < 3600:
+                continue
+            _e0 = None
+            for _m in _mids:
+                _e0 = _sn_by_id.get(_m) or _sn_by_id.get(str(_m))
+                if _e0 is not None:
+                    break
+            if _e0 is None:
+                continue
+            _mins = int((now - _last) // 60)
+            _t = (_e0.get("text") or "").strip() or "（无文字消息）"
+            _notice = ("⏳ 提醒：任务「" + _t[:20] + "」已约 "
+                       + str(_mins)
+                       + " 分钟没有任何进展（也没报错）。按你定的规矩"
+                         "它不会被自动停止，会继续挂着；要取消回 /stop，"
+                         "想让我接着办就说一声。")
+            _sent = False
+            try:
+                r = subprocess.run([cli_path, "send", "--chatid",
+                                    str(_e0.get("chatid") or ""),
+                                    "--chat-type",
+                                    "2" if _e0.get("chattype") == "group" else "1",
+                                    "--text", _notice],
+                                   capture_output=True, timeout=20)
+                _sent = r.returncode == 0
+            except Exception:
+                _sent = False
+            if _sent:
+                _sn[_key] = now
+                _sn_dirty = True
+        if _sn_dirty:
+            try:
+                with open(_sn_path, "w", encoding="utf-8") as f:
+                    json.dump(_sn, f, ensure_ascii=False)
+            except OSError:
+                pass
 
 # --- fail-stop execution ---
 # For every batch declared dead above: cancel each msgid through

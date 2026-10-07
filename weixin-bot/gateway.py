@@ -1955,7 +1955,13 @@ class Gateway:
         r = await client.post(
             upload_url, content=cipher,
             headers={"Content-Type": "application/octet-stream"},
-            timeout=httpx.Timeout(60.0, connect=15.0),
+            # 300s, not 60: probed live 2026-10-07 — a 1.96MB upload
+            # through this egress to the WeChat CDN took ~80s to return
+            # 200. At 60s every large-file attempt died as a read
+            # timeout (surfacing as an empty exception) or a CDN 500,
+            # which wedged a formal video reply for 30+ minutes while
+            # small files went through fine.
+            timeout=httpx.Timeout(300.0, connect=15.0),
         )
         r.raise_for_status()
         download_param = r.headers.get("x-encrypted-param", "")
@@ -2253,9 +2259,23 @@ class Gateway:
         row in the WeCom outbox. Both legs are best-effort;
         failures are only logged. Called once per stuck row (the
         caller persists a notified flag in the retry record)."""
-        text = (f"⚠️ 微信这边有一条正式回复已连续发送失败 {attempts} 次，"
-                "仍在自动重试、不会丢弃。多半是微信发送通道临时故障；"
-                "你在微信里随便发一句话，有助于恢复发送。")
+        fpath = str(item.get("file_path") or "")
+        is_file = item.get("mode") in ("reply_file", "send_file") \
+            and fpath and Path(fpath).exists()
+        if is_file:
+            # File formals fail on the CDN upload leg (slow/timeout —
+            # see _upload_media), NOT on the text leg, so the old
+            # "send a message to help recovery" advice was wrong for
+            # them, and a bare notice left the user empty-handed.
+            # Reroute the file itself via WeCom (below) and say so.
+            text = (f"⚠️ 你要的文件「{Path(fpath).name}」在微信这边上传"
+                    f"连续失败 {attempts} 次（微信文件通道超时/500，"
+                    "不是文件本身坏了）。我已把文件转投到你的企微，"
+                    "急用先去企微看；微信这边仍在继续重试，不会丢弃。")
+        else:
+            text = (f"⚠️ 微信这边有一条正式回复已连续发送失败 {attempts} 次，"
+                    "仍在自动重试、不会丢弃。多半是微信发送通道临时故障；"
+                    "你在微信里随便发一句话，有助于恢复发送。")
         try:
             info = self.context.get(str(item.get("msgid", "")), {})
             to = info.get("from_user_id", "")
@@ -2272,6 +2292,15 @@ class Gateway:
                     "chat_type": 1, "content": "【微信通道提醒】" + text,
                     "id": uuid.uuid4().hex[:12],
                     "queued_at": int(time.time())})
+                if is_file:
+                    self.append_jsonl(STUCK_NOTICE_WECOM_OUTBOX, {
+                        "mode": "send_file",
+                        "chatid": STUCK_NOTICE_WECOM_CHATID,
+                        "chat_type": 1, "file_path": fpath,
+                        "id": uuid.uuid4().hex[:12],
+                        "queued_at": int(time.time())})
+                    log(f"stuck formal {item.get('id')}: file rerouted "
+                        f"via WeCom: {fpath}")
         except Exception as e:
             log(f"stuck-formal notice (wecom leg) failed: {e}")
         log(f"stuck formal {item.get('mode')} {item.get('id')}: "
