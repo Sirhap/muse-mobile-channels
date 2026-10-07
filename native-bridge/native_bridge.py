@@ -38,8 +38,12 @@ CONF_DIR = os.path.expanduser("~/.config/native-bridge")
 STATE_F = os.path.join(BASE, "state.json")
 STATUS_F = os.path.join(BASE, "status.json")
 POLL_SECS = 2
+HEALTH_PROBE_SECS = 45      # idle health probe: catch a silently-dead WS
+RECONNECT_RETRY_SECS = 10   # min gap between eager reconnect attempts
 PROG_FIRST_SECS = 120
 PROG_EVERY_SECS = 300
+ESCALATE_SECS = 1200        # turn age where progress notices turn into
+                            # an actionable "looks stuck, /stop it" warning
 AUTO_ROTATE_TURNS = 80
 AUTO_ROTATE_AGE = 7 * 86400
 NODE_ID = "native-bridge"
@@ -261,6 +265,11 @@ def deliver_reply(ch, msgid, text):
                           "id": rid, "queued_at": now})
 
 
+class PreSendError(Exception):
+    """start_turn failed BEFORE any message was sent (session/history
+    read phase) — safe to retry once on a fresh connection."""
+
+
 class ChannelWorker(threading.Thread):
     def __init__(self, ch):
         super().__init__(daemon=True, name=f"bridge-{ch}")
@@ -268,6 +277,8 @@ class ChannelWorker(threading.Thread):
         self.gw = None
         self.queue = []            # [(row, nbytes)] not yet started
         self.read_offset = None
+        self.last_probe = 0.0
+        self.last_connect_try = 0.0
 
     def log(self, *a):
         print(f"[{self.ch}]", *a, flush=True)
@@ -286,6 +297,7 @@ class ChannelWorker(threading.Thread):
     def ensure_gw(self):
         if self.gw is not None:
             return True
+        self.last_connect_try = time.time()
         try:
             self.gw = connect()
             self.log("connected")
@@ -294,6 +306,34 @@ class ChannelWorker(threading.Thread):
             self.log("connect failed:", type(e).__name__, str(e)[:140])
             self.gw = None
             return False
+
+    def maintain_connection(self, cs):
+        """Keep the native connection warm so the first message after
+        an idle stretch does not pay for a silently-dead WebSocket with
+        a slow cold-path fallback (2026-10-07 20:44 incident: WS died
+        during ~24 idle minutes, was only discovered at send time, and
+        the bridge then stayed disconnected until the NEXT message
+        happened to arrive ~3 min later). While idle, probe with the
+        same cheap call connect() proves itself with; on failure drop
+        the gateway and reconnect immediately. While disconnected,
+        retry on a short timer instead of waiting for a message."""
+        now = time.time()
+        if self.gw is None:
+            if now - self.last_connect_try >= RECONNECT_RETRY_SECS:
+                self.ensure_gw()
+            return
+        if cs["turns"]:
+            return  # turn polling exercises the connection already
+        if now - self.last_probe < HEALTH_PROBE_SECS:
+            return
+        self.last_probe = now
+        try:
+            self.gw.call_json("sessions.list", timeout=10)
+        except Exception as e:
+            self.log("health probe failed:", type(e).__name__,
+                     str(e)[:100], "; reconnecting")
+            self.gw = None
+            self.ensure_gw()
 
     def new_session(self):
         d = self.gw.call_json("session.start", body={
@@ -330,8 +370,13 @@ class ChannelWorker(threading.Thread):
         return sorted(d.get("chat_events", []), key=lambda e: e.get("seq", 0))
 
     def start_turn(self, row, cs):
-        sid, need_preamble = self.session_for(cs)
-        evs = self.history_events(sid, limit=5)
+        try:
+            sid, need_preamble = self.session_for(cs)
+            evs = self.history_events(sid, limit=5)
+        except Exception as e:
+            # Read-only phase: nothing has been sent yet, so the caller
+            # may safely retry this turn on a fresh connection.
+            raise PreSendError(str(e)) from e
         baseline = evs[-1].get("seq", 0) if evs else 0
         text = row.get("text", "")
         if need_preamble:
@@ -358,7 +403,14 @@ class ChannelWorker(threading.Thread):
             return
         excerpt = (turn.get("text") or "")[:24]
         mins = max(1, round(age / 60))
-        text = f"⏳ 还在处理中（已跑约 {mins} 分钟）：「{excerpt}」"
+        if age >= ESCALATE_SECS:
+            # A bare "still working" repeated forever reads as a hang and
+            # gives the user nothing to act on. Past the escalation age,
+            # say it looks stuck and name the remedy.
+            text = (f"⚠️ 这条任务已跑约 {mins} 分钟还没结束，可能卡住了："
+                    f"「{excerpt}」\n发 /stop 可以终止它，后面的消息会继续处理。")
+        else:
+            text = f"⏳ 还在处理中（已跑约 {mins} 分钟）：「{excerpt}」"
         rid = f"bridgeprog-{turn['msgid'][:8]}-{int(age // 60)}"
         if self.ch == "weixin":
             to = turn.get("from_user", "")
@@ -435,6 +487,7 @@ class ChannelWorker(threading.Thread):
             # silently ate the rotation (the ts had already advanced).
             self.update_cs(last_boundary_ts=bts, rotate_main=True)
             self.log("topic boundary seen; session rotates on next turn")
+        self.maintain_connection(cs)
         if self.read_offset is None:
             self.read_offset = cs["spool_offset"]
         with open(spool, "rb") as f:
@@ -595,6 +648,31 @@ class ChannelWorker(threading.Thread):
             return
         try:
             turn = self.start_turn(row, self.cs())
+        except PreSendError as e:
+            # Failed BEFORE anything was sent — almost always a connection
+            # that died in the gap between health probes (the 2026-10-07
+            # 20:44 shape). The message never reached the server, so one
+            # reconnect + retry keeps it on the fast lane; only a second
+            # failure falls back to the cold path.
+            self.log(f"pre-send read-phase failure msgid={row.get('msgid')}: "
+                     f"{str(e)[:120]} - reconnect + retry once")
+            self.gw = None
+            if not self.ensure_gw():
+                fallback_to_inbox(self.ch, row, "connect_retry_failed")
+                self.queue.pop(0)
+                self.note_fallback(row, nbytes)
+                return
+            try:
+                turn = self.start_turn(row, self.cs())
+            except Exception as e2:
+                self.log(f"pre-send retry failed msgid={row.get('msgid')}: "
+                         f"{type(e2).__name__} {str(e2)[:120]}")
+                fallback_to_inbox(self.ch, row,
+                                  f"presend_retry_{type(e2).__name__}")
+                self.queue.pop(0)
+                self.note_fallback(row, nbytes)
+                self.gw = None
+                return
         except Exception as e:
             self.log(f"pre-send failure msgid={row.get('msgid')}: "
                      f"{type(e).__name__} {str(e)[:120]}")
