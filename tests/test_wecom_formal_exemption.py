@@ -176,6 +176,46 @@ check("parked state survives a fresh instance (restart-proof)",
 check("delivered rows leave no parked/retry residue",
       "laterow" not in parked and "laterow" not in retry)
 
+# D: soft ack — position counts only the genuinely waiting, and a
+# reply_file row finishes the batch (2026-10-07, spec:
+# fixable-fixes-spec-2026-10-07.md)
+import shutil
+HS2 = SBX / "hookstate"
+ST2 = SBX / "gwstate"
+shutil.rmtree(HS2, ignore_errors=True)
+shutil.rmtree(ST2, ignore_errors=True)
+HS2.mkdir(parents=True)
+ST2.mkdir(parents=True)
+NOW2 = time.time()
+(HS2 / "active_batch.json").write_text(json.dumps(
+    {"msgids": ["M1"], "since": NOW2}))
+(HS2 / "pending.json").write_text(json.dumps({"M1": 1, "M2": 1}))
+(ST2 / "outbox.jsonl").write_text("")
+ack2 = wc.soft_ack_text(ST2, HS2, "你好")
+check("soft ack counts only waiting (2nd, not 3rd)",
+      ack2 is not None and "第 2 位" in ack2)
+(ST2 / "outbox.jsonl").write_text(json.dumps(
+    {"id": "rf1", "mode": "reply_file", "msgid": "M1",
+     "queued_at": NOW2}) + "\n")
+check("reply_file row ends the batch (no soft ack)",
+      wc.soft_ack_text(ST2, HS2, "你好") is None)
+
+# E: late suppression after a delivered reply_file
+DRB2 = SBX / "drb"
+shutil.rmtree(DRB2, ignore_errors=True)
+DRB2.mkdir(parents=True)
+wc.OUTBOX = DRB2 / "outbox.jsonl"
+wc.OUTBOX_RESULTS = DRB2 / "outbox_results.jsonl"
+wc.OUTBOX.write_text(
+    json.dumps({"id": "file1", "mode": "reply_file", "msgid": "M7"}) + "\n"
+    + json.dumps({"id": "late1", "mode": "update", "msgid": "M7"}) + "\n")
+wc.OUTBOX_RESULTS.write_text(json.dumps({"id": "file1", "ok": True}) + "\n")
+check("late update suppressed after delivered reply_file",
+      wc.Gateway._delivered_reply_before({"id": "late1", "msgid": "M7"}) is True)
+wc.OUTBOX_RESULTS.write_text(json.dumps({"id": "file1", "ok": False}) + "\n")
+check("failed reply_file does NOT suppress the update",
+      wc.Gateway._delivered_reply_before({"id": "late1", "msgid": "M7"}) is False)
+
 fails = [n for n, ok in RESULTS if not ok]
 print(f"\n== {len(RESULTS) - len(fails)}/{len(RESULTS)} passed ==")
 sys.exit(1 if fails else 0)

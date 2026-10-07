@@ -419,6 +419,19 @@ def read_pid_file(path: Path) -> int | None:
         return None
 
 
+def waiting_ahead(pending_ids, in_service_ids) -> int:
+    """How many queued messages are actually waiting, not in service.
+
+    The in-flight batch is being handled. Counting it makes a brand-new
+    message look like it is already 2nd in line. (Adopted 2026-10-07
+    from the reviewed cursor/worker-liveness branch; that branch's
+    worker-pid liveness parts were rejected, this pure counter was
+    not.)
+    """
+    serving = {str(item) for item in in_service_ids}
+    return sum(1 for item in pending_ids if str(item) not in serving)
+
+
 def chunk_slices(chunks: list[str], start: int) -> list[tuple[int, str]]:
     """(index, text) pairs at and after start."""
     return [(index, part) for index, part in enumerate(chunks) if index >= start]

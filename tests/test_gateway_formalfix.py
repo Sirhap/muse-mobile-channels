@@ -279,6 +279,53 @@ check("retry mirror tracks the parked row",
 check("delivered rows leave no parked/retry residue",
       "laterow" not in parked2 and "laterow" not in retry2)
 
+# ---------- 6. reply_file completes the batch + waiting-only position ----------
+# (2026-10-07: usable parts adopted from the reviewed
+# cursor/worker-liveness branch; spec: fixable-fixes-spec-2026-10-07.md)
+HS = SBX / "hookstate"
+ST = SBX / "gwstate"
+shutil.rmtree(HS, ignore_errors=True)
+shutil.rmtree(ST, ignore_errors=True)
+HS.mkdir(parents=True)
+ST.mkdir(parents=True)
+NOW = time.time()
+(HS / "active_batch.json").write_text(json.dumps(
+    {"msgids": ["M1"], "since": NOW}))
+(HS / "pending.json").write_text(json.dumps({"M1": 1, "M2": 1}))
+
+# no reply row yet: batch in flight; the soft-ack position counts
+# only the genuinely waiting M2 (old code said 3rd: pending total + 1)
+(ST / "outbox.jsonl").write_text("")
+check("batch in flight before any reply", gw.batch_in_flight(ST, HS) is True)
+ack = gw.soft_ack_text(ST, HS, "你好")
+check("soft ack counts only waiting (2nd, not 3rd)",
+      ack is not None and "第 2 位" in ack)
+
+# a reply_file row finishes the batch just like a text reply
+(ST / "outbox.jsonl").write_text(json.dumps(
+    {"id": "rf1", "mode": "reply_file", "msgid": "M1",
+     "queued_at": NOW}) + "\n")
+check("reply_file row ends the batch (not in flight)",
+      gw.batch_in_flight(ST, HS) is False)
+check("no soft ack after reply_file finished the batch",
+      gw.soft_ack_text(ST, HS, "你好") is None)
+
+# late suppression: a delivered reply_file suppresses a late update
+DRB = SBX / "drb"
+shutil.rmtree(DRB, ignore_errors=True)
+DRB.mkdir(parents=True)
+gw.OUTBOX = DRB / "outbox.jsonl"
+gw.OUTBOX_RESULTS = DRB / "outbox_results.jsonl"
+gw.OUTBOX.write_text(
+    json.dumps({"id": "file1", "mode": "reply_file", "msgid": "M7"}) + "\n"
+    + json.dumps({"id": "late1", "mode": "update", "msgid": "M7"}) + "\n")
+gw.OUTBOX_RESULTS.write_text(json.dumps({"id": "file1", "ok": True}) + "\n")
+check("late update suppressed after delivered reply_file",
+      gw.Gateway._delivered_reply_before({"id": "late1", "msgid": "M7"}) is True)
+gw.OUTBOX_RESULTS.write_text(json.dumps({"id": "file1", "ok": False}) + "\n")
+check("failed reply_file does NOT suppress the update",
+      gw.Gateway._delivered_reply_before({"id": "late1", "msgid": "M7"}) is False)
+
 fails = [n for n, ok_ in RESULTS if not ok_]
 print(f"\n== {len(RESULTS) - len(fails)}/{len(RESULTS)} passed ==")
 sys.exit(1 if fails else 0)

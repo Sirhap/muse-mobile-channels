@@ -27,6 +27,7 @@ from channel_common import (  # noqa: E402
     safe_child_name,
     subagent_outcome_default,
     trim_mapping,
+    waiting_ahead,
     write_offset,
     read_offset,
 )
@@ -250,6 +251,16 @@ class SafetyTests(unittest.TestCase):
         self.assertIn("qrcode=qr-session", url)
         self.assertIn("verify_code=2468", url)
         self.assertNotIn("verify_code", status_url("qr-session", ""))
+
+
+class WaitingAheadTests(unittest.TestCase):
+    def test_in_service_message_is_not_ahead_in_line(self) -> None:
+        self.assertEqual(waiting_ahead(["m-running", "m-wait"], ["m-running"]), 1)
+        self.assertEqual(waiting_ahead(["m-running"], ["m-running"]), 0)
+
+    def test_all_waiting_when_nothing_in_service(self) -> None:
+        self.assertEqual(waiting_ahead(["a", "b"], []), 2)
+        self.assertEqual(waiting_ahead([], ["a"]), 0)
 
 
 if __name__ == "__main__":
