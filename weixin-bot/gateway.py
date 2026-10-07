@@ -51,7 +51,9 @@ from channel_common import (  # noqa: E402
     subagent_outcome_default,
     trim_mapping,
     write_offset,
+    batch_workers_dead,
     read_offset,
+    waiting_ahead,
 )
 
 BASE = Path(__file__).resolve().parent
@@ -434,7 +436,7 @@ def batch_in_flight(state_dir, hook_state_dir):
                         row = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    if row.get("mode") != "reply":
+                    if row.get("mode") not in ("reply", "reply_file"):
                         continue
                     if str(row.get("msgid") or "") not in idset:
                         continue
@@ -445,6 +447,8 @@ def batch_in_flight(state_dir, hook_state_dir):
                         return False  # batch already finished
         except OSError:
             pass  # no outbox file yet = no reply rows = still in flight
+        if batch_workers_dead(state_dir / "heartbeats", ids):
+            return False
         return True
     except Exception:
         return False
@@ -1508,10 +1512,11 @@ class Gateway:
                 # Queue position: only messages that are themselves
                 # still waiting count as ahead; the in-flight batch is
                 # being served, not queued (see _queue_position).
-                _b, running_ids, pending_count, _d = _queue_summary(HOOK_STATE_DIR)
+                _b, running_ids, _pending_count, _d = _queue_summary(HOOK_STATE_DIR)
                 position = _queue_position(other_items, running_ids, now)
-                if pending_count:
-                    position = max(position, int(pending_count) + 1)
+                pending = _read_json_file(HOOK_STATE_DIR / "pending.json", {}) or {}
+                if isinstance(pending, dict):
+                    position = max(position, waiting_ahead(pending.keys(), running_ids) + 1)
                 if self._maybe_soft_ack(from_user, text, position=position):
                     rec["kind"] = "queued"
                     rec["queued"] = True
@@ -1537,10 +1542,11 @@ class Gateway:
                 # window (worker cold-starting / starting): this one
                 # queues behind the ones that are themselves waiting,
                 # not behind the burst already being picked up.
-                _b, running_ids, pending_count, _d = _queue_summary(HOOK_STATE_DIR)
+                _b, running_ids, _pending_count, _d = _queue_summary(HOOK_STATE_DIR)
                 position = _queue_position(other_items, running_ids, now)
-                if pending_count:
-                    position = max(position, int(pending_count) + 1)
+                pending = _read_json_file(HOOK_STATE_DIR / "pending.json", {}) or {}
+                if isinstance(pending, dict):
+                    position = max(position, waiting_ahead(pending.keys(), running_ids) + 1)
                 # soft_ack_text requires a hook-visible batch, so in
                 # this lag window queue the same template directly.
                 rec["kind"] = "queued"

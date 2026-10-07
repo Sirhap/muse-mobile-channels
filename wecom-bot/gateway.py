@@ -60,6 +60,8 @@ from channel_common import (  # noqa: E402
     subagent_outcome_default,
     trim_mapping,
     atomic_write_text,
+    batch_workers_dead,
+    waiting_ahead,
     write_offset,
 )
 
@@ -506,6 +508,8 @@ def soft_ack_text(state_dir, hook_state_dir, text):
         if not isinstance(since, (int, float)) or since <= 0:
             return None
         idset = set(ids)
+        if batch_workers_dead(state_dir / "heartbeats", ids):
+            return None
         try:
             with open(state_dir / "outbox.jsonl", encoding="utf-8") as f:
                 for line in f:
@@ -516,7 +520,7 @@ def soft_ack_text(state_dir, hook_state_dir, text):
                         row = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    if row.get("mode") != "reply":
+                    if row.get("mode") not in ("reply", "reply_file"):
                         continue
                     if str(row.get("msgid") or "") not in idset:
                         continue
@@ -527,7 +531,9 @@ def soft_ack_text(state_dir, hook_state_dir, text):
                         return None  # batch already finished
         except OSError:
             return None
-        return SOFT_ACK_TEMPLATE.format(n=pcount + 1)
+        pending = _read_json_file(hook_state_dir / "pending.json", {}) or {}
+        keys = pending.keys() if isinstance(pending, dict) else []
+        return SOFT_ACK_TEMPLATE.format(n=waiting_ahead(keys, ids) + 1)
     except Exception:
         return None
 

@@ -27,7 +27,14 @@ source "$HATCH_HOOK_RUNTIME"
 
 INBOX="/home/hatch/workspace/weixin-bot/state/inbox.jsonl"
 OUTBOX="/home/hatch/workspace/weixin-bot/state/outbox.jsonl"
-STATE_DIR="$HOME/hooks/state/weixin-bot"
+if [[ -n "${MUSE_HOME:-}" ]]; then
+  HOOK_HOME="$MUSE_HOME"
+elif [[ -d /home/hatch/hooks || -d /home/hatch/workspace ]]; then
+  HOOK_HOME="/home/hatch"
+else
+  HOOK_HOME="${HOME:-/home/hatch}"
+fi
+STATE_DIR="$HOOK_HOME/hooks/state/weixin-bot"
 SEEN="$STATE_DIR/seen_msgids.txt"
 CARRIED="$STATE_DIR/carried_msgids.txt"
 CLEARED="$STATE_DIR/cleared_msgids.txt"
@@ -56,6 +63,10 @@ import json, os, subprocess, sys, time
 
 seen_path, inbox_path, outbox_path, pending_path, batch_path, jump_path, boundary_path, claims_path, qa_path, starve_path, subjobs_path, subreq_path, subcmd_path, cli_path, context_path, carried_path, cleared_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7], sys.argv[8], sys.argv[9], sys.argv[10], sys.argv[11], sys.argv[12], sys.argv[13], sys.argv[14], sys.argv[15], sys.argv[16], sys.argv[17]
 BATCH_CAP_SECS = 600
+# Messages that land on opposite sides of one poll used to become two
+# batches. Hold a fresh burst until the oldest message is this old so
+# the next poll wakes them together. Stop requests do not wait.
+COALESCE_SECS = 5
 # Silence cap history: 180 -> 360 (2026-10-04 evening) -> 600
 # (2026-10-05, user spec). Two changes came with the 600 bump:
 # (1) workers now run an internal heartbeat (heartbeat.py, started
@@ -692,8 +703,15 @@ elif batch_active and not batch_done:
     else:
         waiting = True
 else:
-    new = pending_entries[:MAX_BATCH]
-    if not new and orphaned_entries:
+    oldest = min(pending.values()) if pending else now
+    hold_burst = (bool(pending_entries) and now - oldest < COALESCE_SECS
+                  and not any(is_stop_request(e.get("text")) for e in pending_entries))
+    if hold_burst:
+        waiting = True
+        new = []
+    else:
+        new = pending_entries[:MAX_BATCH]
+    if not new and orphaned_entries and not hold_burst:
         # Nobody new is waiting, but the previous worker died holding
         # unanswered messages: re-wake those messages themselves so a
         # fresh worker takes over the orphaned work.
