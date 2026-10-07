@@ -241,25 +241,10 @@ if qa_ts > 0 and not dry:
 
 pending_entries = [e for e in entries if e["msgid"] in pending]
 
-# --- slash-command /jump flag (written by the gateway on /jump) ---
-# A plain flag force-releases the current pending queue at this poll,
-# ignoring every preemption threshold; an "armed" flag does the same
-# for the NEXT message that lands in pending. The gateway writes it;
-# this script consumes/clears it (see the clearing rules near the end)
-# so a flag can never fire twice or linger as a ghost trigger.
-jump_ts = 0.0
-jump_armed = False
-try:
-    with open(jump_path, encoding="utf-8") as f:
-        _jump = json.load(f)
-    if isinstance(_jump, dict):
-        _jt = _jump.get("ts")
-        jump_ts = float(_jt) if isinstance(_jt, (int, float)) else 0.0
-        jump_armed = bool(_jump.get("armed"))
-except (OSError, json.JSONDecodeError):
-    jump_ts = 0.0
-jump_present = jump_ts > 0
-jump_consumed = False
+# (argv slot 6 historically carried the /jump flag path. /jump was
+# removed 2026-10-07 — official-client behaviour only, no cut-ins —
+# and nothing writes or reads the flag any more. The slot is kept so
+# the positional arg indices below do not shift.)
 
 # --- topic boundary (/new): history only includes post-boundary turns ---
 boundary_ts = 0.0
@@ -415,6 +400,8 @@ detached_activity = []
 detached_orphan_sources = []
 preempt_info = None
 detached_dirty = False
+retire_rows = []
+DETACHED_RETIRE_SECS = 3600
 
 if detached:
     # Batches preempted earlier keep running in parallel; supervise
@@ -459,6 +446,20 @@ if detached:
                 dlast = _parked_mtime
         if dreplied:
             continue
+        if now - dlast >= DETACHED_RETIRE_SECS:
+            # Zombie retirement (2026-10-07): no delivered reply, no
+            # bound outbox activity, no heartbeat, no parked row for
+            # over an hour. Every sign of life feeds dlast, and a live
+            # worker heartbeats every 60s, so this batch's worker is
+            # gone. Under the no-cap policy nothing else ever retires
+            # it, yet it keeps inflating queue displays and position
+            # counts. Retire it to the graveyard file — a late reply
+            # would still deliver via the outbox; only the supervision
+            # and display tracking stop.
+            retire_rows.append({"msgids": sorted(str(m) for m in dids),
+                                "since": dsince, "last_activity": dlast,
+                                "retired_ts": now})
+            continue
         if now - dlast >= BATCH_CAP_SECS:
             # Fail-stop: the detached batch is dead. Fail its
             # messages (the fail-stop block cancels + notifies) and
@@ -471,6 +472,16 @@ if detached:
         detached_activity.append((list(dids), dsince, dlast))
         kept_detached.append(d)
     detached = kept_detached
+
+if retire_rows and not dry:
+    try:
+        with open(os.path.join(os.path.dirname(batch_path),
+                               "detached_retired.jsonl"),
+                  "a", encoding="utf-8") as _rf:
+            for _rr2 in retire_rows:
+                _rf.write(json.dumps(_rr2, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
 
 # --- orphan claims: atomic takeover guard ---
 # When a wake hands orphaned messages to a worker they are claimed
@@ -707,14 +718,6 @@ elif batch_active and not batch_done:
         preempt_info = {"still_running_msgids": list(batch.get("msgids") or []),
                         "batch_age_mins": round(batch_age / 60, 1),
                         "reason": "stop_request"}
-    elif pending_entries and jump_present:
-        # /jump: the user personally ordered an immediate takeover.
-        # No threshold applies — release the queue at THIS poll. The
-        # running batch is NOT cancelled; it moves to detached below
-        # exactly like a threshold preemption.
-        preempt_info = {"still_running_msgids": list(batch.get("msgids") or []),
-                        "batch_age_mins": round(batch_age / 60, 1),
-                        "reason": "jump_command"}
     elif pending_entries and oldest_wait >= PREEMPT_WAIT_SECS:
         preempt_info = {"still_running_msgids": list(batch.get("msgids") or []),
                         "batch_age_mins": round(batch_age / 60, 1),
@@ -726,10 +729,7 @@ elif batch_active and not batch_done:
     if preempt_info:
         # Force-release the queued messages to a fresh worker while
         # the long batch keeps running; the old batch moves to the
-        # detached list and stays supervised above. Any preemption —
-        # whatever fired it — also satisfies a pending /jump flag:
-        # the user's "release now" intent has been carried out.
-        jump_consumed = True
+        # detached list and stays supervised above.
         new = pending_entries[:MAX_BATCH]
         detached.append({"msgids": list(batch.get("msgids") or []), "since": batch_since})
     else:
@@ -979,27 +979,6 @@ if not dry and new and orphan_info:
         os.replace(tmp, claims_path)
     except OSError:
         pass
-
-if not dry and jump_present:
-    # Consume/clear the /jump flag. Keep it ONLY in the one state where
-    # it still has work to do: armed, a batch is still in flight, the
-    # flag was not consumed this poll, and nothing is queued yet — it
-    # is waiting for the next message. Every other state clears it:
-    # consumed by a preemption, no batch to preempt (a fresh message
-    # wakes immediately anyway), or a plain flag whose queue moment has
-    # passed. Deletion is guarded by the ts read at poll start so a
-    # newer flag written mid-poll is never clobbered (same-poll write
-    # collision rule).
-    _in_flight = batch_active and not batch_done
-    _keep_armed = jump_armed and _in_flight and not jump_consumed and not pending_entries
-    if not _keep_armed:
-        try:
-            with open(jump_path, encoding="utf-8") as f:
-                _cur = json.load(f)
-            if isinstance(_cur, dict) and float(_cur.get("ts") or 0) == jump_ts:
-                os.unlink(jump_path)
-        except (OSError, json.JSONDecodeError, TypeError, ValueError):
-            pass
 
 # --- subagent jobs (/subagent): isolated parallel background jobs ---
 # The gateway intercepts /subagent commands and appends dispatch

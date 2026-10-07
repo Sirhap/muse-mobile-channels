@@ -1,0 +1,20 @@
+[Unit]
+Description=Native fast-lane bridge for Muse mobile channels (cold-start hook path stays as backup)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=/home/hatch/workspace/native-bridge
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-/etc/environment
+Environment=HOME=/home/hatch
+Environment=MUSE_HOME=/home/hatch
+ExecStart=/home/hatch/muse-test-venv/bin/python /home/hatch/workspace/native-bridge/native_bridge.py daemon
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

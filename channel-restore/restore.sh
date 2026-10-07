@@ -114,6 +114,64 @@ PYEOF
   return 1
 }
 
+heal_bridge() {
+  # native-bridge: fast lane for the channels (cold path stays backup).
+  # Different shape from heal_one: venv lives at $HOME_DIR/muse-test-venv,
+  # credentials are the native token/cookies under .config/native-bridge.
+  local WS="$1" HOME_DIR="$2"
+  local svc=native-bridge
+  local src="$WS/native-bridge/native-bridge.service"
+  local dst="/etc/systemd/system/$svc.service"
+  if [[ ! -x "$HOME_DIR/muse-test-venv/bin/python" ]]; then
+    echo "$svc: FAIL venv python missing at $HOME_DIR/muse-test-venv/bin/python"
+    return 1
+  fi
+  if [[ ! -f "$HOME_DIR/.config/native-bridge/token.json" && ! -f "$HOME_DIR/.config/native-bridge/cookies.txt" ]]; then
+    echo "$svc: WARN no native credential (token.json/cookies.txt) - bridge will fall back to cold path"
+  fi
+  if [[ ! -f "$src" ]]; then
+    echo "$svc: FAIL workspace unit copy missing: $src"
+    return 1
+  fi
+  if [[ ! -f "$dst" ]] || ! cmp -s "$src" "$dst"; then
+    cp "$src" "$dst" && echo "$svc: unit (re)installed from workspace copy"
+    systemctl daemon-reload
+  fi
+  if ! systemctl is-enabled --quiet "$svc" 2>/dev/null; then
+    systemctl enable "$svc" >/dev/null 2>&1 && echo "$svc: enabled"
+  fi
+  if ! systemctl is-active --quiet "$svc" 2>/dev/null; then
+    systemctl start "$svc" 2>/dev/null && echo "$svc: started"
+    sleep 3
+  fi
+  if systemctl is-active --quiet "$svc" 2>/dev/null; then
+    # Unit-active is not the same as working: the bridge refreshes
+    # status.json every step (~10s), so a stale heartbeat under a live
+    # process means wedged workers. The gateways have a watchdog hook;
+    # this timer is the bridge's only supervisor — restart it.
+    local age
+    age="$(python3 - "$WS/native-bridge/status.json" <<'PYEOF' 2>/dev/null || echo 999999
+import json, sys, time
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        print(int(time.time()) - int(json.load(f).get("ts", 0)))
+except Exception:
+    print(999999)
+PYEOF
+)"
+    if [[ "$age" =~ ^[0-9]+$ ]] && [[ "$age" -gt 180 ]]; then
+      echo "$svc: active but status stale (${age}s) - restarting"
+      systemctl restart "$svc" 2>/dev/null && echo "$svc: restarted"
+      sleep 3
+    else
+      echo "$svc: active (status age ${age}s)"
+    fi
+    return 0
+  fi
+  echo "$svc: FAIL still not active; see: journalctl -u $svc -n 20"
+  return 1
+}
+
 main() {
   local HOME_DIR
   HOME_DIR="$(resolve_install_home)"
@@ -136,6 +194,7 @@ main() {
 
   heal_one wecom-bot wecom-bot "$HOME_DIR/.config/wecom-bot/credentials.env" || FAIL=1
   heal_one weixin-bot weixin-bot "$HOME_DIR/.config/weixin-bot/credentials.env" || FAIL=1
+  heal_bridge "$WS" "$HOME_DIR" || FAIL=1
 
   if [[ "$FAIL" == "0" ]]; then
     echo "channel-restore: all gateways healthy"

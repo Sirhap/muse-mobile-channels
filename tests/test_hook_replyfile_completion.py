@@ -115,6 +115,17 @@ def run_channel(chan, botdir, hookst, script_name, cli_relpath, entry_fn):
     def calls():
         return open(f"{SBX}/cli.log").read()
 
+    def no_cancel_calls():
+        # Since the 2026-10-07 stall-notice deployment a long-silent
+        # batch legitimately triggers ONE cli "send" (the stall
+        # notice); the no-fail-stop contract is that no "cancel" call
+        # ever happens for these batches.
+        return "CALL: cancel" not in calls()
+
+    def retired():
+        p = os.path.join(HOOKST, "detached_retired.jsonl")
+        return open(p).read() if os.path.exists(p) else ""
+
     def batch():
         return json.loads(open(f"{HOOKST}/active_batch.json").read())
 
@@ -160,7 +171,7 @@ def run_channel(chan, botdir, hookst, script_name, cli_relpath, entry_fn):
               "errmsg": "cancelled", "ts": NOW - 4940}])
     out = run_hook()
     check("S12 no fail-stop on cancelled reply (no cap)",
-          calls() == "")
+          no_cancel_calls() and "CALL: send" in calls())
     check("S12 batch still active, not completed",
           batch().get("msgids") == ["F5"])
 
@@ -207,9 +218,13 @@ def run_channel(chan, botdir, hookst, script_name, cli_relpath, entry_fn):
               "errmsg": "cancelled", "ts": NOW - 4940}])
     out = run_hook()
     check("S15 no detached fail-stop on cancelled reply (no cap)",
-          calls() == "")
-    check("S15 detached entry lingers",
-          (batch().get("detached") or [{}])[0].get("msgids") == ["F8"])
+          no_cancel_calls())
+    # 2026-10-07 doctrine update: a detached batch silent past the
+    # retirement window (no reply, no activity, no heartbeat) is
+    # retired to the graveyard — not failed, not cancelled, just no
+    # longer tracked/displayed.
+    check("S15 detached zombie retired to graveyard",
+          not batch().get("detached") and "F8" in retired())
 
     # S11 reply_file counts as bound for starvation
     reset()
@@ -229,7 +244,8 @@ def run_channel(chan, botdir, hookst, script_name, cli_relpath, entry_fn):
     hookst_w("active_batch.json", {"msgids": ["D1"], "since": NOW - 3700, "detached": []})
     out = run_hook()
     check("S1c silent batch NOT auto-stopped (no cap)",
-          calls() == "" and batch().get("msgids") == ["D1"])
+          no_cancel_calls() and "CALL: send" in calls()
+          and batch().get("msgids") == ["D1"])
 
 
 def wx_entry(mid, ts, text="发个图片"):

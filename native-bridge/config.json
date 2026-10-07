@@ -1,0 +1,22 @@
+{
+ "channels": {
+  "weixin": {
+   "bot_state": "/home/hatch/workspace/weixin-bot/state",
+   "from_user_id": "o9cq803gzsCWEEEYLNgKueNlu-jo@im.wechat",
+   "session_title": "native-bridge-weixin",
+   "boundary_file": "/home/hatch/hooks/state/weixin-bot/topic_boundary.json"
+  },
+  "wecom": {
+   "bot_state": "/home/hatch/workspace/wecom-bot/state",
+   "chatid": "sirhao",
+   "from_userid": "sirhao",
+   "session_title": "native-bridge-wecom",
+   "boundary_file": "/home/hatch/hooks/state/wecom-bot/topic_boundary.json"
+  },
+  "test": {
+   "bot_state": "/tmp/bridge-test/state",
+   "session_title": "native-bridge-test",
+   "boundary_file": "/tmp/bridge-test/hook/topic_boundary.json"
+  }
+ }
+}
