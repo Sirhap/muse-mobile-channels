@@ -59,6 +59,7 @@ from channel_common import (  # noqa: E402
     retry_backoff_secs,
     subagent_outcome_default,
     trim_mapping,
+    waiting_ahead,
     atomic_write_text,
     write_offset,
 )
@@ -490,15 +491,16 @@ def soft_ack_text(state_dir, hook_state_dir, text):
     imperatives get no ack. Any state problem -> None (fail-silent:
     the message itself is always queued exactly as before).
 
-    Position N = the hook's pending count + 1 (this message). The
-    gateway reads the hook's pending.json snapshot, so messages that
+    Position N = the hook's genuinely-waiting pending count + 1
+    (this message; in-service messages never count). The gateway
+    reads the hook's pending.json snapshot, so messages that
     arrived after the hook's last poll are not registered in it yet
     and a fast burst can repeat the same N — accepted approximation.
     """
     try:
         if is_stop_request(text):
             return None
-        batch, _ids, pcount, _dcount = _queue_summary(hook_state_dir)
+        batch, _ids, _pcount, _dcount = _queue_summary(hook_state_dir)
         ids = [str(m) for m in (batch.get("msgids") or [])]
         if not ids:
             return None
@@ -516,7 +518,7 @@ def soft_ack_text(state_dir, hook_state_dir, text):
                         row = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    if row.get("mode") != "reply":
+                    if row.get("mode") not in ("reply", "reply_file"):
                         continue
                     if str(row.get("msgid") or "") not in idset:
                         continue
@@ -527,7 +529,9 @@ def soft_ack_text(state_dir, hook_state_dir, text):
                         return None  # batch already finished
         except OSError:
             return None
-        return SOFT_ACK_TEMPLATE.format(n=pcount + 1)
+        pending = _read_json_file(hook_state_dir / "pending.json", {}) or {}
+        keys = pending.keys() if isinstance(pending, dict) else []
+        return SOFT_ACK_TEMPLATE.format(n=waiting_ahead(keys, ids) + 1)
     except Exception:
         return None
 
@@ -1269,7 +1273,7 @@ class Gateway:
                     continue
                 if o.get("id") == item_id:
                     break
-                if o.get("mode") != "reply" or str(o.get("msgid")) != str(item.get("msgid")):
+                if o.get("mode") not in ("reply", "reply_file") or str(o.get("msgid")) != str(item.get("msgid")):
                     continue
                 res = results.get(o.get("id"))
                 if res is not None and res.get("ok") is True:

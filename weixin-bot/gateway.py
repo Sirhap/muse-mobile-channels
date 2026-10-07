@@ -50,6 +50,7 @@ from channel_common import (  # noqa: E402
     retry_backoff_secs as _retry_backoff_secs,
     subagent_outcome_default,
     trim_mapping,
+    waiting_ahead,
     write_offset,
     read_offset,
 )
@@ -434,7 +435,7 @@ def batch_in_flight(state_dir, hook_state_dir):
                         row = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    if row.get("mode") != "reply":
+                    if row.get("mode") not in ("reply", "reply_file"):
                         continue
                     if str(row.get("msgid") or "") not in idset:
                         continue
@@ -458,8 +459,9 @@ def soft_ack_text(state_dir, hook_state_dir, text, position=None):
     -> None (fail-silent: the message itself is always queued exactly
     as before).
 
-    Position N = the hook's pending count + 1 (this message), unless
-    the caller passes a locally computed position. The gateway reads
+    Position N = the hook's genuinely-waiting pending count + 1
+    (this message; in-service messages never count), unless the
+    caller passes a locally computed position. The gateway reads
     the hook's pending.json snapshot, so messages that arrived after
     the hook's last poll are not registered in it yet and a fast burst
     can repeat the same N — the classifier corrects for that with its
@@ -471,8 +473,10 @@ def soft_ack_text(state_dir, hook_state_dir, text, position=None):
         if not batch_in_flight(state_dir, hook_state_dir):
             return None
         if position is None:
-            _batch, _ids, pcount, _dcount = _queue_summary(hook_state_dir)
-            position = pcount + 1
+            _batch, _ids, _pcount, _dcount = _queue_summary(hook_state_dir)
+            pending = _read_json_file(hook_state_dir / "pending.json", {}) or {}
+            keys = pending.keys() if isinstance(pending, dict) else []
+            position = waiting_ahead(keys, _ids) + 1
         return SOFT_ACK_TEMPLATE.format(n=position)
     except Exception:
         return None
@@ -1508,10 +1512,11 @@ class Gateway:
                 # Queue position: only messages that are themselves
                 # still waiting count as ahead; the in-flight batch is
                 # being served, not queued (see _queue_position).
-                _b, running_ids, pending_count, _d = _queue_summary(HOOK_STATE_DIR)
+                _b, running_ids, _pending_count, _d = _queue_summary(HOOK_STATE_DIR)
                 position = _queue_position(other_items, running_ids, now)
-                if pending_count:
-                    position = max(position, int(pending_count) + 1)
+                pending = _read_json_file(HOOK_STATE_DIR / "pending.json", {}) or {}
+                if isinstance(pending, dict):
+                    position = max(position, waiting_ahead(pending.keys(), running_ids) + 1)
                 if self._maybe_soft_ack(from_user, text, position=position):
                     rec["kind"] = "queued"
                     rec["queued"] = True
@@ -1537,10 +1542,11 @@ class Gateway:
                 # window (worker cold-starting / starting): this one
                 # queues behind the ones that are themselves waiting,
                 # not behind the burst already being picked up.
-                _b, running_ids, pending_count, _d = _queue_summary(HOOK_STATE_DIR)
+                _b, running_ids, _pending_count, _d = _queue_summary(HOOK_STATE_DIR)
                 position = _queue_position(other_items, running_ids, now)
-                if pending_count:
-                    position = max(position, int(pending_count) + 1)
+                pending = _read_json_file(HOOK_STATE_DIR / "pending.json", {}) or {}
+                if isinstance(pending, dict):
+                    position = max(position, waiting_ahead(pending.keys(), running_ids) + 1)
                 # soft_ack_text requires a hook-visible batch, so in
                 # this lag window queue the same template directly.
                 rec["kind"] = "queued"
@@ -2092,7 +2098,7 @@ class Gateway:
                     continue
                 if o.get("id") == item_id:
                     break
-                if o.get("mode") != "reply" or str(o.get("msgid")) != str(item.get("msgid")):
+                if o.get("mode") not in ("reply", "reply_file") or str(o.get("msgid")) != str(item.get("msgid")):
                     continue
                 res = results.get(o.get("id"))
                 if res is not None and res.get("ok") is True:
