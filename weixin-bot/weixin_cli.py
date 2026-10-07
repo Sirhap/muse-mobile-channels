@@ -348,12 +348,18 @@ def main() -> int:
                 (hb_dir / f"{m}.stop").unlink()
             except OSError:
                 pass
+        worker_pid = os.getppid()
+        for m in msgids:
+            try:
+                (hb_dir / f"{m}.worker").write_text(str(worker_pid), encoding="utf-8")
+            except OSError:
+                pass
         subprocess.Popen(
             [sys.executable, str(BASE / "heartbeat.py"),
-             str(STATE), str(HOOK_STATE), ",".join(msgids)],
+             str(STATE), str(HOOK_STATE), ",".join(msgids), str(worker_pid)],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, start_new_session=True)
-        print(json.dumps({"heartbeat_started": msgids}, ensure_ascii=False))
+        print(json.dumps({"heartbeat_started": msgids, "worker_pid": worker_pid}, ensure_ascii=False))
     elif args.cmd == "heartbeat-stop":
         msgids = [m.strip() for m in args.msgids.split(",") if m.strip()]
         if any(safe_child_name(m) is None for m in msgids):

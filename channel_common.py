@@ -411,6 +411,18 @@ def pid_alive(pid: int) -> bool:
     return True
 
 
+def recorded_worker_is_dead(pid: int) -> bool:
+    """True when a recorded worker pid has exited.
+
+    pid <= 1 is not a worker handle (missing record, or init). Those
+    stay on the silence-timer path so older heartbeats without a
+    worker pid are not failed on the first poll.
+    """
+    if pid <= 1:
+        return False
+    return not pid_alive(pid)
+
+
 def read_pid_file(path: Path) -> int | None:
     """Integer pid stored in path, or None."""
     try:
