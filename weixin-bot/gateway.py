@@ -1710,21 +1710,23 @@ class Gateway:
                 return "stop"
             if diverted:
                 # Bridge lane: the cold classifier must not judge this
-                # message (the hook never sees it). Busy bridge -> a
-                # bridge-flavoured ack whose position counts ONLY
-                # bridge work ahead of it. Idle bridge -> fall through
-                # to the normal idle tail (thinking notice); the cold
-                # busy/merged branches below are guarded by diverted.
+                # message (the hook never sees it). No arrival ack is
+                # sent on this lane at all (2026-10-08, user order:
+                # the 「排队第 N 位（原生通道）」 placeholder receipt
+                # goes away) — a message arriving before the running
+                # turn starts replying is merged into that turn by the
+                # bridge, and one that truly has to wait gets the
+                # started notice from the feedback scan when its turn
+                # begins. The record is still kept so the scan's
+                # started / long-wait notices work. Idle bridge ->
+                # fall through to the normal idle tail (thinking
+                # notice); the cold busy/merged branches below are
+                # guarded by diverted.
                 active, queued = _bridge_snapshot("weixin")
                 if active or queued:
-                    ahead = queued.index(mid) if mid in queued \
-                        else len(queued)
                     rec["kind"] = "queued"
                     rec["queued"] = True
                     rec["queued_at"] = now
-                    self._queue_notice(
-                        from_user,
-                        BRIDGE_ACK_TEMPLATE.format(n=ahead + 1), "softack")
                     return "queued"
                 rec["kind"] = "bridge"
             busy = (not diverted) and batch_in_flight(STATE, HOOK_STATE_DIR)
