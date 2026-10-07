@@ -567,7 +567,7 @@ THINKING_NOTICE_COOLDOWN_SECS = 20
 # merged branch, which only fires while a message is unanswered.
 STOP_ACK_TEXT = "🛑 收到停止请求，正在优先处理。"
 MERGED_ACK_TEXT = "📩 已收到补充，会和前面一条一起处理。"
-BRIDGE_ACK_TEMPLATE = "已收到，排队第 {n} 位（原生通道），前面有任务在跑；/stop 取消"
+
 BRIDGE_WAIT_TEMPLATE = "⏳ 还在排队（原生通道第 {n} 位）：前面任务还没结束，已等{dur}；/stop 取消"
 MEDIA_ACK_TEMPLATE = "📎 已收到{what}，正在处理…"
 STARTED_NOTICE_TEMPLATE = "▶️ 排到你了，开始处理：「{excerpt}」"
@@ -1910,6 +1910,8 @@ class Gateway:
             b_active, b_queued = _bridge_snapshot("weixin")
             b_active_ids = {str(a.get("msgid", "")) for a in b_active
                             if isinstance(a, dict)}
+            b_merged_ids = {str(a.get("msgid", "")) for a in b_active
+                            if isinstance(a, dict) and a.get("merged")}
             b_pos = {m: i + 1 for i, m in enumerate(b_queued)}
             sent = 0
             for mid, rec in list(self.feedback_track.items()):
@@ -1929,7 +1931,13 @@ class Gateway:
                 if rec.get("via_bridge"):
                     # Bridge-lane transitions come from the bridge
                     # snapshot, not the hook state.
-                    if mid in b_active_ids and not rec.get("started_notice"):
+                    if mid in b_merged_ids and not rec.get("started_notice"):
+                        # Merged into the running turn: it never
+                        # "starts" on its own, so the STARTED notice
+                        # would be a false claim — suppress it for
+                        # good (2026-10-08, user order).
+                        rec["started_notice"] = True
+                    elif mid in b_active_ids and not rec.get("started_notice"):
                         rec["started_notice"] = True
                         if self._queue_notice(
                                 user,

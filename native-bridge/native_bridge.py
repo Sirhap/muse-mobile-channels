@@ -49,7 +49,7 @@ MERGE_CHANNELS = {"weixin", "test"}
 # started; other channels keep strict FIFO. Merged msgids get this
 # pointer as their bound reply; the combined answer itself is bound
 # to the turn's first msgid.
-MERGE_POINTER_TEXT = "（这条已并入上一条一起处理，答复见上一条）"
+MERGE_POINTER_TEXT = "（已并入上一条处理）"
 AUTO_ROTATE_TURNS = 80
 AUTO_ROTATE_AGE = 7 * 86400
 NODE_ID = "native-bridge"
@@ -60,6 +60,20 @@ PREAMBLE = (
     "如果生成了要发给用户的文件，在回复末尾单独一行写 [[FILE:文件的绝对路径]]；"
     "不要提及桥接机制。\n\n用户消息："
 )
+# A session created by the user's /new carries one extra rule. The
+# rotation itself only swaps the session id; the agent's platform
+# tools can still READ other sessions, and when the user tested /new
+# by asking "what did I just ask you", the fresh session looked the
+# old conversation up and quoted it (2026-10-08 02:41, session
+# 6bdfcfbe) — to the user, /new had not worked. The ack promises
+# earlier conversation is not carried in; this clause makes the
+# agent honour that instead of fetching it.
+PREAMBLE_FRESH = PREAMBLE.replace(
+    "不要提及桥接机制。",
+    "不要提及桥接机制。\n"
+    "【新会话】用户刚主动开了新会话，这是全新对话：不要查阅、引用或复述"
+    "其它会话（包括刚结束的上一个会话）的内容；即使用户问起之前聊过什么，"
+    "也只说明这是新会话、之前的内容没有带入，请用户在新会话里重新说明。")
 
 _state_lock = threading.Lock()
 
@@ -360,6 +374,9 @@ class ChannelWorker(threading.Thread):
         return d.get("session_id")
 
     def session_for(self, cs):
+        """(session_id, preamble_text) — preamble_text is "" when the
+        session is already briefed, PREAMBLE for a normal new session,
+        PREAMBLE_FRESH when the user rotated via /new."""
         rotate = cs["rotate_main"]
         sid = cs["session_id"]
         if sid and not rotate:
@@ -370,16 +387,18 @@ class ChannelWorker(threading.Thread):
                 self.log(f"auto-rotating session (turns={turns_n})")
                 rotate = True
         if rotate or not sid:
+            fresh = bool(cs.get("fresh_start")) and bool(sid)
             sid = self.new_session()
             st = dict(cs["session_started"])
             st["main"] = int(time.time())
             tn = dict(cs["session_turns"])
             tn["main"] = 0
             self.update_cs(session_id=sid, preamble_done=False,
-                           rotate_main=False, idle_push_seq=0,
+                           rotate_main=False, fresh_start=False,
+                           idle_push_seq=0,
                            session_started=st, session_turns=tn)
-            return sid, True
-        return sid, not cs["preamble_done"]
+            return sid, (PREAMBLE_FRESH if fresh else PREAMBLE)
+        return sid, ("" if cs["preamble_done"] else PREAMBLE)
 
     def history_events(self, sid, limit=40):
         d = self.gw.call_json("chat.history",
@@ -387,12 +406,12 @@ class ChannelWorker(threading.Thread):
         return sorted(d.get("chat_events", []), key=lambda e: e.get("seq", 0))
 
     def start_turn(self, row, cs):
-        sid, need_preamble = self.session_for(cs)
+        sid, preamble = self.session_for(cs)
         evs = self.history_events(sid, limit=5)
         baseline = evs[-1].get("seq", 0) if evs else 0
         text = row.get("text", "")
-        if need_preamble:
-            text = PREAMBLE + text
+        if preamble:
+            text = preamble + text
         self.gw._open("chat.stream", body={
             "items": [{"type": "text", "text": text}], "node_id": NODE_ID,
             "capabilities": {}, "session_id": sid})
@@ -466,11 +485,12 @@ class ChannelWorker(threading.Thread):
                 reply = fmt_event(ev)
                 text = reply.get("text", "")
                 deliver_reply(self.ch, turn["msgid"], text)
-                # Merged-in messages share this one combined answer:
-                # each still needs its own bound terminal reply, so it
-                # gets a short pointer instead of a duplicate copy.
+                # Merged-in messages share this one combined answer
+                # and get NO bubble of their own (the official client
+                # shows a single answer). Their gateway feedback
+                # records are closed silently via feedback_clear.
                 for mid in ids[1:]:
-                    deliver_reply(self.ch, mid, MERGE_POINTER_TEXT)
+                    self._silence_merged(mid)
                 self.log(f"reply delivered msgid={turn['msgid']} "
                          f"lane={turn['lane']} "
                          f"secs={int(time.time()) - turn['sent_at']}")
@@ -632,7 +652,8 @@ class ChannelWorker(threading.Thread):
             # earlier version kept them in memory only, so any bridge
             # restart between the user's /new and their next message
             # silently ate the rotation (the ts had already advanced).
-            self.update_cs(last_boundary_ts=bts, rotate_main=True)
+            self.update_cs(last_boundary_ts=bts, rotate_main=True,
+                           fresh_start=True)
             self.log("topic boundary seen; session rotates on next turn")
         if self.read_offset is None:
             self.read_offset = cs["spool_offset"]
@@ -756,9 +777,10 @@ class ChannelWorker(threading.Thread):
         cs = self.cs()
         snap = {
             "active": [{"msgid": mid, "lane": t["lane"],
-                        "secs": int(time.time()) - t["sent_at"]}
+                        "secs": int(time.time()) - t["sent_at"],
+                        **({"merged": True} if i else {})}
                        for t in cs["turns"]
-                       for mid in (t.get("ids") or [t["msgid"]])],
+                       for i, mid in enumerate(t.get("ids") or [t["msgid"]])],
             "queued": [r.get("msgid") for r, _n in self.queue],
             "updated": int(time.time())}
         if snap["active"] != cs["queue_snapshot"].get("active") or \
@@ -810,6 +832,22 @@ class ChannelWorker(threading.Thread):
             self.log(f"fallback alert sent streak={streak}")
         except Exception as e:
             self.log(f"fallback alert failed: {str(e)[:80]}")
+
+    def _silence_merged(self, mid):
+        """Close a merged message's gateway feedback record without
+        sending it any bubble: append its msgid to the channel's
+        feedback_clear.jsonl — the same side channel the hooks use
+        for messages resolved outside the reply path, consumed by
+        the gateway's feedback scan. If that write fails, fall back
+        to a short bound pointer reply so the record still closes."""
+        try:
+            append_jsonl(os.path.join(
+                CFG["channels"][self.ch]["bot_state"],
+                "feedback_clear.jsonl"), {"msgid": mid})
+        except Exception as e:
+            self.log("feedback_clear failed:", str(e)[:80],
+                     "; pointer reply instead")
+            deliver_reply(self.ch, mid, MERGE_POINTER_TEXT)
 
     def _merge_into_active(self):
         """Fold every queued row into the running turn (MERGE_CHANNELS

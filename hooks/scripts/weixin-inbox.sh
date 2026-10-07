@@ -100,9 +100,10 @@ HISTORY_NOTICE_STEP_TURNS = 20
 # History budget (2026-10-04, user-approved): was last-24-turns fixed.
 # Now char-budget based: keep recent turns verbatim until the 30000-char
 # total budget fills; older turns are proactively compressed into a
-# digest summary (see build_history). When overflow first happens (and
-# every HISTORY_NOTICE_STEP_TURNS further summarized turns), payload
-# carries context_notice so the worker tells the user once, not every wake.
+# digest summary (see build_history). Overflow used to add a
+# context_notice to the payload for the worker to surface once;
+# since 2026-10-08 (weixin only, user order) the notice is computed
+# for throttling bookkeeping but never put in the payload.
 dry = os.environ.get("HATCH_HOOK_DRY_RUN") == "1"
 now = time.time()
 try:
@@ -1422,8 +1423,10 @@ if failed_entries:
     payload["failed_tasks"] = [{"msgid": e["msgid"],
                                 "text": (e.get("text") or "")[:200]}
                                for e in failed_entries]
-if context_notice:
-    payload["context_notice"] = context_notice
+# 2026-10-08 (user order, weixin only): compression still happens
+# and history_meta still reports it, but the notice is never
+# surfaced to the user - context_notice is deliberately NOT
+# added to the payload on this channel.
 if sub_notices_out:
     payload["subagent_notices"] = sub_notices_out
 if job_wake is not None:
