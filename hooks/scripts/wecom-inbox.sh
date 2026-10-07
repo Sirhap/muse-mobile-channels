@@ -123,10 +123,33 @@ except (OSError, json.JSONDecodeError):
     pass
 
 
+def _worker_dead(mid):
+    # heartbeats/<msgid>.worker holds the pid of the process that
+    # started the batch (the worker), not the heartbeat child.
+    # A dead pid is a fact. A missing file is not: older batches
+    # keep the silence-timer path.
+    path = os.path.join(os.path.dirname(inbox_path), "heartbeats", str(mid) + ".worker")
+    try:
+        with open(path, encoding="utf-8") as f:
+            pid = int(f.read().strip())
+    except (OSError, ValueError):
+        return False
+    if pid <= 1:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    return False
+
 def _hb_ts(mid):
-    # Internal worker heartbeat (heartbeat.py): a fresh per-msgid
-    # file under <bot-state>/heartbeats/ proves the batch's worker
-    # is alive even when it sends no visible progress.
+    # A fresh heartbeat file counts only while the recorded worker
+    # process is still alive. The heartbeat child keeps writing after
+    # the worker dies; that file must not extend the batch.
+    if _worker_dead(mid):
+        return 0.0
     try:
         return os.path.getmtime(os.path.join(
             os.path.dirname(inbox_path), "heartbeats", str(mid)))
@@ -356,8 +379,18 @@ if batch_active:
     if _parked_msgids & {str(_m) for _m in batch_ids}:
         if _parked_mtime > last_activity:
             last_activity = _parked_mtime
+    worker_dead = any(_worker_dead(str(_m)) for _m in batch_ids)
     if batch_replied:
         batch_done = True
+    elif worker_dead:
+        # The process that owned this batch has exited. Do not wait
+        # out the silence cap: the heartbeat child is not the worker.
+        batch_done = True
+        by_id = {e["msgid"]: e for e in entries}
+        for mid in batch.get("msgids") or []:
+            e = by_id.get(mid)
+            if e is not None:
+                failed_entries.append(e)
     elif now - last_activity >= BATCH_CAP_SECS:
         # Fail-stop (user spec, 2026-10-05): no reply, no outbox
         # activity and no heartbeat for a full cap window = dead.
@@ -440,6 +473,12 @@ if detached:
             if _parked_mtime > dlast:
                 dlast = _parked_mtime
         if dreplied:
+            continue
+        if any(_worker_dead(str(_m)) for _m in dids):
+            for mid in d.get("msgids") or []:
+                e = by_id.get(mid)
+                if e is not None and e not in failed_entries:
+                    failed_entries.append(e)
             continue
         if now - dlast >= BATCH_CAP_SECS:
             # Fail-stop: the detached batch is dead. Fail its

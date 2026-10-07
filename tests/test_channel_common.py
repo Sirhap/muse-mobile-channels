@@ -13,6 +13,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "weixin-bot"))
 
+import subprocess
+
 from channel_common import (  # noqa: E402
     allocate_subagent_id,
     complete_jsonl_lines,
@@ -29,6 +31,7 @@ from channel_common import (  # noqa: E402
     trim_mapping,
     write_offset,
     read_offset,
+    recorded_worker_is_dead,
 )
 import login  # noqa: E402
 from login import status_url  # noqa: E402
@@ -244,6 +247,17 @@ class SafetyTests(unittest.TestCase):
                 self.assertEqual(login.pending_qrcode(), "qr-session")
             finally:
                 login.LOGIN_STATE = previous
+
+    def test_dead_worker_pid_is_a_hard_signal(self) -> None:
+        self.assertFalse(recorded_worker_is_dead(0))
+        self.assertFalse(recorded_worker_is_dead(1))
+        proc = subprocess.Popen(["sleep", "30"])
+        try:
+            self.assertFalse(recorded_worker_is_dead(proc.pid))
+        finally:
+            proc.kill()
+            proc.wait(timeout=5)
+        self.assertTrue(recorded_worker_is_dead(proc.pid))
 
     def test_verify_code_is_on_the_status_url(self) -> None:
         url = status_url("qr-session", "2468")

@@ -59,7 +59,7 @@ _REPO = Path(__file__).resolve().parent.parent
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
-from channel_common import read_pid_file, safe_child_path
+from channel_common import read_pid_file, recorded_worker_is_dead, safe_child_path
 
 
 def _env_secs(name: str, default: float) -> float:
@@ -86,14 +86,20 @@ def _read_json(path: Path):
         return None, "bad"
 
 
-def _sleep_until(seconds: float, stop_paths: list[Path]) -> bool:
-    """Sleep up to seconds. Return True if a stop marker appears."""
+def _sleep_until(seconds: float, stop_paths: list[Path], worker_dead) -> str:
+    """Sleep up to seconds. Return stop, worker, or empty."""
     deadline = time.time() + seconds
     while time.time() < deadline:
+        if worker_dead():
+            return "worker"
         if any(path.exists() for path in stop_paths):
-            return True
+            return "stop"
         time.sleep(min(1.0, max(0.0, deadline - time.time())))
-    return any(path.exists() for path in stop_paths)
+    if worker_dead():
+        return "worker"
+    if any(path.exists() for path in stop_paths):
+        return "stop"
+    return ""
 
 
 def main() -> int:
@@ -101,6 +107,12 @@ def main() -> int:
     state_dir = Path(sys.argv[1])
     hook_state_dir = Path(sys.argv[2])
     msgids = [item for item in sys.argv[3].split(",") if item]
+    worker_pid = 0
+    if len(sys.argv) > 4:
+        try:
+            worker_pid = int(sys.argv[4])
+        except ValueError:
+            worker_pid = 0
     if not msgids:
         return 2
     hb_dir = state_dir / "heartbeats"
@@ -128,6 +140,7 @@ def main() -> int:
                 "ts": started,
                 "msgids": [item[0] for item in paths],
                 "pid": pid,
+                "worker_pid": worker_pid,
                 "event": "start",
             }, ensure_ascii=False) + "\n")
     except OSError:
@@ -161,10 +174,19 @@ def main() -> int:
         cleanup()
         return 0
 
+    def worker_dead() -> bool:
+        # The heartbeat process outlives the worker on purpose
+        # (start_new_session). The worker pid recorded at start is
+        # the hard signal: once that process is gone, another beat
+        # would only hide the death.
+        return recorded_worker_is_dead(worker_pid)
+
     stop_paths = [item[3] for item in paths]
     while True:
         now = time.time()
         age = now - started
+        if worker_dead():
+            return bail("worker_dead")
         if any(path.exists() for path in stop_paths):
             return bail("stop_marker")
         batch, batch_state = _read_json(hook_state_dir / "active_batch.json")
@@ -211,7 +233,10 @@ def main() -> int:
                     pass
         if age >= MAX_AGE_SECS:
             return bail("max_age")
-        if _sleep_until(INTERVAL_SECS, stop_paths):
+        wake = _sleep_until(INTERVAL_SECS, stop_paths, worker_dead)
+        if wake == "worker":
+            return bail("worker_dead")
+        if wake == "stop":
             return bail("stop_marker")
 
 
