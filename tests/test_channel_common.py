@@ -31,7 +31,9 @@ from channel_common import (  # noqa: E402
     trim_mapping,
     write_offset,
     read_offset,
+    batch_workers_dead,
     recorded_worker_is_dead,
+    waiting_ahead,
 )
 import login  # noqa: E402
 from login import status_url  # noqa: E402
@@ -247,6 +249,23 @@ class SafetyTests(unittest.TestCase):
                 self.assertEqual(login.pending_qrcode(), "qr-session")
             finally:
                 login.LOGIN_STATE = previous
+
+    def test_in_service_message_is_not_ahead_in_line(self) -> None:
+        self.assertEqual(waiting_ahead(["m-running", "m-wait"], ["m-running"]), 1)
+        self.assertEqual(waiting_ahead(["m-running"], ["m-running"]), 0)
+
+    def test_dead_worker_file_ends_the_batch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            heartbeats = Path(tmp)
+            proc = subprocess.Popen(["sleep", "30"])
+            dead = proc.pid
+            proc.kill()
+            proc.wait(timeout=5)
+            (heartbeats / "m1.worker").write_text(str(dead), encoding="utf-8")
+            self.assertTrue(batch_workers_dead(heartbeats, ["m1"]))
+            (heartbeats / "m1.worker").write_text(str(os.getpid()), encoding="utf-8")
+            self.assertFalse(batch_workers_dead(heartbeats, ["m1"]))
+            self.assertFalse(batch_workers_dead(heartbeats, ["no-record"]))
 
     def test_dead_worker_pid_is_a_hard_signal(self) -> None:
         self.assertFalse(recorded_worker_is_dead(0))

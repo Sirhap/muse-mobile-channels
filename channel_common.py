@@ -411,6 +411,35 @@ def pid_alive(pid: int) -> bool:
     return True
 
 
+def waiting_ahead(pending_ids, in_service_ids) -> int:
+    """How many queued messages are actually waiting, not in service.
+
+    The in-flight batch is being handled. Counting it makes a brand-new
+    message look like it is already 2nd in line.
+    """
+    serving = {str(item) for item in in_service_ids}
+    return sum(1 for item in pending_ids if str(item) not in serving)
+
+
+def batch_workers_dead(heartbeat_dir: Path, msgids) -> bool:
+    """True when every recorded worker for these messages has exited.
+
+    No worker file means the batch has not reported a process yet, so
+    this returns False and the silence timer still applies.
+    """
+    saw = False
+    for msgid in msgids:
+        path = heartbeat_dir / f"{msgid}.worker"
+        try:
+            pid = int(path.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            continue
+        saw = True
+        if not recorded_worker_is_dead(pid):
+            return False
+    return saw
+
+
 def recorded_worker_is_dead(pid: int) -> bool:
     """True when a recorded worker pid has exited.
 
