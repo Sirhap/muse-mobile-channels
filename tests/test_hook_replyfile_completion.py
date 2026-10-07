@@ -17,13 +17,17 @@ S10 detached batch + DELIVERED reply_file row -> dropped silently
 S11 msgid answered only via reply_file + starvation carried=3
     -> no solo wake (reply_file counts as bound)
 S12 active batch + reply_file queued but result cancelled, old
-    -> fail-stop fires (queued-but-undelivered is NOT completion)
+    -> NOT completion and NOT failed: since the 2026-10-07
+    no-cap order the batch simply stays active (no cancel, no
+    failure notice) — queued-but-undelivered still never
+    counts as answered
 S13 active batch + formal reply parked in the retry lane
     -> batch stays alive past cap: no fail-stop, not completed
 S14 detached batch + DELIVERED bound send row -> dropped silently
 S15 detached batch + reply queued but cancelled, old
-    -> fail-stop fires for the detached msgid
-S1c control: silent batch, no outbox rows -> fail-stop still fires
+    -> detached entry lingers, no fail-stop (no cap)
+S1c control: silent batch, no outbox rows -> nothing happens
+    (no auto-stop since the 2026-10-07 no-cap order)
 
 Fixture ages were rescaled on 2026-10-07 when the user raised
 BATCH_CAP_SECS 600 -> 3600: "aged past cap" fixtures now use
@@ -155,8 +159,10 @@ def run_channel(chan, botdir, hookst, script_name, cli_relpath, entry_fn):
     results([{"id": "RF5", "mode": "reply_file", "ok": False,
               "errmsg": "cancelled", "ts": NOW - 4940}])
     out = run_hook()
-    check("S12 fail-stop fires on cancelled reply",
-          "cancel --msgid F5" in calls() and calls().count("CALL: send") == 1)
+    check("S12 no fail-stop on cancelled reply (no cap)",
+          calls() == "")
+    check("S12 batch still active, not completed",
+          batch().get("msgids") == ["F5"])
 
     # S13 formal reply parked in the retry lane keeps the batch alive
     reset()
@@ -200,8 +206,10 @@ def run_channel(chan, botdir, hookst, script_name, cli_relpath, entry_fn):
     results([{"id": "RF8", "mode": "reply", "ok": False,
               "errmsg": "cancelled", "ts": NOW - 4940}])
     out = run_hook()
-    check("S15 detached fail-stop fires on cancelled reply",
-          "cancel --msgid F8" in calls())
+    check("S15 no detached fail-stop on cancelled reply (no cap)",
+          calls() == "")
+    check("S15 detached entry lingers",
+          (batch().get("detached") or [{}])[0].get("msgids") == ["F8"])
 
     # S11 reply_file counts as bound for starvation
     reset()
@@ -220,8 +228,8 @@ def run_channel(chan, botdir, hookst, script_name, cli_relpath, entry_fn):
     hookst_w("carried_msgids.txt", "D1\n")
     hookst_w("active_batch.json", {"msgids": ["D1"], "since": NOW - 3700, "detached": []})
     out = run_hook()
-    check("S1c fail-stop still fires", "cancel --msgid D1" in calls()
-          and calls().count("CALL: send") == 1)
+    check("S1c silent batch NOT auto-stopped (no cap)",
+          calls() == "" and batch().get("msgids") == ["D1"])
 
 
 def wx_entry(mid, ts, text="发个图片"):
