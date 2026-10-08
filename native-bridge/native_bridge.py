@@ -43,13 +43,26 @@ PROG_EVERY_SECS = 300
 ESCALATE_SECS = 1200        # turn age where progress notices turn into
                             # an actionable "looks stuck, /stop it" warning
 IDLE_PUSH_EVERY_SECS = 20   # idle-session scan cadence (see idle_push_scan)
-MERGE_CHANNELS = {"weixin", "test"}
+MERGE_CHANNELS = {"weixin", "test", "wecom"}
 # Channels in MERGE_CHANNELS fold a queued message into the running
 # turn (official-client steering) while that turn's reply has not
-# started; other channels keep strict FIFO. Merged msgids get this
-# pointer as their bound reply; the combined answer itself is bound
-# to the turn's first msgid.
+# started; other channels keep strict FIFO. The combined answer is
+# bound to the turn's first msgid; merged msgids are closed out per
+# channel (see _silence_merged): silently via feedback_clear where
+# the gateway consumes that file, else with this pointer as their
+# bound reply.
 MERGE_POINTER_TEXT = "（已并入上一条处理）"
+# Channels whose gateway actually consumes feedback_clear.jsonl:
+# weixin's gateway folds it into its feedback scan
+# (_consume_feedback_clear). The WeCom gateway has NO feedback
+# track/scan at all, and every diverted WeCom message holds an open
+# think stream that only a bound reply finishes in place — a
+# silently-cleared merged msgid would hang until the stream watchdog
+# (~540s) closes it with a false "taking too long" bubble. So WeCom
+# merged msgids always take the pointer bound reply instead, which
+# finishes their own stream in place; there is no scan on that side
+# to send anything further for the msgid.
+FEEDBACK_CLEAR_CHANNELS = {"weixin", "test"}
 AUTO_ROTATE_TURNS = 80
 AUTO_ROTATE_AGE = 7 * 86400
 NODE_ID = "native-bridge"
@@ -486,9 +499,8 @@ class ChannelWorker(threading.Thread):
                 text = reply.get("text", "")
                 deliver_reply(self.ch, turn["msgid"], text)
                 # Merged-in messages share this one combined answer
-                # and get NO bubble of their own (the official client
-                # shows a single answer). Their gateway feedback
-                # records are closed silently via feedback_clear.
+                # (the official client shows a single answer); each
+                # is closed out gateway-side by _silence_merged.
                 for mid in ids[1:]:
                     self._silence_merged(mid)
                 self.log(f"reply delivered msgid={turn['msgid']} "
@@ -834,20 +846,25 @@ class ChannelWorker(threading.Thread):
             self.log(f"fallback alert failed: {str(e)[:80]}")
 
     def _silence_merged(self, mid):
-        """Close a merged message's gateway feedback record without
-        sending it any bubble: append its msgid to the channel's
+        """Close a merged message out on the gateway side.
+        FEEDBACK_CLEAR_CHANNELS: append its msgid to the channel's
         feedback_clear.jsonl — the same side channel the hooks use
         for messages resolved outside the reply path, consumed by
-        the gateway's feedback scan. If that write fails, fall back
-        to a short bound pointer reply so the record still closes."""
-        try:
-            append_jsonl(os.path.join(
-                CFG["channels"][self.ch]["bot_state"],
-                "feedback_clear.jsonl"), {"msgid": mid})
-        except Exception as e:
-            self.log("feedback_clear failed:", str(e)[:80],
-                     "; pointer reply instead")
-            deliver_reply(self.ch, mid, MERGE_POINTER_TEXT)
+        the gateway's feedback scan — so it gets no bubble at all;
+        if that write fails, fall back to the pointer reply.
+        Other channels (wecom): the gateway consumes no such file
+        and the message's think stream needs a bound reply to
+        finish in place, so send the short pointer reply directly."""
+        if self.ch in FEEDBACK_CLEAR_CHANNELS:
+            try:
+                append_jsonl(os.path.join(
+                    CFG["channels"][self.ch]["bot_state"],
+                    "feedback_clear.jsonl"), {"msgid": mid})
+                return
+            except Exception as e:
+                self.log("feedback_clear failed:", str(e)[:80],
+                         "; pointer reply instead")
+        deliver_reply(self.ch, mid, MERGE_POINTER_TEXT)
 
     def _merge_into_active(self):
         """Fold every queued row into the running turn (MERGE_CHANNELS
