@@ -47,6 +47,23 @@ ACTIVITY_POLL_SECS = 60     # activity.list cadence during a long turn
                             # (P3: coarse progress signals folded into
                             # the existing progress notices only)
 IDLE_PUSH_EVERY_SECS = 20   # idle-session scan cadence (see idle_push_scan)
+# --- LT2 long-task trailing loop + session self-heal (2026-10-08) -----
+# Ported from the reference implementation, muse-cli's chat.py
+# Chat.send resident loop (baseline seq, poll history, print each new
+# reply as it lands, reset the quiet window after every reply). All
+# LT2 behaviour is gated per channel by a longtask-<channel> flag
+# file (see longtask_mode); with the flag absent every code path
+# below is inert and behaviour is byte-for-byte the pre-LT2 bridge.
+TRAILING_QUIET_SECS = 30    # LT2: status completed + this much silence
+                            # after the last reply closes the turn
+                            # (chat.py's QUIET, stretched for channels)
+TRAILING_MAX_SECS = 600     # LT2: hard cap on the trailing window;
+                            # later arrivals are the idle scan's job,
+                            # continuing on the SAME cursor (spec 3)
+LT_EVENT_PROG_MIN_SECS = 60   # LT2: min gap between event-triggered
+                                # progress notices for one turn
+IDLE_FAIL_ALERT_STREAK = 3    # LT2: idle-scan failures before alerting
+IDLE_ALERT_MIN_SECS = 3600    # LT2: min gap between idle-scan alerts
 MERGE_CHANNELS = {"weixin", "test", "wecom"}
 # Channels in MERGE_CHANNELS fold a queued message into the running
 # turn (official-client steering) while that turn's reply has not
@@ -148,6 +165,7 @@ def ch_state(st, ch):
         "session_turns": {"main": 0},
         "admin_offset": 0,
         "idle_push_seq": 0, "idle_pushed_ids": [],
+        "idle_scan_fail_streak": 0, "idle_scan_last_alert": 0,
         "queue_snapshot": {"active": [], "queued": []}}
     c = st["channels"].setdefault(ch, {})
     for k, v in defaults.items():
@@ -169,6 +187,25 @@ def write_status(extra):
 
 def live_mode(ch):
     return os.path.exists(os.path.join(BASE, f"enabled-{ch}"))
+
+
+def longtask_mode(ch):
+    """LT2 gate: the long-task trailing loop / session self-heal /
+    event-triggered progress apply only to channels carrying a
+    longtask-<channel> flag file (same pattern as enabled-<channel>).
+    Only the test channel is flagged during LT2 acceptance."""
+    return os.path.exists(os.path.join(BASE, f"longtask-{ch}"))
+
+
+def is_session_not_found(exc):
+    """True when a gateway failure means the session id itself is
+    gone server-side (the 2026-10-08 mass-404: every stored sid had
+    vanished from sessions.list). Matches either the structured
+    GatewayError status or the message text, so stub/plain errors
+    with the same meaning also count."""
+    if getattr(exc, "status", None) == 404:
+        return True
+    return "session not found" in str(exc).lower()
 
 
 def outbox_path(ch):
@@ -528,6 +565,7 @@ class ChannelWorker(threading.Thread):
         self.last_idle_scan = 0.0
         self._turn_reply_marks = []   # [(seq, mid)] delivered as turn replies
         self._turns_dirty = False    # a turn field changed during polling
+        self._session_from_stored = False   # LT2: last session_for reused sid
 
     def log(self, *a):
         print(f"[{self.ch}]", *a, flush=True)
@@ -582,6 +620,11 @@ class ChannelWorker(threading.Thread):
         PREAMBLE_FRESH when the user rotated via /new."""
         rotate = cs["rotate_main"]
         sid = cs["session_id"]
+        # LT2 self-heal needs to know whether the coming turn reuses
+        # the STORED sid (only then does a session-not-found mean
+        # "stored sid died"); a freshly started sid failing is a
+        # different failure and must not trigger the heal retry.
+        self._session_from_stored = bool(sid) and not rotate
         if sid and not rotate:
             started = (cs["session_started"].get("main", 0) or 0)
             turns_n = cs["session_turns"].get("main", 0)
@@ -589,6 +632,7 @@ class ChannelWorker(threading.Thread):
                     (started and time.time() - started > AUTO_ROTATE_AGE):
                 self.log(f"auto-rotating session (turns={turns_n})")
                 rotate = True
+                self._session_from_stored = False
         if rotate or not sid:
             fresh = bool(cs.get("fresh_start")) and bool(sid)
             old_sid = sid if fresh else None
@@ -629,6 +673,16 @@ class ChannelWorker(threading.Thread):
             return sid, (PREAMBLE_FRESH if fresh else PREAMBLE)
         return sid, ("" if cs["preamble_done"] else PREAMBLE)
 
+    def _invalidate_session(self, why):
+        """LT2 self-heal: forget a server-dead stored session id so
+        the next start builds a fresh session instead of reusing a
+        corpse (and so the idle scan stops hammering it). Clears the
+        /new audit binding with it — it referred to the dead sid."""
+        self.log(f"session dead -> healing ({why})")
+        self.update_cs(session_id=None, preamble_done=False,
+                       fresh_session_id=None, audit_fingerprints=[],
+                       idle_push_seq=0)
+
     def history_events(self, sid, limit=40):
         d = self.gw.call_json("chat.history",
                               body={"limit": limit, "session_id": sid})
@@ -654,7 +708,15 @@ class ChannelWorker(threading.Thread):
                 "ids": [row["msgid"]], "reply_started": False,
                 "sess_status": None, "status_completed_seen": False,
                 "activities": [], "activity_seen": [],
-                "last_activity_poll": 0, "last_activity": None}
+                "last_activity_poll": 0, "last_activity": None,
+                # LT2 trailing-loop state (inert unless longtask_mode):
+                # reply_delivered flips on the first delivered reply,
+                # cursor_seq is the unified cursor shared with the
+                # idle scan, last_reply_at/trailing_since drive the
+                # quiet/max close conditions.
+                "reply_delivered": False, "cursor_seq": baseline,
+                "last_reply_at": 0, "trailing_since": 0,
+                "activity_dirty": False, "last_event_prog": 0}
         self.log(f"turn sent msgid={row['msgid']} "
                  f"baseline={baseline}")
         return turn
@@ -730,13 +792,16 @@ class ChannelWorker(threading.Thread):
         the events are only ever surfaced inside progress_notice /
         the queue snapshot — never as their own messages. Dedup by
         (timestamp, message_id, type); only events at/after the
-        turn's sent_at are collected."""
+        turn's sent_at are collected.
+        LT2: returns True when at least one NEW event was folded in
+        (the event-triggered progress path in step keys off this);
+        every early exit returns False."""
         if self.gw is None:
-            return
+            return False
         now = time.time()
         if now - (turn.get("last_activity_poll") or 0) \
                 < ACTIVITY_POLL_SECS:
-            return
+            return False
         turn["last_activity_poll"] = int(now)
         # The poll timestamp must persist, or the throttle is lost
         # when step() reloads state and activity.list gets hit on
@@ -745,9 +810,9 @@ class ChannelWorker(threading.Thread):
         try:
             d = self.gw.call_json("activity.list", timeout=15)
         except Exception:
-            return
+            return False
         if not isinstance(d, dict):
-            return
+            return False
         seen = {tuple(k) for k in (turn.get("activity_seen") or [])
                 if isinstance(k, (list, tuple))}
         acts = list(turn.get("activities") or [])
@@ -776,6 +841,7 @@ class ChannelWorker(threading.Thread):
             turn["activities"] = acts[-20:]
             turn["last_activity"] = acts[-1]["text"]
             self._turns_dirty = True
+        return changed
 
     def _best_effort_reply(self, turn):
         """Fresh history read for the abnormal-end path: the LAST
@@ -806,38 +872,103 @@ class ChannelWorker(threading.Thread):
                 self.log("cancel call failed:", str(e)[:100])
             self.log(f"turn cancelled msgid={turn['msgid']}")
             return "cancelled"
+        # LT2 gate: with the flag off, everything below is exactly
+        # the pre-LT2 single-reply behaviour.
+        gated = longtask_mode(self.ch)
         evs = self.history_events(turn["session_id"])
         started = False
+        now_t = time.time()
         for ev in evs:
+            seq = ev.get("seq") or 0
             if ev.get("event_name") == "message.assistant" and \
-                    (ev.get("seq") or 0) > turn["baseline"]:
+                    seq > turn["baseline"]:
                 started = True
-            if is_turn_reply(ev, turn["baseline"]):
-                self._turn_reply_marks.append(
-                    (ev.get("seq") or 0, _ev_mid(ev)))
-                reply = fmt_event(ev)
-                text = reply.get("text", "")
-                deliver_reply(self.ch, turn["msgid"], text)
-                # Merged-in messages share this one combined answer
-                # (the official client shows a single answer); each
-                # is closed out gateway-side by _silence_merged.
-                for mid in ids[1:]:
-                    self._silence_merged(mid)
-                self.log(f"reply delivered msgid={turn['msgid']} "
-                         f"lane={turn['lane']} "
-                         f"secs={int(time.time()) - turn['sent_at']}")
+            if not is_turn_reply(ev, turn["baseline"]):
+                continue
+            text = fmt_event(ev).get("text", "")
+            if gated and turn.get("reply_delivered"):
+                # LT2 trailing segment: a further completed message
+                # after the first reply. Deliver it as an unbound
+                # idle send (its own dedup id), advance the unified
+                # cursor, and stay in the trailing window — the
+                # Chat.send pattern of printing each reply as it
+                # lands and resetting the quiet window.
+                if seq <= (turn.get("cursor_seq") or turn["baseline"]):
+                    continue
+                mid = _ev_mid(ev)
+                self._deliver_idle(text, mid or f"seq{seq}")
+                self._turn_reply_marks.append((seq, mid))
+                turn["cursor_seq"] = seq
+                turn["last_reply_at"] = int(now_t)
+                self._turns_dirty = True
+                self.log(f"trailing reply delivered "
+                         f"msgid={turn['msgid']} seq={seq}")
+                continue
+            # First completed reply of the turn (the only one the
+            # pre-LT2 bridge ever delivered).
+            self._turn_reply_marks.append((seq, _ev_mid(ev)))
+            deliver_reply(self.ch, turn["msgid"], text)
+            # Merged-in messages share this one combined answer
+            # (the official client shows a single answer); each
+            # is closed out gateway-side by _silence_merged. LT2:
+            # this runs exactly once, on the first reply only.
+            for mid in ids[1:]:
+                self._silence_merged(mid)
+            self.log(f"reply delivered msgid={turn['msgid']} "
+                     f"lane={turn['lane']} "
+                     f"secs={int(time.time()) - turn['sent_at']}")
+            if not gated:
                 return "done"
+            # LT2: do NOT close the turn — enter the trailing
+            # window and keep scanning this same history batch for
+            # further segments before deciding below.
+            turn["reply_delivered"] = True
+            turn["cursor_seq"] = seq
+            turn["last_reply_at"] = int(now_t)
+            turn["trailing_since"] = int(now_t)
+            self._turns_dirty = True
         if started and not turn.get("reply_started"):
             turn["reply_started"] = True
             self._turns_dirty = True
-        # No completed reply in history. Cross-check the platform's
-        # own turn state (sessions.get, probe9) — conservatively:
-        # a single "completed" observation never ends the turn (it
-        # gets one more poll to let a lagging history catch up); only
-        # a SECOND consecutive completed with history still empty is
-        # treated as an abnormal end (empty/failed reply), closed
-        # out after a best-effort delivery of any assistant text.
-        # A failed status query changes nothing at all.
+        if gated and turn.get("reply_delivered"):
+            # LT2 trailing window. New activity still marks the
+            # turn dirty so step() can fire an event progress
+            # notice. Close conditions: the platform says the
+            # session turn is completed AND the quiet window since
+            # the last reply has elapsed (TRAILING_QUIET_SECS), or
+            # the trailing window hits its hard cap
+            # (TRAILING_MAX_SECS) — later arrivals then continue
+            # through idle_push_scan on the same unified cursor.
+            # A running status never closes on silence alone.
+            if self._poll_activity(turn):
+                turn["activity_dirty"] = True
+                self._turns_dirty = True
+            status = self._session_status(turn["session_id"])
+            if status is not None and status != turn.get("sess_status"):
+                turn["sess_status"] = status
+                self._turns_dirty = True
+            now2 = time.time()
+            if now2 - (turn.get("trailing_since") or now2) \
+                    >= TRAILING_MAX_SECS:
+                self.log(f"trailing window capped msgid={turn['msgid']}")
+                return "done"
+            if status == "completed" and \
+                    now2 - (turn.get("last_reply_at") or now2) \
+                    >= TRAILING_QUIET_SECS:
+                self.log(f"trailing window closed msgid={turn['msgid']}")
+                return "done"
+            return "running"
+        # No completed reply delivered (yet). Cross-check the
+        # platform's own turn state (sessions.get, probe9) —
+        # conservatively: a single "completed" observation never
+        # ends the turn (it gets one more poll to let a lagging
+        # history catch up); only a SECOND consecutive completed
+        # with history still empty is treated as an abnormal end
+        # (empty/failed reply), closed out after a best-effort
+        # delivery of any assistant text. A failed status query
+        # changes nothing at all. LT2: this abnormal-end logic
+        # applies only while reply_delivered is False — a turn in
+        # its trailing window never reaches here.
         status = self._session_status(turn["session_id"])
         if status is not None and status != turn.get("sess_status"):
             turn["sess_status"] = status
@@ -862,7 +993,10 @@ class ChannelWorker(threading.Thread):
         elif status == "running" and turn.get("status_completed_seen"):
             turn["status_completed_seen"] = False
             self._turns_dirty = True
-        self._poll_activity(turn)
+        if self._poll_activity(turn) and gated:
+            # LT2 spec 4: fresh activity is a progress event.
+            turn["activity_dirty"] = True
+            self._turns_dirty = True
         return "running"
 
     def _deliver_idle(self, text, key):
@@ -918,6 +1052,35 @@ class ChannelWorker(threading.Thread):
         if rows:
             self.log(f"idle push key={str(key)[:12]} rows={len(rows)}")
 
+    def _note_idle_scan_failure(self, cs, exc):
+        """LT2 (gated): bookkeep one idle-scan failure. A dead
+        session used to spam "idle scan failed: session not found"
+        into the journal every ~20s forever, unnoticed; other
+        failures were equally silent. Session-not-found invalidates
+        the stored sid (the scan then skips itself, since sid is
+        None) and does NOT count towards the streak; other errors
+        accumulate idle_scan_fail_streak, and at >= threshold (with
+        an hourly cap) raise ONE visible alert through the channel
+        outbox. Returns nothing; callers just drop the connection."""
+        err = f"{type(exc).__name__} {str(exc)[:100]}"
+        if is_session_not_found(exc):
+            self._invalidate_session(f"idle scan: {err}")
+            return
+        streak = (cs.get("idle_scan_fail_streak") or 0) + 1
+        kw = {"idle_scan_fail_streak": streak}
+        alert = streak >= IDLE_FAIL_ALERT_STREAK and \
+            time.time() - (cs.get("idle_scan_last_alert") or 0) \
+            >= IDLE_ALERT_MIN_SECS
+        if alert:
+            kw["idle_scan_last_alert"] = int(time.time())
+        self.update_cs(**kw)
+        if alert:
+            self._send_alert_text(
+                "⚠️ 原生桥空闲扫描连续失败 "
+                f"{streak} 次，主动推送可能受影响；"
+                "我会继续重试，你不用管。")
+            self.log(f"idle scan alert sent streak={streak}")
+
     def idle_push_scan(self, cs):
         """While no bridge turn is open, watch the channel's own
         session for NEW completed assistant messages and push them to
@@ -927,7 +1090,11 @@ class ChannelWorker(threading.Thread):
         session only baselines the watermark — history is never
         retro-pushed. Read-only polling reuses/renews a quiet
         connection; sends still always go out on fresh turn-scoped
-        connections via _start_next."""
+        connections via _start_next.
+        LT2 (gated): failures go through _note_idle_scan_failure —
+        a session-not-found invalidates the dead sid so the scan
+        stops, other failures streak towards a visible alert, and a
+        successful scan clears the streak."""
         now = time.time()
         if now - self.last_idle_scan < IDLE_PUSH_EVERY_SECS:
             return
@@ -935,12 +1102,15 @@ class ChannelWorker(threading.Thread):
         sid = cs.get("session_id")
         if not sid:
             return
+        gated = longtask_mode(self.ch)
         if self.gw is None:
             try:
                 self.gw = connect()
             except Exception as e:
                 self.log("idle scan connect failed:",
                          type(e).__name__, str(e)[:100])
+                if gated:
+                    self._note_idle_scan_failure(cs, e)
                 return
         try:
             evs = self.history_events(sid, limit=40)
@@ -948,7 +1118,11 @@ class ChannelWorker(threading.Thread):
             self.log("idle scan failed:", type(e).__name__,
                      str(e)[:100])
             self.drop_gw()
+            if gated:
+                self._note_idle_scan_failure(cs, e)
             return
+        if gated and cs.get("idle_scan_fail_streak"):
+            self.update_cs(idle_scan_fail_streak=0)
         if not evs:
             return
         wm = cs.get("idle_push_seq") or 0
@@ -1052,7 +1226,25 @@ class ChannelWorker(threading.Thread):
                 if outcome == "running":
                     age = int(time.time()) - turn["sent_at"]
                     nxt = turn.get("next_prog") or 0
-                    if age >= PROG_FIRST_SECS and time.time() >= nxt:
+                    # LT2 spec 4 (gated): fresh activity is a
+                    # progress EVENT — fire the notice now (throttled
+                    # to one per LT_EVENT_PROG_MIN_SECS) instead of
+                    # waiting for the 120/300 timer, and push the
+                    # timed notice out so the two never stack.
+                    fired = False
+                    if longtask_mode(ch) and turn.get("activity_dirty") \
+                            and time.time() - \
+                            (turn.get("last_event_prog") or 0) \
+                            >= LT_EVENT_PROG_MIN_SECS:
+                        turn["activity_dirty"] = False
+                        turn["last_event_prog"] = int(time.time())
+                        turn["next_prog"] = int(time.time()) \
+                            + PROG_EVERY_SECS
+                        prog_dirty = True
+                        self.progress_notice(turn, age)
+                        fired = True
+                    if not fired and age >= PROG_FIRST_SECS \
+                            and time.time() >= nxt:
                         turn["next_prog"] = int(time.time()) \
                             + PROG_EVERY_SECS
                         prog_dirty = True
@@ -1173,23 +1365,32 @@ class ChannelWorker(threading.Thread):
         if alert:
             self._send_fb_alert(row, streak)
 
-    def _send_fb_alert(self, row, streak):
-        text = ("⚠️ 原生通道暂时连不上（已连续失败 "
-                f"{streak} 次），消息改走备用通道处理，回复会慢一些；"
-                "我会自动重连，你不用管。")
+    def _send_alert_text(self, text, row=None):
+        """Write one visible alert row into this channel's outbox
+        (live addressing when live, the shadow outbox otherwise).
+        Generalized from _send_fb_alert's write pattern so LT2's
+        idle-scan alert reuses exactly the same delivery path —
+        including the gateway's parked-retry handling downstream —
+        instead of inventing a second one. row, when given, supplies
+        the live route; otherwise the channel config does."""
         rid = f"bridgealert-{int(time.time())}"
         try:
             if live_mode(self.ch):
                 out = {"id": rid, "mode": "send", "text": text}
                 if self.ch == "wecom":
-                    if not row.get("chatid"):
+                    cid = (row or {}).get("chatid") or \
+                        CFG["channels"][self.ch].get("chatid", "")
+                    if not cid:
                         return
-                    out["chatid"] = row["chatid"]
-                    out["chattype"] = row.get("chattype", "single")
+                    out["chatid"] = cid
+                    out["chattype"] = (row or {}).get("chattype",
+                                                      "single")
                 else:
-                    if not row.get("from_user"):
+                    to = (row or {}).get("from_user") or \
+                        CFG["channels"][self.ch].get("from_user_id", "")
+                    if not to:
                         return
-                    out["to_user_id"] = row["from_user"]
+                    out["to_user_id"] = to
                 append_jsonl(os.path.join(
                     CFG["channels"][self.ch]["bot_state"], "outbox.jsonl"),
                     out)
@@ -1197,9 +1398,15 @@ class ChannelWorker(threading.Thread):
                 append_jsonl(os.path.join(BASE, "shadow",
                                           f"{self.ch}-outbox.jsonl"),
                              {"id": rid, "mode": "send", "text": text})
-            self.log(f"fallback alert sent streak={streak}")
         except Exception as e:
-            self.log(f"fallback alert failed: {str(e)[:80]}")
+            self.log(f"alert send failed: {str(e)[:80]}")
+
+    def _send_fb_alert(self, row, streak):
+        text = ("⚠️ 原生通道暂时连不上（已连续失败 "
+                f"{streak} 次），消息改走备用通道处理，回复会慢一些；"
+                "我会自动重连，你不用管。")
+        self._send_alert_text(text, row)
+        self.log(f"fallback alert sent streak={streak}")
 
     def _silence_merged(self, mid):
         """Close a merged message out on the gateway side.
@@ -1274,22 +1481,39 @@ class ChannelWorker(threading.Thread):
         # a long-dead idle connection at send time — the failure mode
         # behind the cold-path fallbacks. Cookie/token auth makes the
         # ~2-3s reconnect cheap; that is the whole cost of the fix.
-        self.drop_gw()
-        if not self.ensure_gw():
-            fallback_to_inbox(self.ch, row, "connect_or_auth_failed")
-            self.queue.pop(0)
-            self.note_fallback(row, nbytes)
-            return
-        try:
-            turn = self.start_turn(row, self.cs())
-        except Exception as e:
-            self.log(f"pre-send failure msgid={row.get('msgid')}: "
-                     f"{type(e).__name__} {str(e)[:120]}")
-            fallback_to_inbox(self.ch, row, f"presend_{type(e).__name__}")
-            self.queue.pop(0)
-            self.note_fallback(row, nbytes)
+        # LT2 (gated): a pre-send session-not-found against the
+        # STORED sid means that sid died server-side; invalidate it
+        # and retry THIS row exactly once on a fresh session before
+        # considering the fallback path — never a duplicate send,
+        # because the failed attempt never opened chat.stream.
+        healed = False
+        while True:
             self.drop_gw()
-            return
+            if not self.ensure_gw():
+                fallback_to_inbox(self.ch, row, "connect_or_auth_failed")
+                self.queue.pop(0)
+                self.note_fallback(row, nbytes)
+                return
+            try:
+                turn = self.start_turn(row, self.cs())
+            except Exception as e:
+                self.log(f"pre-send failure msgid={row.get('msgid')}: "
+                         f"{type(e).__name__} {str(e)[:120]}")
+                if not healed and longtask_mode(self.ch) \
+                        and is_session_not_found(e) \
+                        and self._session_from_stored:
+                    healed = True
+                    self._invalidate_session(
+                        f"pre-send msgid={row.get('msgid')}")
+                    self.drop_gw()
+                    continue
+                fallback_to_inbox(self.ch, row,
+                                  f"presend_{type(e).__name__}")
+                self.queue.pop(0)
+                self.note_fallback(row, nbytes)
+                self.drop_gw()
+                return
+            break
         self.queue.pop(0)
         cs = self.cs()
         turns = list(cs["turns"]) + [turn]
