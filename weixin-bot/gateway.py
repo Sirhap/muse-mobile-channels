@@ -92,18 +92,32 @@ SEND_MAX_ATTEMPTS = 10
 SEND_NOTICE_DROP_AFTER_FAILURES = 5
 
 # Wedge guard for mode="send_file" rows whose delivery dies at the
-# WeChat CDN upload step (2026-10-06): on 2026-10-05/06 the CDN
-# upload endpoint (novac2c.cdn.weixin.qq.com) returned HTTP 500 for
-# every file size — a provider-side outage — and one queued video
-# send_file row sat at the head of the outbox in backoff while text
-# notices and a formal reply queued behind it. A file that cannot
-# even be uploaded gains nothing from the full 10-attempt
-# dead-letter path, so after 3 consecutive CDN-upload-500 failures
-# the row is consumed (the file stays on disk
-# and can be re-sent / rerouted, e.g. via WeCom). ONLY failures
-# whose errmsg names the CDN host AND a 500 count; every other
-# send_file failure keeps the normal backoff / dead-letter policy.
-SEND_FILE_CDN500_DROP_AFTER_FAILURES = 3
+# WeChat CDN upload step (2026-10-06; reworked 2026-10-08): on
+# 2026-10-05/06 the CDN upload endpoint (novac2c.cdn.weixin.qq.com)
+# returned HTTP 500 for every file size — a provider-side outage —
+# and one queued video send_file row sat at the head of the outbox
+# in backoff while text notices and a formal reply queued behind
+# it. A file that cannot even be uploaded gains nothing from the
+# full 10-attempt dead-letter path, so after 3 consecutive
+# upload-stage failures the row is consumed — but NO LONGER
+# silently (2026-10-08): the user gets a WeChat text notice and the
+# file itself is rerouted via the WeCom outbox (the file branch of
+# _notify_stuck_formal). Counting was also widened: ANY upload-
+# stage failure counts — _deliver_file wraps upload-leg exceptions
+# in UploadStageError (marker "upload-stage" in the errmsg),
+# including empty transport errors and timeouts that carry no
+# message at all; the legacy errmsg pattern (CDN host + 500) still
+# counts too. Non-upload send_file failures keep the normal
+# backoff / dead-letter policy.
+SEND_FILE_UPLOAD_REROUTE_AFTER_FAILURES = 3
+UPLOAD_STAGE_MARKER = "upload-stage"
+
+
+class UploadStageError(RuntimeError):
+    """A file delivery failed during the CDN upload leg (before
+    sendmessage). Raised by _deliver_file so _note_failure can
+    count upload-stage failures regardless of the underlying
+    exception's message — some transport errors stringify to ""."""
 
 # Formal replies are NEVER dead-lettered (user decision 2026-10-06,
 # superseding the any-row policy above for these modes): a reply or
@@ -2314,7 +2328,13 @@ class Gateway:
             raise PermissionError(f"refusing to send file outside allowed directories: {fpath}")
         data = path.read_bytes()
         mtype = weixin_media_type(fpath)
-        up = await self._upload_media(client, creds, to_user_id, data, mtype)
+        try:
+            up = await self._upload_media(client, creds, to_user_id, data, mtype)
+        except Exception as e:
+            # Tag the failure as upload-stage so _note_failure can
+            # count it even when str(e) is empty (bare transport
+            # errors / timeouts raise messageless exceptions).
+            raise UploadStageError(f"{UPLOAD_STAGE_MARKER}: {e}") from e
         item = self._media_item(mtype, up, Path(fpath).name, len(data))
         return await self._send_items(client, creds, to_user_id, [item], context_token)
 
@@ -2473,7 +2493,8 @@ class Gateway:
         rec = parked.get(item_id)
         if rec is None:
             rec = {"item": item, "n": 0, "parked_at": int(time.time()),
-                   "notice_streak": 0, "cdn_streak": 0, "notified": False}
+                   "notice_streak": 0, "cdn_streak": 0, "notified": False,
+                   "upload_fail": 0, "rerouted": False}
         rec["item"] = item
         rec["n"] = int(rec.get("n") or 0) + 1
         n = rec["n"]
@@ -2483,16 +2504,35 @@ class Gateway:
             # SEND_NOTICE_DROP_AFTER_FAILURES consecutive failures.
             rec["notice_streak"] = int(rec.get("notice_streak") or 0) + 1
         if mode == "send_file":
-            # Wedge guard: only CDN-upload-500 failures count
-            # (errmsg names the CDN host AND a 500).
+            # Upload-stage failures (2026-10-08 widening): the
+            # "upload-stage" marker _deliver_file stamps on upload-
+            # leg exceptions counts — including empty transport
+            # errors — and so does the legacy pattern (errmsg names
+            # the CDN host AND a 500). cdn_streak is still kept for
+            # observability of the original CDN-500 subset.
             err = errmsg or ""
-            if "cdn.weixin.qq.com" in err and "500" in err:
+            is_cdn500 = "cdn.weixin.qq.com" in err and "500" in err
+            if is_cdn500:
                 rec["cdn_streak"] = int(rec.get("cdn_streak") or 0) + 1
+            if is_cdn500 or UPLOAD_STAGE_MARKER in err:
+                rec["upload_fail"] = int(rec.get("upload_fail") or 0) + 1
         notify = (mode in FORMAL_MODES
                   and n >= FORMAL_STUCK_NOTIFY_ATTEMPTS
                   and not rec.get("notified"))
         if notify:
             rec["notified"] = True
+        # send_file upload-stage reroute (2026-10-08): at the
+        # threshold the row is consumed, but the caller must run
+        # _notify_stuck_formal (its file branch sends the WeChat
+        # text notice + reroutes the file via WeCom) — signalled
+        # through the same notify channel, exactly once.
+        reroute = (mode == "send_file"
+                   and int(rec.get("upload_fail") or 0)
+                   >= SEND_FILE_UPLOAD_REROUTE_AFTER_FAILURES
+                   and not rec.get("rerouted"))
+        if reroute:
+            rec["rerouted"] = True
+            notify = True
         action = "park"
         if (mode == "send" and item.get("notice")
                 and int(rec.get("notice_streak") or 0)
@@ -2501,13 +2541,12 @@ class Gateway:
             log(f"DROPPING unbound send {item_id} after "
                 f"{rec['notice_streak']} consecutive failed attempts "
                 f"(wedge guard)")
-        elif (mode == "send_file"
-                and int(rec.get("cdn_streak") or 0)
-                >= SEND_FILE_CDN500_DROP_AFTER_FAILURES):
+        elif reroute:
             action = "drop"
-            log(f"DROPPING send_file {item_id} after "
-                f"{rec['cdn_streak']} consecutive CDN upload 500 "
-                f"failures (wedge guard)")
+            log(f"send_file {item_id}: consumed after "
+                f"{rec['upload_fail']} consecutive upload-stage "
+                f"failures; notifying user + rerouting via WeCom "
+                f"(wedge guard, no longer silent)")
         elif mode not in FORMAL_MODES and n >= SEND_MAX_ATTEMPTS:
             action = "deadletter"
             self.append_jsonl(OUTBOX_RESULTS, {
@@ -2565,22 +2604,40 @@ class Gateway:
         is_file = item.get("mode") in ("reply_file", "send_file") \
             and fpath and Path(fpath).exists()
         if is_file:
-            # File formals fail on the CDN upload leg (slow/timeout —
+            # File rows fail on the CDN upload leg (slow/timeout —
             # see _upload_media), NOT on the text leg, so the old
             # "send a message to help recovery" advice was wrong for
             # them, and a bare notice left the user empty-handed.
             # Reroute the file itself via WeCom (below) and say so.
-            text = (f"⚠️ 你要的文件「{Path(fpath).name}」在微信这边上传"
-                    f"连续失败 {attempts} 次（微信文件通道超时/500，"
-                    "不是文件本身坏了）。我已把文件转投到你的企微，"
-                    "急用先去企微看；微信这边仍在继续重试，不会丢弃。")
+            # Wording follows the three-tier rule (2026-10-08):
+            # state what the server did / did not accept, what was
+            # rerouted, and what still awaits the user's own
+            # confirmation — a server-side ret=0 is never phrased
+            # as "delivered".
+            if item.get("mode") == "send_file":
+                # Terminal reroute: the wedge guard consumed the
+                # row after repeated upload-stage failures.
+                text = (f"⚠️ 文件「{Path(fpath).name}」发送状态："
+                        f"① 服务端：微信上传连续失败 {attempts} 次，"
+                        "微信服务端尚未接受这个文件；"
+                        "② 转投：已把原文件转投到你的企微；"
+                        "③ 待确认：请在企微确认收到——微信这边已停止"
+                        "重试，原文件在 VM 上，需要时告诉我再发。")
+            else:
+                text = (f"⚠️ 文件「{Path(fpath).name}」发送状态："
+                        f"① 服务端：微信上传连续失败 {attempts} 次，"
+                        "微信服务端尚未接受这个文件；"
+                        "② 转投：已把原文件转投到你的企微应急；"
+                        "③ 微信这边仍在继续重试、不会丢弃，最终以你"
+                        "在微信实际收到为准。")
         else:
             text = (f"⚠️ 微信这边有一条正式回复已连续发送失败 {attempts} 次，"
                     "仍在自动重试、不会丢弃。多半是微信发送通道临时故障；"
                     "你在微信里随便发一句话，有助于恢复发送。")
         try:
             info = self.context.get(str(item.get("msgid", "")), {})
-            to = info.get("from_user_id", "")
+            to = info.get("from_user_id", "") \
+                or str(item.get("to_user_id", "") or "")
             if to:
                 await self.send_text(
                     client, creds, to, text,
@@ -2608,16 +2665,25 @@ class Gateway:
         log(f"stuck formal {item.get('mode')} {item.get('id')}: "
             f"user notified at attempt {attempts}")
 
-    def _compress_file_sync(self, src: Path) -> Path | None:
+    def _compress_file_sync(self, src: Path, level: int = 0) -> Path | None:
         """Compress src into COMPRESSED_DIR and return the new path,
-        or None when not applicable / failed / not smaller. Video:
-        ffmpeg <=854px wide, CRF 30. Image: PIL <=1600px, JPEG q80.
-        Never modifies the original."""
+        or None when not applicable / failed / not smaller. Ladder
+        (2026-10-08): L0 = video ffmpeg <=854px CRF30 / image PIL
+        <=1600px q80; L1 = 640px CRF36 / 1280px q65; L2 = 480px
+        CRF42 / 1024px q55. The cache key carries the level so
+        rungs never pollute each other. Never modifies the
+        original."""
         try:
+            level = max(0, min(2, int(level)))
+            vwidth, vcrf, imax, iq = (
+                (854, 30, 1600, 80) if level == 0 else
+                (640, 36, 1280, 65) if level == 1 else
+                (480, 42, 1024, 55))
             size = src.stat().st_size
             st = src.stat()
             key = hashlib.sha256(
-                f"{src}|{size}|{int(st.st_mtime)}".encode()).hexdigest()[:16]
+                f"{src}|{size}|{int(st.st_mtime)}|L{level}".encode()
+            ).hexdigest()[:16]
             COMPRESSED_DIR.mkdir(parents=True, exist_ok=True)
             ext = src.suffix.lower()
             if ext in VIDEO_EXTS:
@@ -2625,8 +2691,8 @@ class Gateway:
                 if not (out.exists() and out.stat().st_size > 0):
                     r = subprocess.run(
                         ["ffmpeg", "-y", "-i", str(src),
-                         "-vf", "scale='min(854,iw)':-2",
-                         "-c:v", "libx264", "-crf", "30",
+                         "-vf", f"scale='min({vwidth},iw)':-2",
+                         "-c:v", "libx264", "-crf", str(vcrf),
                          "-preset", "veryfast",
                          "-c:a", "aac", "-b:a", "96k",
                          "-movflags", "+faststart", str(out)],
@@ -2641,8 +2707,8 @@ class Gateway:
                     from PIL import Image
                     with Image.open(src) as im:
                         im = im.convert("RGB")
-                        im.thumbnail((1600, 1600))
-                        im.save(out, "JPEG", quality=80)
+                        im.thumbnail((imax, imax))
+                        im.save(out, "JPEG", quality=iq)
             else:
                 return None
             if out.exists() and 0 < out.stat().st_size < size:
@@ -2652,22 +2718,90 @@ class Gateway:
             log(f"compression failed for {src}: {e}")
             return None
 
-    async def _prepare_file_for_send(self, fpath: str):
-        """Return (effective_path, was_compressed). Files over
-        FILE_COMPRESS_THRESHOLD are compressed first (cached); any
-        problem falls back to the original path."""
+    @staticmethod
+    def _compress_level_for(parked_n: int) -> int:
+        """Compression ladder rung for a parked row's failure
+        count: n>=4 -> L2, n>=2 -> L1, else L0."""
+        if parked_n >= 4:
+            return 2
+        if parked_n >= 2:
+            return 1
+        return 0
+
+    async def _prepare_file_for_send(self, fpath: str, level: int = 0,
+                                     parked_n: int = 0):
+        """Return (effective_path, was_compressed). Compression
+        triggers when the file is over FILE_COMPRESS_THRESHOLD OR
+        this is a retry of an already-failed row (parked_n >= 1),
+        at the given ladder level; cached per level; any problem
+        falls back to the original path."""
         try:
             p = Path(fpath)
-            if (p.exists() and p.stat().st_size > FILE_COMPRESS_THRESHOLD
+            if (p.exists()
+                    and (p.stat().st_size > FILE_COMPRESS_THRESHOLD
+                         or parked_n >= 1)
                     and COMPRESSED_DIR not in p.parents):
-                out = await asyncio.to_thread(self._compress_file_sync, p)
+                out = await asyncio.to_thread(
+                    self._compress_file_sync, p, int(level))
                 if out is not None:
-                    log(f"compressed for send: {p.name} "
+                    log(f"compressed for send (L{level}): {p.name} "
                         f"{p.stat().st_size} -> {out.stat().st_size} bytes")
                     return str(out), True
         except Exception as e:
             log(f"compression skipped for {fpath}: {e}")
         return fpath, False
+
+    def _parked_n(self, item_id: str) -> int:
+        """Current parked failure count for an outbox row (0 when
+        it has never failed). Drives the compression ladder."""
+        if not item_id:
+            return 0
+        rec = self._load_parked().get(item_id) or {}
+        return int(rec.get("n") or 0)
+
+    @staticmethod
+    def _file_result_meta(fpath: str, level: int) -> dict:
+        """Result-row fields for a file dispatch (2026-10-08):
+        byte size + MD5 of the file actually sent (post-compression
+        effective path) and the compression level applied."""
+        meta = {"compress_level": int(level)}
+        try:
+            data = Path(fpath).read_bytes()
+            meta["file_bytes"] = len(data)
+            meta["file_md5"] = hashlib.md5(data).hexdigest()
+        except OSError:
+            pass
+        return meta
+
+    async def _maybe_notify_level_up(self, client: httpx.AsyncClient,
+                                     creds: dict, item_id: str,
+                                     to: str, level: int) -> None:
+        """Tell the user once per rung when a retry sends the file
+        at a higher (more degraded) compression level. The
+        notified rungs live in the parked record so restarts and
+        repeated dispatches cannot re-send the notice."""
+        if level <= 0 or not item_id or not to:
+            return
+        try:
+            parked = self._load_parked()
+            rec = parked.get(item_id)
+            if rec is None:
+                return
+            notified = list(rec.get("compress_notified") or [])
+            prev = int(rec.get("compress_level") or 0)
+            if level <= prev or level in notified:
+                return
+            rec["compress_level"] = level
+            rec["compress_notified"] = notified + [level]
+            parked[item_id] = rec
+            self._save_parked(parked)
+            await self.send_text(
+                client, creds, to,
+                f"（这个文件已多次发送失败，这次降到 L{level} 档压缩"
+                "发送；原文件没动，在 VM 上可取）",
+                "", "", 2, f"{item_id}:levelup")
+        except Exception as e:
+            log(f"level-up notice failed for {item_id}: {e}")
 
     async def dispatch_outbox_item(self, client: httpx.AsyncClient, creds: dict, item: dict) -> bool:
         """Return True if the item is consumed (delivered or a
@@ -2739,8 +2873,15 @@ class Gateway:
                     log(f"outbox reply_file {item_id}: {result['errmsg']}")
                     return True
                 orig_name = Path(fpath).name
+                pn = self._parked_n(item_id)
+                lvl = self._compress_level_for(pn)
                 fpath, was_compressed = \
-                    await self._prepare_file_for_send(fpath)
+                    await self._prepare_file_for_send(fpath, lvl, pn)
+                result.update(self._file_result_meta(
+                    fpath, lvl if was_compressed else 0))
+                if was_compressed and lvl > 0:
+                    await self._maybe_notify_level_up(
+                        client, creds, item_id, to, lvl)
                 caption = content or f"📎 {orig_name}"
                 if was_compressed:
                     caption += "\n（文件较大，已自动压缩发送）"
@@ -2778,9 +2919,16 @@ class Gateway:
                     self.append_jsonl(OUTBOX_RESULTS, result)
                     return True
                 if fpath:
+                    pn = self._parked_n(item_id)
+                    lvl = self._compress_level_for(pn)
                     fpath, was_compressed = \
-                        await self._prepare_file_for_send(fpath)
+                        await self._prepare_file_for_send(fpath, lvl, pn)
+                    result.update(self._file_result_meta(
+                        fpath, lvl if was_compressed else 0))
                     if was_compressed:
+                        if lvl > 0:
+                            await self._maybe_notify_level_up(
+                                client, creds, item_id, to, lvl)
                         content = (content + "\n" if content else "") \
                             + "（文件较大，已自动压缩发送）"
                 if content and not self._caption_already_sent(item_id):
@@ -2810,6 +2958,8 @@ class Gateway:
             return True
         except Exception as e:
             result["errmsg"] = f"exception: {e}"
+            if isinstance(e, UploadStageError):
+                result["stage"] = "upload"
             self.append_jsonl(OUTBOX_RESULTS, result)
             log(f"outbox {mode} {item_id}: ok=False err={result['errmsg']}")
             self.write_status()
