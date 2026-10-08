@@ -26,6 +26,7 @@ Credentials: env NATIVE_TOKEN_JSON, else cookies.txt + vm_id.txt in
 ~/.config/native-bridge/ (auto-renew, primary), else token.json there.
 """
 import hashlib, json, os, sys, threading, time, traceback
+from datetime import datetime, timezone
 
 BASE = "/home/hatch/workspace/native-bridge"
 sys.path.insert(0, "/home/hatch/workspace/native-probe")
@@ -42,6 +43,9 @@ PROG_FIRST_SECS = 120
 PROG_EVERY_SECS = 300
 ESCALATE_SECS = 1200        # turn age where progress notices turn into
                             # an actionable "looks stuck, /stop it" warning
+ACTIVITY_POLL_SECS = 60     # activity.list cadence during a long turn
+                            # (P3: coarse progress signals folded into
+                            # the existing progress notices only)
 IDLE_PUSH_EVERY_SECS = 20   # idle-session scan cadence (see idle_push_scan)
 MERGE_CHANNELS = {"weixin", "test", "wecom"}
 # Channels in MERGE_CHANNELS fold a queued message into the running
@@ -71,7 +75,9 @@ PREAMBLE = (
     "【渠道桥接说明】你正在通过桥接程序回复手机渠道（微信/企业微信）上的用户。"
     "你的最终回复文本会被原样转发到该渠道，所以：结论先行、简洁自然；"
     "如果生成了要发给用户的文件，在回复末尾单独一行写 [[FILE:文件的绝对路径]]；"
-    "不要提及桥接机制。\n\n用户消息："
+    "不要提及桥接机制。"
+    "渠道内不要使用卡片/选项控件提问；需要用户选择时用纯文本编号列出选项。"
+    "\n\n用户消息："
 )
 # A session created by the user's /new carries one extra rule. The
 # rotation itself only swaps the session id; the agent's platform
@@ -281,6 +287,11 @@ def deliver_reply(ch, msgid, text):
             if os.path.isfile(p):
                 files.append(p)
                 continue
+        if s.startswith("[[hatch_widget:") and s.endswith("]]"):
+            # Widget tokens never render on the channels (the user
+            # sees nothing); drop a token that stands alone on its
+            # own line. Inline mentions in prose are kept verbatim.
+            continue
         kept.append(line)
     body = "\n".join(kept).strip()
     now = int(time.time())
@@ -320,6 +331,57 @@ def is_turn_reply(ev, baseline):
     if not p.get("status"):
         return False
     return True
+
+
+def _activity_ts_epoch(raw):
+    """Epoch seconds for an activity timestamp (ISO-8601 string or
+    number); None when unparseable."""
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+def activity_summary(ev):
+    """One short neutral line for an activity.list event, or "".
+    activity.list is an account-wide stream, so summaries state only
+    what the record itself carries (a file path in details may be
+    quoted verbatim; anything else stays generic)."""
+    t = ev.get("type") or ""
+    details = ev.get("details") if isinstance(ev.get("details"), dict) \
+        else {}
+    if t in ("file_created", "file_updated"):
+        path = details.get("path") or details.get("file_path") or \
+            details.get("file") or ""
+        verb = "创建了文件" if t == "file_created" else "更新了文件"
+        return f"{verb} {path}".strip() if path else \
+            (ev.get("title") or verb)
+    if t == "task_running":
+        tasks = details.get("tasks") if isinstance(
+            details.get("tasks"), list) else []
+        for task in tasks:
+            if not isinstance(task, dict):
+                continue
+            if task.get("status") == "completed":
+                label = task.get("label") or "子助手"
+                prev = (task.get("response_preview") or "").strip()
+                first = prev.splitlines()[0].strip() if prev else ""
+                s = f"子助手已完成：{label}"
+                if first:
+                    s += f"：{first[:40]}"
+                return s
+        return "子助手运行中"
+    if t == "web_search":
+        title = ev.get("title") or ""
+        return f"网页搜索：{title}".strip() if title else "网页搜索"
+    return (ev.get("title") or ev.get("status_title") or "")[:80]
 
 
 def _ev_mid(ev):
@@ -435,7 +497,10 @@ class ChannelWorker(threading.Thread):
                 "from_user": row.get("from_user", ""),
                 "chatid": row.get("chatid", ""),
                 "chattype": row.get("chattype", ""), "next_prog": 0,
-                "ids": [row["msgid"]], "reply_started": False}
+                "ids": [row["msgid"]], "reply_started": False,
+                "sess_status": None, "status_completed_seen": False,
+                "activities": [], "activity_seen": [],
+                "last_activity_poll": 0, "last_activity": None}
         self.log(f"turn sent msgid={row['msgid']} "
                  f"baseline={baseline}")
         return turn
@@ -448,14 +513,27 @@ class ChannelWorker(threading.Thread):
             return
         excerpt = (turn.get("text") or "")[:24]
         mins = max(1, round(age / 60))
+        phase = "已开始生成" if turn.get("reply_started") else "思考中"
+        nq = len(self.queue)
+        qtxt = f"后面还排着 {nq} 条。" if nq else ""
         if age >= ESCALATE_SECS:
             # A bare "still working" repeated forever reads as a hang and
             # gives the user nothing to act on. Past the escalation age,
             # say it looks stuck and name the remedy.
-            text = (f"⚠️ 这条任务已跑约 {mins} 分钟还没结束，可能卡住了："
-                    f"「{excerpt}」\n发 /stop 可以终止它，后面的消息会继续处理。")
+            text = (f"⚠️ 这条任务已跑约 {mins} 分钟还没结束（{phase}），"
+                    f"可能卡住了：「{excerpt}」\n"
+                    f"发 /stop 可以终止它，后面的消息会继续处理。{qtxt}")
         else:
-            text = f"⏳ 还在处理中（已跑约 {mins} 分钟）：「{excerpt}」"
+            text = (f"⏳ 还在处理中（已跑约 {mins} 分钟，{phase}）："
+                    f"「{excerpt}」{qtxt}")
+        # Fold the newest activity signals into THIS notice only —
+        # never a separate bubble. Neutral wording: activity.list is
+        # an account-wide stream, attribution is by time window only.
+        self._poll_activity(turn)
+        acts = [a.get("text") for a in (turn.get("activities") or [])
+                if isinstance(a, dict) and a.get("text")]
+        if acts:
+            text += "\n最近动态：" + "；".join(acts[-2:])
         rid = f"bridgeprog-{turn['msgid'][:8]}-{int(age // 60)}"
         if self.ch == "weixin":
             to = turn.get("from_user", "")
@@ -474,6 +552,94 @@ class ChannelWorker(threading.Thread):
             return
         append_jsonl(outbox_path(self.ch), out)
         self.log(f"progress notice msgid={turn['msgid']} age={age}s")
+
+    def _session_status(self, sid):
+        """Authoritative turn state from sessions.get (probe9: its
+        status field flips running -> completed the moment a reply
+        lands). Returns the status string, or None on ANY failure —
+        callers must treat None as "no signal" and fall back to the
+        pure history logic."""
+        try:
+            d = self.gw.call_json("sessions.get",
+                                  path_params={"id": sid}, timeout=15)
+        except Exception as e:
+            self.log("sessions.get failed:", type(e).__name__,
+                     str(e)[:80])
+            return None
+        if isinstance(d, dict):
+            return d.get("status") or None
+        return None
+
+    def _poll_activity(self, turn):
+        """Fold new activity.list events into the turn state (P3).
+        Low-frequency (ACTIVITY_POLL_SECS), silent on failure, and
+        the events are only ever surfaced inside progress_notice /
+        the queue snapshot — never as their own messages. Dedup by
+        (timestamp, message_id, type); only events at/after the
+        turn's sent_at are collected."""
+        if self.gw is None:
+            return
+        now = time.time()
+        if now - (turn.get("last_activity_poll") or 0) \
+                < ACTIVITY_POLL_SECS:
+            return
+        turn["last_activity_poll"] = int(now)
+        # The poll timestamp must persist, or the throttle is lost
+        # when step() reloads state and activity.list gets hit on
+        # every 2s step instead of every ACTIVITY_POLL_SECS.
+        self._turns_dirty = True
+        try:
+            d = self.gw.call_json("activity.list", timeout=15)
+        except Exception:
+            return
+        if not isinstance(d, dict):
+            return
+        seen = {tuple(k) for k in (turn.get("activity_seen") or [])
+                if isinstance(k, (list, tuple))}
+        acts = list(turn.get("activities") or [])
+        changed = False
+        for day in d.get("days", []) or []:
+            if not isinstance(day, dict):
+                continue
+            for ev in day.get("activities", []) or []:
+                if not isinstance(ev, dict):
+                    continue
+                ts = _activity_ts_epoch(ev.get("timestamp"))
+                if ts is None or ts < (turn.get("sent_at") or 0):
+                    continue
+                key = (str(ev.get("timestamp") or ""),
+                       str(ev.get("message_id") or ""),
+                       str(ev.get("type") or ""))
+                if key in seen:
+                    continue
+                seen.add(key)
+                turn.setdefault("activity_seen", []).append(list(key))
+                summary = activity_summary(ev)
+                if summary:
+                    acts.append({"ts": key[0], "text": summary})
+                    changed = True
+        if changed:
+            turn["activities"] = acts[-20:]
+            turn["last_activity"] = acts[-1]["text"]
+            self._turns_dirty = True
+
+    def _best_effort_reply(self, turn):
+        """Fresh history read for the abnormal-end path: the LAST
+        assistant event after baseline carrying any text, whatever
+        its status. Returns (ev, text) or (None, "")."""
+        try:
+            evs = self.history_events(turn["session_id"])
+        except Exception:
+            return None, ""
+        best_ev, best_text = None, ""
+        for ev in evs:
+            if ev.get("event_name") != "message.assistant" or \
+                    (ev.get("seq") or 0) <= turn["baseline"]:
+                continue
+            text = fmt_event(ev).get("text", "")
+            if text.strip():
+                best_ev, best_text = ev, text
+        return best_ev, best_text
 
     def poll_turn(self, turn):
         ids = turn.get("ids") or [turn["msgid"]]
@@ -510,6 +676,39 @@ class ChannelWorker(threading.Thread):
         if started and not turn.get("reply_started"):
             turn["reply_started"] = True
             self._turns_dirty = True
+        # No completed reply in history. Cross-check the platform's
+        # own turn state (sessions.get, probe9) — conservatively:
+        # a single "completed" observation never ends the turn (it
+        # gets one more poll to let a lagging history catch up); only
+        # a SECOND consecutive completed with history still empty is
+        # treated as an abnormal end (empty/failed reply), closed
+        # out after a best-effort delivery of any assistant text.
+        # A failed status query changes nothing at all.
+        status = self._session_status(turn["session_id"])
+        if status is not None and status != turn.get("sess_status"):
+            turn["sess_status"] = status
+            self._turns_dirty = True
+        if status == "completed":
+            if turn.get("status_completed_seen"):
+                ev, text = self._best_effort_reply(turn)
+                if text.strip():
+                    if ev is not None:
+                        self._turn_reply_marks.append(
+                            (ev.get("seq") or 0, _ev_mid(ev)))
+                    deliver_reply(self.ch, turn["msgid"], text)
+                    for mid in ids[1:]:
+                        self._silence_merged(mid)
+                self.log(f"turn ended abnormally msgid={turn['msgid']}: "
+                         f"sessions.get=completed twice, no completed "
+                         f"reply in history; best-effort text "
+                         f"{'delivered' if text.strip() else 'none'}")
+                return "done"
+            turn["status_completed_seen"] = True
+            self._turns_dirty = True
+        elif status == "running" and turn.get("status_completed_seen"):
+            turn["status_completed_seen"] = False
+            self._turns_dirty = True
+        self._poll_activity(turn)
         return "running"
 
     def _deliver_idle(self, text, key):
@@ -790,6 +989,9 @@ class ChannelWorker(threading.Thread):
         snap = {
             "active": [{"msgid": mid, "lane": t["lane"],
                         "secs": int(time.time()) - t["sent_at"],
+                        "phase": "generating" if t.get("reply_started")
+                                 else "thinking",
+                        "last_activity": t.get("last_activity"),
                         **({"merged": True} if i else {})}
                        for t in cs["turns"]
                        for i, mid in enumerate(t.get("ids") or [t["msgid"]])],
