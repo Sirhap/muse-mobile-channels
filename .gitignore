@@ -21,6 +21,8 @@
 !/tests/*.py
 !/docs/
 !/docs/*.md
+!/ops/
+!/ops/cold_death_drill.py
 !/native-probe/
 !/native-probe/gw2.py
 !/native-probe/README.md
