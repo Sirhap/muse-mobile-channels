@@ -12,6 +12,10 @@
 # invoke this script; a replacement VM otherwise loses the schedule.
 # Safe to run any time (also on a 5-minute timer via
 # channel-restore.timer): when everything is healthy it changes nothing.
+# A VM replacement deletes the timer too, so this script does not run
+# again until a heartbeat check or an operator starts it. The read-only
+# detector for that gap is channel-restore/liveness-probe.sh (HEARTBEAT.md).
+# The probe does not call this script.
 set -uo pipefail
 
 # systemd system units set HOME=/root. The install home is /home/hatch

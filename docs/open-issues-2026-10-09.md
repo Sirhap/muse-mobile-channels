@@ -56,10 +56,10 @@
 - 其余一致性同日 18:10 已核：hooks 线上脚本与仓库副本两渠道 cmp 一致；6 个 systemd unit（channel-restore/native-bridge/weixin-bot/wecom-bot/approval-relay）与仓库副本全一致；工作区除下条草稿外干净。
 - 下一步：该线完工后由其归属会话补交；下次 push 前重跑一遍线上↔仓库 cmp。
 
-### 10. VM 替换反复抹掉 /etc/systemd unit
+### ~~10. VM 替换反复抹掉 /etc/systemd unit~~ （2026-10-09 已记录双保险，并加 VM 外只读探测）
 - 证据：2026-10-09 17:04 心跳巡检再次发现 channel-restore.timer 缺失（当天第二次），已按 HEARTBEAT.md 修复并验证 all gateways healthy。
-- 影响：自愈链依赖「定时器 + 心跳巡检」双保险，任一失效窗口内渠道可能长时间掉线无人知。
-- 下一步：接受现状（文档化）或再加一层独立于 VM 的存活探测，二选一并记录。
+- 影响：自愈链依赖「定时器 + 心跳巡检」双保险。定时器自己也在 `/etc/systemd`，被抹掉之后要等巡检来跑 `restore.sh`，这段窗口里渠道可能掉线无人知。
+- 决定：接受双保险，不改 VM 镜像。巡检清单写在仓库根 `HEARTBEAT.md`（哪些 unit 要紧、抹掉时长什么样、恢复只跑 `restore.sh`）。另加 `channel-restore/liveness-probe.sh`：从 VM 外 SSH 只读检查 timer 与网关，退出码 1 表示要去跑恢复，退出码 2 表示没查成。探测不安装、不重启 unit，也不改两个网关。
 
 ### 11. 未跟踪草稿待处置
 - `channel-restore/outbound-probe-draft-2026-10-08.md` 自 2026-10-08 起未跟踪悬置。
