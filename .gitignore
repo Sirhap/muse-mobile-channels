@@ -22,11 +22,6 @@
 !/docs/
 !/docs/*.md
 !/native-probe/
-# Whitelist: the reusable client only. One-off probe scripts, result
-# dumps, and nested archives stay on the hatch VM (they were showing up
-# as untracked). Last match wins — keep these two negations below the
-# contents rule. See docs/hatch-untracked-disposition.md.
-/native-probe/**
 !/native-probe/gw2.py
 !/native-probe/README.md
 !/slash-commands-2026-10-04.md
@@ -45,11 +40,13 @@ native-bridge/divert-*
 native-bridge/longtask-*
 native-bridge/queue_admin-*.jsonl
 native-bridge/probe_*.py
-# Dated outbound-probe writeups (P3#11). Any directory, so a copy under
-# channel-restore/ or docs/ does not become a dirty untracked file.
-# Read the file on the VM that still has it before keeping or deleting;
-# do not recreate it from memory.
-outbound-probe-draft-*.md
+# P3#11 result dumps and the channel-restore outbound draft.
+# These do not match gw2.py, README.md, or other native-probe *.py deps.
+# Hatch moves/deletes are done via Muse; this only keeps the dumps untracked.
+native-probe/probe*_results.txt
+native-probe/probe*_stdout.log
+native-probe/probe*_*.log
+channel-restore/outbound-probe-draft-*.md
 .venv/
 __pycache__/
 *.pyc
