@@ -524,9 +524,12 @@ def _deliver_reply_raw(ch, msgid, text):
     for i, p in enumerate(files):
         rid = bridge_row_id(msgid, f"file{i}")
         if not outbox_already_has(ch, rid):
+            # content stays empty. The formal reply above already
+            # carries `body`; copying it here made the Weixin gateway
+            # send that text a second time as the file caption.
             append_jsonl(outbox_path(ch),
                          {"mode": "reply_file", "msgid": msgid,
-                          "file_path": p, "content": body if i == 0 else "",
+                          "file_path": p, "content": "",
                           "id": rid, "queued_at": now})
 
 
