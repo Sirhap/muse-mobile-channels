@@ -64,6 +64,16 @@ from channel_common import (  # noqa: E402
     write_offset,
 )
 
+_WECOM_DIR = Path(__file__).resolve().parent
+if str(_WECOM_DIR) not in sys.path:
+    sys.path.insert(0, str(_WECOM_DIR))
+
+from wecom_video_limit import (  # noqa: E402
+    WECOM_VIDEO_MAX_BYTES,
+    WeComVideoLimitError,
+    fit_wecom_video,
+)
+
 def _load_coalescer_cls():
     """Load the reviewed WeCom outbound coalescer (v2, idle-gap).
 
@@ -96,6 +106,9 @@ WS_URL = "wss://openws.work.weixin.qq.com"
 BASE = Path(__file__).resolve().parent
 STATE = BASE / "state"
 MEDIA_DIR = STATE / "media"
+# Transcoded copies for the WeCom 10MB video cap. The source file is
+# never modified. Tests redirect this global.
+COMPRESSED_DIR = STATE / "compressed"
 INBOX = STATE / "inbox.jsonl"
 OUTBOX = STATE / "outbox.jsonl"
 OUTBOX_RESULTS = STATE / "outbox_results.jsonl"
@@ -2625,6 +2638,80 @@ class Gateway:
             if last_error is not None:
                 log(f"media {msgid}/{i}: download/decrypt failed: {last_error!r}")
 
+    async def _outbound_media_bytes(self, file_path: Path) -> tuple[bytes, str, str]:
+        """Bytes, WeCom media type, and upload filename for one outbound file.
+
+        A video over ``WECOM_VIDEO_MAX_BYTES`` is transcoded first.
+        Raises ``WeComVideoLimitError`` when that video cannot be brought
+        under the cap. Other types are read unchanged (WeCom's file cap
+        is separate from the video cap).
+        """
+        send_path = file_path
+        if media_type_for_path(str(file_path)) == "video":
+            send_path = await asyncio.to_thread(
+                fit_wecom_video, file_path, COMPRESSED_DIR)
+        data = send_path.read_bytes()
+        mtype = media_type_for_path(str(send_path))
+        if mtype == "video" and len(data) > WECOM_VIDEO_MAX_BYTES:
+            raise WeComVideoLimitError(file_path.name, len(data))
+        upload_name = file_path.name
+        if send_path.resolve() != file_path.resolve():
+            upload_name = f"{file_path.stem}.mp4"
+            log(
+                f"wecom video compressed for send: {file_path.name} "
+                f"{file_path.stat().st_size} -> {len(data)} bytes"
+            )
+        return data, mtype, upload_name
+
+    async def _notify_wecom_video_limit(
+        self, item: dict, mode: str, err: WeComVideoLimitError,
+    ) -> None:
+        """Tell the chat the video exceeds the WeCom 10MB limit.
+
+        Best-effort. The outbox result row is the logged record either
+        way. ``reply_file`` answers on the callback req_id; ``send_file``
+        sends a proactive markdown message.
+        """
+        body = {"msgtype": "markdown", "markdown": {"content": err.user_text}}
+        try:
+            chatid = ""
+            chat_type = 1
+            if mode == "reply_file":
+                info = self.reqinfo(str(item.get("msgid", "")))
+                req_id = info.get("req_id", "")
+                if req_id:
+                    resp = await self.respond(req_id, body)
+                    if isinstance(resp, dict) and resp.get("errcode") == 0:
+                        return
+                chatid = str(info.get("chatid", "") or "")
+                chat_type = 2 if info.get("chattype") == "group" else 1
+            elif mode == "send_file":
+                chatid = str(item.get("chatid", "") or "")
+                chat_type = int(item.get("chat_type", 1) or 1)
+            else:
+                return
+            if not chatid:
+                log(
+                    f"wecom video limit notice skipped: no chat for "
+                    f"{mode} {item.get('id')}"
+                )
+                return
+            await self.send_frame(
+                {
+                    "cmd": "aibot_send_msg",
+                    "headers": {"req_id": self.new_req_id("send")},
+                    "body": {
+                        "chatid": chatid,
+                        "chat_type": chat_type,
+                        "msgtype": "markdown",
+                        "markdown": {"content": err.user_text},
+                    },
+                },
+                wait_response=True,
+            )
+        except Exception as exc:
+            log(f"wecom video limit notice failed: {exc}")
+
     async def upload_media(self, data: bytes, mtype: str, filename: str) -> str:
         chunk_size = 512 * 1024
         total_chunks = max(1, (len(data) + chunk_size - 1) // chunk_size)
@@ -3053,9 +3140,11 @@ class Gateway:
                     self.append_jsonl(OUTBOX_RESULTS, result)
                     log(f"outbox reply_file {item_id}: {result['errmsg']}")
                     return True
-                data = file_path.read_bytes()
-                mtype = media_type_for_path(fpath)
-                media_id = await self.upload_media(data, mtype, file_path.name)
+                # Over the 10MB video cap: transcode, or fail with a
+                # clear notice. Do not upload the original (40011).
+                data, mtype, upload_name = await self._outbound_media_bytes(file_path)
+                result["file_bytes"] = len(data)
+                media_id = await self.upload_media(data, mtype, upload_name)
                 resp = await self.respond(
                     orig_req_id,
                     {"msgtype": mtype, mtype: {"media_id": media_id}},
@@ -3204,9 +3293,9 @@ class Gateway:
                     self.append_jsonl(OUTBOX_RESULTS, result)
                     log(f"outbox send_file {item_id}: {result['errmsg']}")
                     return True
-                data = file_path.read_bytes()
-                mtype = media_type_for_path(fpath)
-                media_id = await self.upload_media(data, mtype, file_path.name)
+                data, mtype, upload_name = await self._outbound_media_bytes(file_path)
+                result["file_bytes"] = len(data)
+                media_id = await self.upload_media(data, mtype, upload_name)
                 resp = await self.send_frame(
                     {
                         "cmd": "aibot_send_msg",
@@ -3231,6 +3320,16 @@ class Gateway:
                 self.msgs_sent += 1
                 if mode in ("reply", "reply_file", "reply_confirm"):
                     self.open_streams.pop(str(item.get("msgid", "")), None)
+        except WeComVideoLimitError as e:
+            # Permanent: another attempt will not get this file under
+            # the cap. Return True so the formal row is not retried
+            # forever, after the user has been told why.
+            result["errmsg"] = str(e)
+            result["ok"] = False
+            await self._notify_wecom_video_limit(item, mode, e)
+            self.append_jsonl(OUTBOX_RESULTS, result)
+            log(f"outbox {mode} {item_id}: {result['errmsg']}")
+            return True
         except Exception as e:
             result["errmsg"] = f"exception: {e}"
         self.append_jsonl(OUTBOX_RESULTS, result)
