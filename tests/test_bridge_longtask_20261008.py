@@ -547,15 +547,19 @@ set_state("weixin", turns=[turn], last_boundary_ts=0, session_id="sid1")
 w.step(str(spool), None)
 sup_sends = [r for r in read_jsonl(WX / "outbox.jsonl")
              if r.get("mode") == "send"]
-check("G a tool row newer than the reply still notifies",
+check("G a tool row newer than the reply does not notify",
       [r["content"] for r in replies_for("m-sup3")] == ["先回一段"]
-      and any("还在处理中" in (r.get("content") or "")
-              for r in sup_sends))
+      and not any("还在处理中" in (r.get("content") or "")
+                  for r in sup_sends))
+check("G post-reply history_dirty is cleared",
+      nb.load_state()["channels"]["weixin"]["turns"][0].get(
+          "history_dirty") is False)
 
 # activity_dirty must follow the same rule as history_dirty: a
 # completed reply supersedes activity at or before that reply, and
 # step() must not add 「还在处理中」. Activity strictly after
-# last_reply_at still notifies.
+# last_reply_at used to notify; once the bound reply is delivered
+# that notice is suppressed too.
 (WX / "outbox.jsonl").unlink(missing_ok=True)
 stub = StubGW()
 stub.status = "running"
@@ -635,8 +639,11 @@ nb.save_state(st)
 w.step(str(spool), None)
 act_sends = [r for r in read_jsonl(WX / "outbox.jsonl")
              if r.get("mode") == "send"]
-check("G activity newer than the reply still notifies",
-      any("还在处理中" in (r.get("content") or "") for r in act_sends))
+check("G activity newer than the reply does not notify",
+      not any("还在处理中" in (r.get("content") or "") for r in act_sends))
+check("G post-reply activity_dirty is cleared",
+      nb.load_state()["channels"]["weixin"]["turns"][0].get(
+          "activity_dirty") is False)
 
 stub = StubGW()
 stub.status = "running"
@@ -689,6 +696,114 @@ finally:
     flag.unlink(missing_ok=True)
 check("G wecom longtask flag removed again",
       not nb.longtask_mode("wecom"))
+
+# ---------------------------------------------------------------- H
+# DEF-progress-after-done: once the bound formal reply is out, the
+# 120s/300s timer and a later activity/history fold must not send
+# 「还在处理中」 for that msgid. WeCom live + longtask, same emitter
+# the 2026-10-09 21:35 bubble used. A still-running turn with no
+# reply still gets the 12-minute notice, and a trailing segment
+# after the formal reply is still delivered.
+wc_out = WC / "outbox.jsonl"
+wc_spool = SBX / "spool" / "wecom.jsonl"
+wc_spool.write_text("", encoding="utf-8")
+(SBX / "enabled-wecom").touch()
+(SBX / "longtask-wecom").touch()
+clip = SBX / "clip.mp4"
+clip.write_bytes(b"video")
+try:
+    check("H wecom live and longtask on",
+          nb.live_mode("wecom") and nb.longtask_mode("wecom"))
+    wc_out.unlink(missing_ok=True)
+    sent_h = int(time.time()) - 12 * 60
+    stub = StubGW()
+    stub.status = "running"
+    w = worker_with("wecom", stub)
+    turn = make_turn(msgid="6f3fcd57-run", chatid="grp-live",
+                     chattype="group", sent_at=sent_h, next_prog=0,
+                     text="生成一段视频")
+    w.progress_notice(turn, 12 * 60)
+    run_sends = [r for r in read_jsonl(wc_out) if r.get("mode") == "send"]
+    check("H still-running turn still gets the 12-minute notice",
+          len(run_sends) == 1
+          and "还在处理中" in (run_sends[0].get("content") or "")
+          and "12 分钟" in (run_sends[0].get("content") or "")
+          and "6f3fcd57" in (run_sends[0].get("content") or ""))
+
+    wc_out.unlink(missing_ok=True)
+    done = make_turn(msgid="6f3fcd57-done", chatid="grp-live",
+                     chattype="group", sent_at=sent_h, next_prog=0,
+                     text="生成一段视频", reply_delivered=True)
+    w.progress_notice(done, 12 * 60)
+    check("H progress_notice is a no-op after the formal reply",
+          read_jsonl(wc_out) == [])
+
+    wc_out.unlink(missing_ok=True)
+    formal = "视频已生成\n[[FILE:" + str(clip) + "]]"
+    stub.history = [asst(11, formal)]
+    turn = make_turn(msgid="6f3fcd57-same", chatid="grp-live",
+                     chattype="group", sent_at=sent_h, next_prog=0,
+                     text="生成一段视频", hist_seen_seq=10,
+                     last_activity_poll=int(time.time()))
+    set_state("wecom", turns=[turn], last_boundary_ts=0,
+              session_id="sid1")
+    w.step(str(wc_spool), None)
+    same_rows = read_jsonl(wc_out)
+    same_replies = [r for r in same_rows if r.get("mode") == "reply"
+                    and r.get("msgid") == "6f3fcd57-same"]
+    same_files = [r for r in same_rows if r.get("mode") == "reply_file"
+                  and r.get("msgid") == "6f3fcd57-same"]
+    same_prog = [r for r in same_rows if r.get("mode") == "send"
+                 and "还在处理中" in (r.get("content") or "")]
+    check("H same step delivers the formal text",
+          [r.get("content") for r in same_replies] == ["视频已生成"])
+    check("H same step still delivers reply_file after that text",
+          len(same_files) == 1 and same_files[0].get("file_path") == str(clip)
+          and same_files[0].get("content") == "")
+    check("H due 12-minute timer does not follow the formal reply",
+          same_prog == [])
+    saved_same = nb.load_state()["channels"]["wecom"]["turns"][0]
+    check("H turn stays open with reply_delivered set",
+          saved_same.get("reply_delivered") is True)
+
+    wc_out.unlink(missing_ok=True)
+    later_act = int(time.time()) + 60
+    stub.history = [asst(11, "视频已生成"), asst(12, "补充说明"),
+                    tool_ev(13)]
+    stub.activity = {"days": [{"activities": [
+        {"timestamp": iso(later_act), "type": "file_created",
+         "message_id": "after-done",
+         "details": {"path": "/tmp/x/after-done.txt"}}]}]}
+    turn = make_turn(msgid="6f3fcd57-later", chatid="grp-live",
+                     chattype="group", sent_at=sent_h, next_prog=0,
+                     text="生成一段视频", reply_delivered=True,
+                     cursor_seq=11, last_reply_at=int(time.time()) - 1,
+                     trailing_since=int(time.time()) - 1,
+                     hist_seen_seq=11, last_activity_poll=0,
+                     last_event_prog=0, activity_dirty=True,
+                     history_dirty=True, reply_started=True)
+    set_state("wecom", turns=[turn], last_boundary_ts=0,
+              session_id="sid1")
+    w.step(str(wc_spool), None)
+    later_rows = read_jsonl(wc_out)
+    later_prog = [r for r in later_rows if r.get("mode") == "send"
+                  and "还在处理中" in (r.get("content") or "")]
+    later_tail = [r for r in later_rows if r.get("mode") == "send"
+                  and r.get("content") == "补充说明"]
+    check("H later timer and newer activity send no progress",
+          later_prog == [])
+    check("H trailing segment after the formal reply still delivers",
+          len(later_tail) == 1 and later_tail[0].get("chatid") == "grp-live")
+    saved_later = nb.load_state()["channels"]["wecom"]["turns"][0]
+    check("H post-reply progress flags are cleared",
+          saved_later.get("reply_delivered") is True
+          and saved_later.get("activity_dirty") is False
+          and saved_later.get("history_dirty") is False)
+finally:
+    (SBX / "enabled-wecom").unlink(missing_ok=True)
+    (SBX / "longtask-wecom").unlink(missing_ok=True)
+check("H wecom flags removed again",
+      not nb.live_mode("wecom") and not nb.longtask_mode("wecom"))
 
 failed = [n for n, ok in RESULTS if not ok]
 print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} passed")

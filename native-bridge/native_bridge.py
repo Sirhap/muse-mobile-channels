@@ -808,7 +808,15 @@ class ChannelWorker(threading.Thread):
     def progress_notice(self, turn, age):
         """One unbound progress message for a long-running turn, so a
         multi-minute native task never looks dead from the user's side.
-        Live channels only; needs the route captured at divert time."""
+        Live channels only; needs the route captured at divert time.
+
+        Once the bound formal reply for this msgid has been delivered,
+        this returns without writing. The result already ended the
+        "still working" story for that task; a later timer tick or
+        activity fold must not add another 「还在处理中」.
+        """
+        if turn.get("reply_delivered"):
+            return
         if not live_mode(self.ch):
             return
         excerpt = (turn.get("text") or "")[:24]
@@ -1017,9 +1025,9 @@ class ChannelWorker(threading.Thread):
         Counterpart of _clear_superseded_history_dirty. activity.list
         is not ordered by history seq, so the reply's last_reply_at
         is the line: an event at or before that instant is the work
-        the reply just reported, and step() must not send
-        「还在处理中」 for it in the same turn. An event strictly
-        after last_reply_at is newer work and stays dirty.
+        the reply just reported. An event strictly after
+        last_reply_at is left dirty here; step() still does not send
+        「还在处理中」 once reply_delivered is set (timer included).
         Called after the reply has been delivered and after this
         poll's _poll_activity, because that fold can set the flag
         later than the history clear.
@@ -1433,6 +1441,20 @@ class ChannelWorker(threading.Thread):
                 if outcome == "running":
                     age = int(time.time()) - turn["sent_at"]
                     nxt = turn.get("next_prog") or 0
+                    # The bound formal reply already went out for this
+                    # msgid. Trailing segments may still be delivered,
+                    # but neither the 120s/300s timer nor an
+                    # activity/history event may add 「还在处理中」
+                    # after that result. progress_notice repeats the
+                    # same guard for any other caller.
+                    if turn.get("reply_delivered"):
+                        if turn.get("activity_dirty") \
+                                or turn.get("history_dirty"):
+                            turn["activity_dirty"] = False
+                            turn["history_dirty"] = False
+                            prog_dirty = True
+                        alive.append(turn)
+                        continue
                     # LT2 spec 4 (gated): fresh activity OR a history
                     # delta is a progress EVENT — fire the notice now
                     # (throttled to one per LT_EVENT_PROG_MIN_SECS)
@@ -1440,6 +1462,8 @@ class ChannelWorker(threading.Thread):
                     # push the timed notice out so the two never stack.
                     # The throttle is what keeps the 12s activity poll
                     # and the 2s history poll from spamming.
+                    # Applies only while the formal reply is still
+                    # outstanding (see reply_delivered above).
                     fired = False
                     event_dirty = turn.get("activity_dirty") \
                         or turn.get("history_dirty")
