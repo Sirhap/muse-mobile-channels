@@ -64,3 +64,9 @@
 
 ### 12. 企微合并消息指针回复（平台差异，非 bug，备查）
 - 企微网关不消费 `feedback_clear`，被合并消息必须单独发一条「（已并入上一条处理）」指针回复关 think stream，微信侧是静默清除。平台限制，无修复计划，仅防误判为 bug 重查。
+
+### 13. audit 测试套件非自包含（已修复 2026-10-09）
+- 症状：Grok 从 PR#2（c4ecc99）全新克隆复跑 `test_bridge_audit_20261008.py` 得 22/30，8 条 FAIL 全在 2–6 节的投递内容断言；生产机上同套件 30/30。
+- 根因：`native_bridge.py` 的 BASE 写死生产路径，`live_mode()` 读 BASE 下 `enabled-<渠道>` 开关、shadow 投递写 BASE/shadow/；audit 测试只重定向了 CFG/STATE_F/STATUS_F、没重定向 BASE，平时靠借用生产开关与 shadow 目录才过。全新克隆无开关 → 渠道判 shadow 模式 → 回复全进 shadow outbox，测试在沙箱 outbox 里查无此行。隔离命名空间已三段复现（无 shadow 崩、建 shadow 后 22/30 且 FAIL 清单逐字一致、补开关 30/30）。
+- 修复：audit 测试按 progress 套件（13816b4）同款做法把 BASE 指向沙箱、自备 enabled 开关与 shadow 目录；修复后在同款隔离环境（克隆目录只剩 3 个跟踪文件）复跑 30/30，生产环境亦 30/30。
+- 备查：Grok 在 PR#2 分支上的临时解法是在其克隆的 native-bridge/ 下 touch enabled-weixin/enabled-wecom 并保留 shadow 目录；PR#2 合并后以 main 的修法为准。
