@@ -40,6 +40,13 @@ native-bridge/divert-*
 native-bridge/longtask-*
 native-bridge/queue_admin-*.jsonl
 native-bridge/probe_*.py
+# P3#11 result dumps and the channel-restore outbound draft.
+# These do not match gw2.py, README.md, or other native-probe *.py deps.
+# Hatch moves/deletes are done via Muse; this only keeps the dumps untracked.
+native-probe/probe*_results.txt
+native-probe/probe*_stdout.log
+native-probe/probe*_*.log
+channel-restore/outbound-probe-draft-*.md
 .venv/
 __pycache__/
 *.pyc

@@ -27,7 +27,11 @@ env file outside the tree:
 - WeCom: `~/.config/wecom-bot/credentials.env` (`WECOM_CRED_FILE`)
 
 Runtime state (`state/`), virtualenvs (`.venv/`), and backups (`*.bak-*`)
-are gitignored.
+are gitignored. So are probe result dumps
+(`native-probe/probe*_results.txt`, `native-probe/probe*_stdout.log`,
+`native-probe/probe*_*.log`) and
+`channel-restore/outbound-probe-draft-*.md`. `native-probe/gw2.py` and
+`README.md` stay tracked. See `docs/hatch-untracked-disposition.md`.
 
 ## Run
 
