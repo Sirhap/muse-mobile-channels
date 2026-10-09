@@ -8,10 +8,13 @@ chat.py's Chat.send resident loop):
      one by one (first as the bound reply, the rest as unbound idle
      sends), the unified cursor advances, and the turn closes only
      after status=completed + TRAILING_QUIET_SECS of silence.
-     Re-delivery of an already-pushed segment is deduped.
-  B. The trailing window is capped at TRAILING_MAX_SECS; after the
-     cap closes the turn, idle_push_scan continues on the SAME
-     cursor and pushes a later arrival exactly once.
+     Re-delivery of an already-pushed segment is deduped. Closing
+     consults outbox_results for the bound reply (ok / pending).
+  B. There is no wall-clock cap. A turn that has been trailing for
+     much longer than the old 600s cap stays open while the last
+     reply is fresh. It closes only on completed + quiet. After
+     that close, idle_push_scan continues on the SAME cursor and
+     pushes a later arrival exactly once.
   C. A new activity event triggers an immediate progress_notice via
      step() (even before PROG_FIRST_SECS) carrying the 最近动态 line;
      with no new event and age < 120s, no notice is sent.
@@ -178,6 +181,11 @@ check("0 is_session_not_found: other errors excluded",
 check("0 longtask gate: weixin/test on, wecom off",
       nb.longtask_mode("weixin") and nb.longtask_mode("test")
       and not nb.longtask_mode("wecom"))
+check("0 quiet window aligned to muse-cli 10s",
+      nb.TRAILING_QUIET_SECS == 10)
+check("0 no trailing hard cap", not hasattr(nb, "TRAILING_MAX_SECS"))
+check("0 activity poll inside 10-15s",
+      10 <= nb.ACTIVITY_POLL_SECS <= 15)
 st0 = {"channels": {}}
 c0 = nb.ch_state(st0, "weixin")
 check("0 ch_state defaults carry idle-scan fields",
@@ -214,35 +222,84 @@ w._deliver_idle("第二段", "am12")
 check("A re-delivery of a pushed segment is deduped",
       len(sends_with("第二段")) == 1)
 turn["last_reply_at"] = int(time.time()) - nb.TRAILING_QUIET_SECS - 1
-check("A completed + quiet elapsed -> done", w.poll_turn(turn) == "done")
+seen_ok = {}
+orig_ok = nb.outbox_result_ok
+
+
+def _capture_ok(ch, row_id):
+    seen_ok["ch"] = ch
+    seen_ok["id"] = row_id
+    return True
+
+
+nb.outbox_result_ok = _capture_ok
+try:
+    check("A completed + quiet elapsed -> done",
+          w.poll_turn(turn) == "done")
+finally:
+    nb.outbox_result_ok = orig_ok
+check("A close checks the bound reply's outbox id",
+      seen_ok.get("ch") == "weixin"
+      and seen_ok.get("id") == nb.bridge_row_id("m-A"))
 check("A no duplicate bound reply after close",
       [r["content"] for r in replies_for("m-A")] == ["第一段"])
+(WX / "outbox_results.jsonl").write_text(
+    json.dumps({"id": "other", "ok": False}) + "\n"
+    + json.dumps({"id": nb.bridge_row_id("m-ok"), "ok": False}) + "\n"
+    + json.dumps({"id": nb.bridge_row_id("m-ok"), "ok": True}) + "\n",
+    encoding="utf-8")
+check("A outbox_result_ok: latest true wins",
+      nb.outbox_result_ok("weixin", nb.bridge_row_id("m-ok")) is True)
+check("A outbox_result_ok: missing id is pending",
+      nb.outbox_result_ok("weixin", "no-such-row") is None)
+check("A outbox_result_ok: shadow channel is pending",
+      nb.outbox_result_ok("wecom", nb.bridge_row_id("m-ok")) is None)
+old_id = nb.bridge_row_id("m-old")
+pad = "".join(
+    json.dumps({"id": f"pad-{i}", "ok": True}, ensure_ascii=False) + "\n"
+    for i in range(12000))
+(WX / "outbox_results.jsonl").write_text(
+    json.dumps({"id": old_id, "ok": False}) + "\n"
+    + json.dumps({"id": old_id, "ok": True}) + "\n"
+    + pad,
+    encoding="utf-8")
+check("A outbox_result_ok: verdict older than 256KB still found",
+      (WX / "outbox_results.jsonl").stat().st_size > 262144
+      and nb.outbox_result_ok("weixin", old_id) is True)
 
 # ---------------------------------------------------------------- B
+# No wall-clock cap: far past the old 600s, a fresh last reply keeps
+# the turn open even when status is already completed. Silence then
+# closes it, and the idle scan still delivers a post-close arrival
+# on the same cursor.
 now = int(time.time())
 stub = StubGW()
-stub.status = "running"
-stub.history = [asst(21, "第一段"), asst(22, "迟到段")]
+stub.status = "completed"
+stub.history = [asst(21, "第一段"), asst(22, "仍在滴入")]
 w = worker_with("weixin", stub)
 turn = make_turn(msgid="m-B", reply_delivered=True, cursor_seq=21,
-                 last_reply_at=now, trailing_since=now - 601,
-                 sent_at=now - 700, reply_started=True)
-check("B trailing cap (600s) closes the turn",
+                 last_reply_at=now, trailing_since=now - 5000,
+                 sent_at=now - 5100, reply_started=True,
+                 hist_seen_seq=21)
+check("B long trailing window stays open (no hard cap)",
+      w.poll_turn(turn) == "running")
+check("B in-window late segment still delivered",
+      len(sends_with("仍在滴入")) == 1)
+turn["last_reply_at"] = int(time.time()) - nb.TRAILING_QUIET_SECS - 1
+check("B completed + quiet elapsed closes without a cap",
       w.poll_turn(turn) == "done")
-check("B in-window late segment delivered before the cap closed it",
-      len(sends_with("迟到段")) == 1)
 set_state("weixin", session_id="sid1", idle_push_seq=22,
           idle_pushed_ids=["am21", "am22"])
 stub.history.append(asst(23, "更迟到的结果"))
 w.last_idle_scan = 0
 w.idle_push_scan(w.cs())
 check("B idle scan continues on the same cursor and pushes the "
-      "post-cap arrival", len(sends_with("更迟到的结果")) == 1)
+      "post-close arrival", len(sends_with("更迟到的结果")) == 1)
 w.last_idle_scan = 0
 w.idle_push_scan(w.cs())
-check("B idle scan does not re-push it (or the capped segment)",
+check("B idle scan does not re-push it",
       len(sends_with("更迟到的结果")) == 1
-      and len(sends_with("迟到段")) == 1)
+      and len(sends_with("仍在滴入")) == 1)
 
 # ---------------------------------------------------------------- C
 def iso(epoch):
@@ -380,6 +437,258 @@ check("F gate off: reply delivered", [r["content"] for r in rows]
       == ["门控外答案"])
 check("F gate off: no trailing state engaged",
       not turn.get("reply_delivered"))
+
+# ---------------------------------------------------------------- G
+# Progress granularity: history delta is a second trigger, throttled
+# with activity notices. Trailing sends use the turn's route.
+(WX / "outbox.jsonl").unlink(missing_ok=True)
+sent = int(time.time()) - 10
+stub = StubGW()
+stub.status = "running"
+stub.history = [{"event_name": "tool.invoke", "seq": 11,
+                 "payload": {"name": "shell"}}]
+w = worker_with("weixin", stub)
+turn = make_turn(msgid="m-H", sent_at=sent,
+                 last_activity_poll=int(time.time()),
+                 hist_seen_seq=10)
+set_state("weixin", turns=[turn], last_boundary_ts=0, session_id="sid1")
+w.step(str(spool), None)
+rows = [r for r in read_jsonl(WX / "outbox.jsonl") if r.get("mode") == "send"]
+check("G history delta fires a progress notice before 120s",
+      any("还在处理中" in (r.get("content") or "") for r in rows))
+
+(WX / "outbox.jsonl").unlink(missing_ok=True)
+stub.history.append({"event_name": "tool.invoke", "seq": 12,
+                     "payload": {"name": "shell"}})
+w.step(str(spool), None)
+rows = [r for r in read_jsonl(WX / "outbox.jsonl") if r.get("mode") == "send"]
+saved = nb.load_state()["channels"]["weixin"]["turns"][0]
+check("G second history delta inside 60s sends no extra notice",
+      rows == [])
+check("G throttled history delta stays pending",
+      saved.get("history_dirty") is True)
+st = nb.load_state()
+st["channels"]["weixin"]["turns"][0]["last_event_prog"] = \
+    int(time.time()) - nb.LT_EVENT_PROG_MIN_SECS - 1
+nb.save_state(st)
+w.step(str(spool), None)
+rows = [r for r in read_jsonl(WX / "outbox.jsonl") if r.get("mode") == "send"]
+check("G pending history delta fires once the throttle elapses",
+      any("还在处理中" in (r.get("content") or "") for r in rows))
+
+(WX / "outbox.jsonl").unlink(missing_ok=True)
+stub = StubGW()
+stub.status = "running"
+stub.history = [{"event_name": "message.user", "seq": 11,
+                 "payload": {"display_text": "hello"}}]
+w = worker_with("weixin", stub)
+turn = make_turn(msgid="m-H2", sent_at=sent,
+                 last_activity_poll=int(time.time()),
+                 hist_seen_seq=10)
+set_state("weixin", turns=[turn], last_boundary_ts=0, session_id="sid1")
+w.step(str(spool), None)
+rows = [r for r in read_jsonl(WX / "outbox.jsonl") if r.get("mode") == "send"]
+check("G user echo is not a progress trigger", rows == [])
+
+
+def tool_ev(seq):
+    return {"event_name": "tool.invoke", "seq": seq,
+            "payload": {"name": "shell"}}
+
+
+(WX / "outbox.jsonl").unlink(missing_ok=True)
+stub = StubGW()
+stub.status = "running"
+stub.history = [tool_ev(11), asst(12, "最终答案")]
+w = worker_with("weixin", stub)
+turn = make_turn(msgid="m-sup", sent_at=sent,
+                 last_activity_poll=int(time.time()),
+                 hist_seen_seq=10)
+set_state("weixin", turns=[turn], last_boundary_ts=0, session_id="sid1")
+w.step(str(spool), None)
+sup_sends = [r for r in read_jsonl(WX / "outbox.jsonl")
+             if r.get("mode") == "send"]
+check("G reply supersedes same-batch tool progress",
+      [r["content"] for r in replies_for("m-sup")] == ["最终答案"]
+      and not any("还在处理中" in (r.get("content") or "")
+                  for r in sup_sends))
+check("G superseded history_dirty is cleared",
+      nb.load_state()["channels"]["weixin"]["turns"][0].get(
+          "history_dirty") is False)
+
+(WX / "outbox.jsonl").unlink(missing_ok=True)
+stub = StubGW()
+stub.status = "running"
+stub.history = [tool_ev(11), asst(12, "后到的答案")]
+w = worker_with("weixin", stub)
+turn = make_turn(msgid="m-sup2", sent_at=sent,
+                 last_activity_poll=int(time.time()),
+                 hist_seen_seq=11, history_dirty=True,
+                 last_event_prog=int(time.time())
+                 - nb.LT_EVENT_PROG_MIN_SECS - 1)
+set_state("weixin", turns=[turn], last_boundary_ts=0, session_id="sid1")
+w.step(str(spool), None)
+sup_sends = [r for r in read_jsonl(WX / "outbox.jsonl")
+             if r.get("mode") == "send"]
+check("G a pending dirty flag does not outlive the reply",
+      [r["content"] for r in replies_for("m-sup2")] == ["后到的答案"]
+      and not any("还在处理中" in (r.get("content") or "")
+                  for r in sup_sends))
+
+(WX / "outbox.jsonl").unlink(missing_ok=True)
+stub = StubGW()
+stub.status = "running"
+stub.history = [asst(11, "先回一段"), tool_ev(12)]
+w = worker_with("weixin", stub)
+turn = make_turn(msgid="m-sup3", sent_at=sent,
+                 last_activity_poll=int(time.time()),
+                 hist_seen_seq=10)
+set_state("weixin", turns=[turn], last_boundary_ts=0, session_id="sid1")
+w.step(str(spool), None)
+sup_sends = [r for r in read_jsonl(WX / "outbox.jsonl")
+             if r.get("mode") == "send"]
+check("G a tool row newer than the reply still notifies",
+      [r["content"] for r in replies_for("m-sup3")] == ["先回一段"]
+      and any("还在处理中" in (r.get("content") or "")
+              for r in sup_sends))
+
+# activity_dirty must follow the same rule as history_dirty: a
+# completed reply supersedes activity at or before that reply, and
+# step() must not add 「还在处理中」. Activity strictly after
+# last_reply_at still notifies.
+(WX / "outbox.jsonl").unlink(missing_ok=True)
+stub = StubGW()
+stub.status = "running"
+stub.history = [asst(12, "正式回复")]
+w = worker_with("weixin", stub)
+turn = make_turn(msgid="m-actsup", sent_at=sent,
+                 last_activity_poll=int(time.time()),
+                 hist_seen_seq=10, activity_dirty=True,
+                 last_event_prog=int(time.time())
+                 - nb.LT_EVENT_PROG_MIN_SECS - 1,
+                 activities=[{"ts": iso(sent + 1),
+                              "text": "创建了文件 /tmp/x/old.txt"}],
+                 last_activity="创建了文件 /tmp/x/old.txt")
+set_state("weixin", turns=[turn], last_boundary_ts=0, session_id="sid1")
+w.step(str(spool), None)
+act_sends = [r for r in read_jsonl(WX / "outbox.jsonl")
+             if r.get("mode") == "send"]
+check("G pending activity_dirty does not outlive the reply",
+      [r["content"] for r in replies_for("m-actsup")] == ["正式回复"]
+      and not any("还在处理中" in (r.get("content") or "")
+                  for r in act_sends))
+check("G superseded activity_dirty is cleared",
+      nb.load_state()["channels"]["weixin"]["turns"][0].get(
+          "activity_dirty") is False)
+
+(WX / "outbox.jsonl").unlink(missing_ok=True)
+stub = StubGW()
+stub.status = "running"
+stub.history = [asst(12, "带着旧动态的回复")]
+stub.activity = {"days": [{"activities": [
+    {"timestamp": iso(sent + 1), "type": "file_created",
+     "message_id": "old-act",
+     "details": {"path": "/tmp/x/old.txt"}}]}]}
+w = worker_with("weixin", stub)
+turn = make_turn(msgid="m-actsup2", sent_at=sent,
+                 last_activity_poll=0, hist_seen_seq=10,
+                 last_event_prog=0)
+set_state("weixin", turns=[turn], last_boundary_ts=0, session_id="sid1")
+w.step(str(spool), None)
+act_sends = [r for r in read_jsonl(WX / "outbox.jsonl")
+             if r.get("mode") == "send"]
+check("G same-step activity older than the reply does not notify",
+      [r["content"] for r in replies_for("m-actsup2")] == ["带着旧动态的回复"]
+      and not any("还在处理中" in (r.get("content") or "")
+                  for r in act_sends))
+check("G same-step superseded activity_dirty is cleared",
+      nb.load_state()["channels"]["weixin"]["turns"][0].get(
+          "activity_dirty") is False)
+
+(WX / "outbox.jsonl").unlink(missing_ok=True)
+stub = StubGW()
+stub.status = "running"
+stub.history = [asst(12, "先到的回复")]
+stub.activity = {"days": []}
+w = worker_with("weixin", stub)
+turn = make_turn(msgid="m-actnew", sent_at=sent,
+                 last_activity_poll=int(time.time()),
+                 hist_seen_seq=10)
+set_state("weixin", turns=[turn], last_boundary_ts=0, session_id="sid1")
+w.step(str(spool), None)
+check("G reply alone sends no activity notice",
+      [r["content"] for r in replies_for("m-actnew")] == ["先到的回复"]
+      and not any("还在处理中" in (r.get("content") or "")
+                  for r in read_jsonl(WX / "outbox.jsonl")
+                  if r.get("mode") == "send"))
+saved = nb.load_state()["channels"]["weixin"]["turns"][0]
+later = int(saved.get("last_reply_at") or 0) + 5
+stub.activity = {"days": [{"activities": [
+    {"timestamp": iso(later), "type": "file_created",
+     "message_id": "new-act",
+     "details": {"path": "/tmp/x/after.txt"}}]}]}
+saved["last_activity_poll"] = 0
+saved["last_event_prog"] = 0
+st = nb.load_state()
+st["channels"]["weixin"]["turns"][0] = saved
+nb.save_state(st)
+w.step(str(spool), None)
+act_sends = [r for r in read_jsonl(WX / "outbox.jsonl")
+             if r.get("mode") == "send"]
+check("G activity newer than the reply still notifies",
+      any("还在处理中" in (r.get("content") or "") for r in act_sends))
+
+stub = StubGW()
+stub.status = "running"
+ev_late = {"timestamp": iso(int(time.time())), "type": "file_created",
+           "message_id": "a-late",
+           "details": {"path": "/tmp/x/late.txt"}}
+stub.activity = {"days": [{"activities": [ev_late]}]}
+w = worker_with("weixin", stub)
+turn = make_turn(msgid="m-act", sent_at=int(time.time()) - 30,
+                 last_activity_poll=int(time.time()))
+check("G activity poll respects the 12s cadence",
+      w._poll_activity(turn) is False)
+turn["last_activity_poll"] = int(time.time()) - nb.ACTIVITY_POLL_SECS - 1
+check("G activity poll runs once the cadence elapses",
+      w._poll_activity(turn) is True)
+
+stub = StubGW()
+stub.status = "completed"
+stub.history = [asst(41, "微首"), asst(42, "微次")]
+w = worker_with("weixin", stub)
+turn = make_turn(msgid="m-wxr", from_user="user-from-turn",
+                 hist_seen_seq=10)
+check("G weixin trailing stays open after the first segments",
+      w.poll_turn(turn) == "running")
+routed = sends_with("微次")
+check("G weixin trailing send uses the turn's from_user",
+      len(routed) == 1
+      and routed[0].get("to_user_id") == "user-from-turn"
+      and routed[0].get("to_user_id")
+      != nb.CFG["channels"]["weixin"].get("from_user_id"))
+
+flag = SBX / "longtask-wecom"
+flag.touch()
+try:
+    stub = StubGW()
+    stub.status = "completed"
+    stub.history = [asst(51, "企微首段"), asst(52, "企微次段")]
+    w = worker_with("wecom", stub)
+    turn = make_turn(msgid="m-wc", chatid="grp-9", chattype="group",
+                     hist_seen_seq=10)
+    check("G wecom trailing stays open after the first segments",
+          w.poll_turn(turn) == "running")
+    wc_rows = [r for r in read_jsonl(SBX / "shadow" / "wecom-outbox.jsonl")
+               if r.get("mode") == "send" and r.get("content") == "企微次段"]
+    check("G wecom trailing send uses the turn chat",
+          len(wc_rows) == 1
+          and wc_rows[0].get("chatid") == "grp-9"
+          and wc_rows[0].get("chat_type") == 2)
+finally:
+    flag.unlink(missing_ok=True)
+check("G wecom longtask flag removed again",
+      not nb.longtask_mode("wecom"))
 
 failed = [n for n, ok in RESULTS if not ok]
 print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} passed")
