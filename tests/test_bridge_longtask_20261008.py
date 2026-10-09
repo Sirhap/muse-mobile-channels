@@ -552,6 +552,92 @@ check("G a tool row newer than the reply still notifies",
       and any("还在处理中" in (r.get("content") or "")
               for r in sup_sends))
 
+# activity_dirty must follow the same rule as history_dirty: a
+# completed reply supersedes activity at or before that reply, and
+# step() must not add 「还在处理中」. Activity strictly after
+# last_reply_at still notifies.
+(WX / "outbox.jsonl").unlink(missing_ok=True)
+stub = StubGW()
+stub.status = "running"
+stub.history = [asst(12, "正式回复")]
+w = worker_with("weixin", stub)
+turn = make_turn(msgid="m-actsup", sent_at=sent,
+                 last_activity_poll=int(time.time()),
+                 hist_seen_seq=10, activity_dirty=True,
+                 last_event_prog=int(time.time())
+                 - nb.LT_EVENT_PROG_MIN_SECS - 1,
+                 activities=[{"ts": iso(sent + 1),
+                              "text": "创建了文件 /tmp/x/old.txt"}],
+                 last_activity="创建了文件 /tmp/x/old.txt")
+set_state("weixin", turns=[turn], last_boundary_ts=0, session_id="sid1")
+w.step(str(spool), None)
+act_sends = [r for r in read_jsonl(WX / "outbox.jsonl")
+             if r.get("mode") == "send"]
+check("G pending activity_dirty does not outlive the reply",
+      [r["content"] for r in replies_for("m-actsup")] == ["正式回复"]
+      and not any("还在处理中" in (r.get("content") or "")
+                  for r in act_sends))
+check("G superseded activity_dirty is cleared",
+      nb.load_state()["channels"]["weixin"]["turns"][0].get(
+          "activity_dirty") is False)
+
+(WX / "outbox.jsonl").unlink(missing_ok=True)
+stub = StubGW()
+stub.status = "running"
+stub.history = [asst(12, "带着旧动态的回复")]
+stub.activity = {"days": [{"activities": [
+    {"timestamp": iso(sent + 1), "type": "file_created",
+     "message_id": "old-act",
+     "details": {"path": "/tmp/x/old.txt"}}]}]}
+w = worker_with("weixin", stub)
+turn = make_turn(msgid="m-actsup2", sent_at=sent,
+                 last_activity_poll=0, hist_seen_seq=10,
+                 last_event_prog=0)
+set_state("weixin", turns=[turn], last_boundary_ts=0, session_id="sid1")
+w.step(str(spool), None)
+act_sends = [r for r in read_jsonl(WX / "outbox.jsonl")
+             if r.get("mode") == "send"]
+check("G same-step activity older than the reply does not notify",
+      [r["content"] for r in replies_for("m-actsup2")] == ["带着旧动态的回复"]
+      and not any("还在处理中" in (r.get("content") or "")
+                  for r in act_sends))
+check("G same-step superseded activity_dirty is cleared",
+      nb.load_state()["channels"]["weixin"]["turns"][0].get(
+          "activity_dirty") is False)
+
+(WX / "outbox.jsonl").unlink(missing_ok=True)
+stub = StubGW()
+stub.status = "running"
+stub.history = [asst(12, "先到的回复")]
+stub.activity = {"days": []}
+w = worker_with("weixin", stub)
+turn = make_turn(msgid="m-actnew", sent_at=sent,
+                 last_activity_poll=int(time.time()),
+                 hist_seen_seq=10)
+set_state("weixin", turns=[turn], last_boundary_ts=0, session_id="sid1")
+w.step(str(spool), None)
+check("G reply alone sends no activity notice",
+      [r["content"] for r in replies_for("m-actnew")] == ["先到的回复"]
+      and not any("还在处理中" in (r.get("content") or "")
+                  for r in read_jsonl(WX / "outbox.jsonl")
+                  if r.get("mode") == "send"))
+saved = nb.load_state()["channels"]["weixin"]["turns"][0]
+later = int(saved.get("last_reply_at") or 0) + 5
+stub.activity = {"days": [{"activities": [
+    {"timestamp": iso(later), "type": "file_created",
+     "message_id": "new-act",
+     "details": {"path": "/tmp/x/after.txt"}}]}]}
+saved["last_activity_poll"] = 0
+saved["last_event_prog"] = 0
+st = nb.load_state()
+st["channels"]["weixin"]["turns"][0] = saved
+nb.save_state(st)
+w.step(str(spool), None)
+act_sends = [r for r in read_jsonl(WX / "outbox.jsonl")
+             if r.get("mode") == "send"]
+check("G activity newer than the reply still notifies",
+      any("还在处理中" in (r.get("content") or "") for r in act_sends))
+
 stub = StubGW()
 stub.status = "running"
 ev_late = {"timestamp": iso(int(time.time())), "type": "file_created",
