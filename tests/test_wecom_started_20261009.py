@@ -105,9 +105,9 @@ def read_jsonl(path):
 
 
 def send_rows(state_dir):
-    """Unbound outbox send rows (feedback notices live here)."""
+    """Feedback notices. They are reply_notice rows on the msgid chain."""
     return [row for row in read_jsonl(state_dir / "outbox.jsonl")
-            if row.get("mode") == "send"]
+            if row.get("mode") == "reply_notice"]
 
 
 def started_rows(state_dir):
@@ -164,8 +164,12 @@ def scenario_idle_to_active():
     check("1 idle→active: exactly 1 started",
           n_start == 1 and len(rows) == 1
           and rows[0]["content"] == expected_started(msgid, text)
+          and rows[0].get("mode") == "reply_notice"
+          and rows[0].get("msgid") == msgid
           and rows[0].get("chatid") == "sirhao"
-          and str(rows[0].get("id", "")).startswith("started-"))
+          and str(rows[0].get("id", "")).startswith("started-")
+          and not any(r.get("mode") == "send"
+                      for r in read_jsonl(state_dir / "outbox.jsonl")))
     n_again = gateway._feedback_scan_once(now=time.time() + 20)
     check("1 second scan: still exactly 1 started",
           n_again == 0 and len(started_rows(state_dir)) == 1)

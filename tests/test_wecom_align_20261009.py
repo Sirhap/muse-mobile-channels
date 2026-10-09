@@ -114,8 +114,9 @@ def read_jsonl(p):
 
 
 def send_rows(d):
+    """Started / wait notices. Bound reply_notice rows, not free sends."""
     return [r for r in read_jsonl(d / "outbox.jsonl")
-            if r.get("mode") == "send"]
+            if r.get("mode") == "reply_notice"]
 
 
 # ---------- source-level premises ----------
@@ -195,9 +196,14 @@ def scenario_bcd():
     check("b: one started notice queued",
           n1 == 1 and len(rows) == 1
           and rows[0]["content"].startswith("▶️ 排到你了，开始处理")
-          and "排队的问题" in rows[0]["content"])
+          and "排队的问题" in rows[0]["content"]
+          and rows[0].get("mode") == "reply_notice"
+          and rows[0].get("msgid") == "M-Q")
     check("b: started notice addressed by chatid",
           rows and rows[0].get("chatid") == "sirhao")
+    check("b: started notice is not an unbound send",
+          not any(r.get("mode") == "send"
+                  for r in read_jsonl(d / "outbox.jsonl")))
     n2 = g._feedback_scan_once(now=time.time() + 30)
     check("b: second scan sends nothing", n2 == 0 and len(send_rows(d)) == 1)
 
