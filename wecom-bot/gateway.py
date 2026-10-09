@@ -64,6 +64,34 @@ from channel_common import (  # noqa: E402
     write_offset,
 )
 
+def _load_coalescer_cls():
+    """Load the reviewed WeCom outbound coalescer (v2, idle-gap).
+
+    The unit lives in the acceptance-fix folder as a standalone,
+    separately tested module; the gateway loads it by path so this
+    file stays the only gateway file changed. Any load problem ->
+    None, and the outbox falls back to plain per-row dispatch.
+    """
+    try:
+        import importlib.util as _ilu
+
+        path = (Path(__file__).resolve().parent.parent
+                / "acceptance-fix-2026-10-08"
+                / "wecom_outbound_coalesce_v2.py")
+        spec = _ilu.spec_from_file_location(
+            "wecom_outbound_coalesce_v2", path)
+        mod = _ilu.module_from_spec(spec)
+        # The module uses @dataclass, which looks its module up in
+        # sys.modules during class creation — register before exec.
+        sys.modules[spec.name] = mod
+        spec.loader.exec_module(mod)
+        return mod.Coalescer
+    except Exception:
+        return None
+
+
+Coalescer = _load_coalescer_cls()
+
 WS_URL = "wss://openws.work.weixin.qq.com"
 BASE = Path(__file__).resolve().parent
 STATE = BASE / "state"
@@ -332,8 +360,8 @@ HOOK_STATE_DIR = muse_home() / "hooks" / "state" / "wecom-bot"
 CLI_WRAPPER = BASE / "wecom"
 CHAN_LABEL = "企业微信"
 
-SLASH_COMMANDS = {"ping", "status", "stop", "new", "check", "queue", "help", "subagent"}
-SLASH_ALIASES = {"自检": "check", "命令": "help", "副助手": "subagent", "新会话": "new"}
+SLASH_COMMANDS = {"ping", "status", "stop", "new", "check", "queue", "help", "subagent", "approvals", "approve", "deny"}
+SLASH_ALIASES = {"自检": "check", "命令": "help", "副助手": "subagent", "新会话": "new", "审批": "approvals", "批准": "approve", "拒绝": "deny"}
 
 # User-facing times in acks are rendered in the user's timezone; the VM
 # itself runs UTC, so plain localtime would show times 8h off.
@@ -556,7 +584,20 @@ def _task_overview_text(channel, state_dir, hook_state_dir):
         return ""
 
 
-BRIDGE_ACK_TEMPLATE = "已收到，排队第 {n} 位（原生通道），前面有任务在跑；/stop 取消"
+# ---------- bridge-lane arrival feedback (2026-10-09) ----------
+# Aligned with the Weixin gateway (user order 2026-10-08, extended
+# to WeCom 2026-10-09): a diverted (bridge-lane) message gets NO
+# arrival ack at all — the in-place think stream opened for every
+# inbound message already signals receipt, and a message arriving
+# before the running turn starts replying is merged into that turn
+# by the bridge. A message that truly has to wait is announced by
+# the feedback scan instead: STARTED_NOTICE_TEMPLATE when its turn
+# begins, and one BRIDGE_WAIT_TEMPLATE reminder after
+# WAIT_REMIND_SECS still queued. (The old "queued at position N"
+# arrival ack this replaces was WeCom-only leftover behaviour.)
+STARTED_NOTICE_TEMPLATE = "▶️ 排到你了，开始处理：「{excerpt}」"
+BRIDGE_WAIT_TEMPLATE = "⏳ 还在排队（原生通道第 {n} 位）：前面任务还没结束，已等{dur}；/stop 取消"
+WAIT_REMIND_SECS = 180
 
 
 def _bridge_snapshot(channel):
@@ -715,6 +756,8 @@ SLASH_HELP_TEXT = """【命令表】在聊天里直接发，网关秒回、不�
 /new 开新会话：换一个全新的原生会话，之前的对话不再带入（别名 /新会话）
 /check 一次性自检，跑完即结束（别名 /自检）
 /help 本命令表（别名 /命令）
+/审批 待审批列表（网络/浏览器类审批，出现时也会主动通知）
+/批准 N 批准第 N 条（仅这次）；/批准 N 永久 永久批准同类；/拒绝 N 拒绝
 注：只有以上是命令；其他以 / 开头的话会当普通消息处理。"""
 
 
@@ -1052,6 +1095,50 @@ def slash_subagent_stop_ack(hook_state_dir, job_id):
 
 
 
+# ---------- /审批 /批准 /拒绝: egress approval relay ----------
+# The relay (~/workspace/approval-relay/) polls egress.approvals and
+# owns state.json (number -> approval); the gateways only read that
+# state to render/validate and append the user's decision to
+# decisions.jsonl, which the relay submits via egress.approval.decide.
+APPROVAL_RELAY_DIR = Path("/home/hatch/workspace/approval-relay")
+
+
+def _approval_items():
+    st = _read_json_file(APPROVAL_RELAY_DIR / "state.json", {}) or {}
+    items = st.get("items") or {}
+    return {n: it for n, it in items.items() if isinstance(it, dict)}
+
+
+def slash_approvals_text():
+    items = _approval_items()
+    pend = [(n, it) for n, it in
+            sorted(items.items(), key=lambda kv: int(kv[0]))
+            if it.get("status") == "pending"]
+    if not pend:
+        return "当前没有待审批。新的审批出现时我会主动发通知。"
+    lines = ["【待审批】"]
+    for n, it in pend:
+        lines.append(f"#{n} {it.get('who', '')}：{str(it.get('what', ''))[:60]}")
+    lines.append("回 /批准 N（仅这次）｜/批准 N 永久｜/拒绝 N")
+    return "\n".join(lines)
+
+
+def slash_approval_decide_ack(num, decision, channel):
+    items = _approval_items()
+    it = items.get(str(num))
+    if it is None:
+        return f"没有找到审批 #{num}。发 /审批 看当前列表。"
+    if it.get("status") != "pending":
+        return f"审批 #{num} 已经处理过了。"
+    label = {"allow_once": "批准（仅这次）", "allow_always": "批准（永久）",
+             "deny": "拒绝"}[decision]
+    if _append_jsonl_file(APPROVAL_RELAY_DIR / "decisions.jsonl",
+                          {"num": str(num), "decision": decision,
+                           "channel": channel, "ts": time.time()}):
+        return f"已提交{label} #{num}：{it.get('who', '')}。执行结果马上发你。"
+    return "提交失败：暂时写不了审批指令，请稍后再试。"
+
+
 # --- Subagent reply label enforcement (fix #2, 2026-10-04) -----
 # See the CLI of this channel for the rationale; the gateway
 # re-checks every reply at dispatch so even a bypassed CLI
@@ -1144,6 +1231,20 @@ class Gateway:
         self.seen_msgids: set[str] = set()
         self.reqmap: dict[str, str] = {}
         self.cards: dict[str, dict] = {}
+        # Bridge-lane arrival feedback (2026-10-09, mirroring the
+        # Weixin gateway): msgid -> {chatid, chattype, ts, excerpt,
+        # queued, queued_at, started_notice, wait_reminded,
+        # via_bridge}. A record lives from a diverted message's
+        # arrival until its formal reply is delivered (see
+        # _feedback_on_reply); _feedback_scan_once drives the
+        # started / long-wait transition notices from it.
+        self.feedback_track: dict[str, dict] = {}
+        # Outbound coalescer (v2 idle-gap): built lazily by the
+        # outbox loop; _coalesce_pending keeps the original rows of
+        # buffered "send" rows by id so a merged dispatch can still
+        # account results / parked retries per ORIGINAL row id.
+        self._coalescer = None
+        self._coalesce_pending: dict[str, dict] = {}
         self._lock_fd = None
         self._kicked = False
         self._acquire_instance_lock()
@@ -1691,6 +1792,19 @@ class Gateway:
                                "后台执行中，主对话不受影响；查进度：/subagent list")
                     else:
                         ack = "派发失败：暂时无法登记副助手任务，请稍后再试。"
+            elif name == "approvals":
+                ack = slash_approvals_text()
+            elif name in ("approve", "deny"):
+                toks = arg.split()
+                num = toks[0] if toks else ""
+                if not num.isdigit():
+                    ack = "用法：/批准 N（仅这次）、/批准 N 永久、/拒绝 N；N 发 /审批 查看。"
+                elif name == "deny":
+                    ack = slash_approval_decide_ack(num, "deny", "wecom")
+                elif len(toks) > 1 and toks[1] == "永久":
+                    ack = slash_approval_decide_ack(num, "allow_always", "wecom")
+                else:
+                    ack = slash_approval_decide_ack(num, "allow_once", "wecom")
             if ack is not None:
                 await self._send_slash_ack(chatid, chattype, ack, req_id)
             log(f"slash /{name} handled for chat {chatid}")
@@ -1721,29 +1835,147 @@ class Gateway:
         except Exception as e:
             log(f"soft ack failed (ignored): {e!r}")
 
-    def _maybe_bridge_ack(self, chatid, chattype, msgid):
-        """Bridge-lane arrival ack for diverted messages: when the
-        native bridge already has work running or queued, tell the
-        user this message is queued on the bridge (position counts
-        ONLY bridge work). Idle bridge -> no ack (the think stream
-        already signals receipt). Fire-and-forget like _maybe_soft_ack."""
+    # ---------- bridge-lane arrival feedback (2026-10-09) ----------
+    # Ported from the Weixin gateway's diverted branch of
+    # _maybe_arrival_feedback + _feedback_scan_once, adapted to the
+    # WeCom architecture: notices are unbound outbox "send" rows
+    # addressed by chatid (WeCom has no per-user send addressing, and
+    # the think stream of the message itself is never touched).
+
+    def _queue_notice(self, chatid, chattype, content, prefix):
+        """Append one unbound outbox "send" row for a feedback
+        notice. Unbound rows carry no msgid, so they never count as
+        batch activity or completion for any message."""
+        self.append_jsonl(OUTBOX, {
+            "id": f"{prefix}-{uuid.uuid4().hex}",
+            "mode": "send",
+            "chatid": chatid,
+            "chat_type": 2 if chattype == "group" else 1,
+            "content": content,
+        })
+        log(f"{prefix} notice queued for chat {chatid}: {content}")
+        return True
+
+    def _register_bridge_feedback(self, chatid, chattype, msgid, text):
+        """Register a diverted message for transition notices.
+
+        NO arrival ack is sent (aligned with Weixin 2026-10-09):
+        the think stream signals receipt. The record is marked
+        queued only when the bridge already has work running or
+        queued and this message is not itself the running one —
+        an idle bridge starts its turn at once, so there is nothing
+        to announce. Stop imperatives are never tracked: they are
+        handled by the cancel path, not the queue. Fire-and-forget:
+        any failure is logged and swallowed."""
         try:
-            active, queued = _bridge_snapshot("wecom")
-            if not active and not queued:
-                return
             mid = str(msgid or "")
-            ahead = queued.index(mid) if mid in queued else len(queued)
-            ack = BRIDGE_ACK_TEMPLATE.format(n=ahead + 1)
-            self.append_jsonl(OUTBOX, {
-                "id": f"softack-{uuid.uuid4().hex}",
-                "mode": "send",
-                "chatid": chatid,
-                "chat_type": 2 if chattype == "group" else 1,
-                "content": ack,
-            })
-            log(f"bridge ack queued for chat {chatid}: {ack}")
+            if not mid or is_stop_request(text):
+                return
+            track = getattr(self, "feedback_track", None)
+            if track is None:
+                track = self.feedback_track = {}
+            now = time.time()
+            active, queued = _bridge_snapshot("wecom")
+            active_ids = {str(a.get("msgid", "")) for a in active
+                          if isinstance(a, dict)}
+            track[mid] = {
+                "chatid": chatid, "chattype": chattype, "ts": now,
+                "excerpt": _excerpt(text or "", 20),
+                "queued": bool((active or queued)
+                               and mid not in active_ids),
+                "queued_at": now, "started_notice": False,
+                "wait_reminded": False, "via_bridge": True,
+            }
+            # Prune records that never got a reply (same 7200s rule
+            # as the Weixin arrival classifier) so the dict cannot
+            # grow or poison later scans.
+            for m in [m for m, r in track.items()
+                      if now - r.get("ts", now) > 7200]:
+                track.pop(m, None)
         except Exception as e:
-            log(f"bridge ack failed (ignored): {e!r}")
+            log(f"bridge feedback register failed (ignored): {e!r}")
+
+    def _feedback_on_reply(self, msgid):
+        """Close a message's feedback record once its formal reply
+        (or reply_file) has been delivered ok — the Weixin hook of
+        the same name, called from dispatch_outbox_item."""
+        try:
+            track = getattr(self, "feedback_track", None)
+            if track is not None and msgid:
+                track.pop(str(msgid), None)
+        except Exception:
+            pass
+
+    def _feedback_scan_once(self, now=None):
+        """Transition notices for bridge-queued messages: poll the
+        bridge queue snapshot once and queue, per tracked queued
+        message,
+        - a "started" notice when it moves queued -> active, and
+        - one "still waiting" reminder when it has sat in the
+          bridge queue for WAIT_REMIND_SECS.
+        A message the bridge merged into the running turn (snapshot
+        active entry flagged merged) never "starts" on its own, so
+        its started notice is suppressed for good — the bound
+        pointer reply the bridge sends for it closes the record via
+        _feedback_on_reply instead. Fail-silent; returns the number
+        of notices queued."""
+        try:
+            now = now or time.time()
+            track = getattr(self, "feedback_track", None)
+            if not track:
+                return 0
+            b_active, b_queued = _bridge_snapshot("wecom")
+            b_active_ids = {str(a.get("msgid", "")) for a in b_active
+                            if isinstance(a, dict)}
+            b_merged_ids = {str(a.get("msgid", "")) for a in b_active
+                            if isinstance(a, dict) and a.get("merged")}
+            b_pos = {str(m): i + 1 for i, m in enumerate(b_queued)}
+            sent = 0
+            for mid, rec in list(track.items()):
+                if not rec.get("via_bridge") or not rec.get("queued"):
+                    continue
+                if now - float(rec.get("ts") or now) > 7200:
+                    track.pop(mid, None)
+                    continue
+                chatid = rec.get("chatid", "")
+                if not chatid:
+                    continue
+                if mid in b_merged_ids and not rec.get("started_notice"):
+                    rec["started_notice"] = True
+                elif mid in b_active_ids and not rec.get("started_notice"):
+                    rec["started_notice"] = True
+                    if self._queue_notice(
+                            chatid, rec.get("chattype", ""),
+                            STARTED_NOTICE_TEMPLATE.format(
+                                excerpt=rec.get("excerpt", "")),
+                            "started"):
+                        sent += 1
+                elif mid in b_pos and not rec.get("wait_reminded"):
+                    waited = now - float(rec.get("queued_at") or now)
+                    if waited >= WAIT_REMIND_SECS:
+                        rec["wait_reminded"] = True
+                        if self._queue_notice(
+                                chatid, rec.get("chattype", ""),
+                                BRIDGE_WAIT_TEMPLATE.format(
+                                    n=b_pos[mid],
+                                    dur=_dur_str(waited)),
+                                "waitremind"):
+                            sent += 1
+            return sent
+        except Exception as e:
+            log(f"feedback scan failed (ignored): {e!r}")
+            return 0
+
+    async def feedback_watch_loop(self) -> None:
+        """Drive _feedback_scan_once every few seconds for the life
+        of a session (started alongside the outbox loop, same
+        cadence and fail-silent style as the Weixin watch loop)."""
+        while True:
+            await asyncio.sleep(4.0)
+            try:
+                await asyncio.to_thread(self._feedback_scan_once)
+            except Exception as e:
+                log(f"feedback watch failed (ignored): {e!r}")
 
     async def handle_message_callback(self, frame: dict) -> None:
         body = frame.get("body", {}) or {}
@@ -1884,16 +2116,26 @@ class Gateway:
                 self.append_jsonl(INBOX, entry)
             self._mark_seen(msgid)
             if not diverted:
-                # Soft ack: if a batch is in flight this message just
-                # joined the pending queue — acknowledge immediately
-                # instead of leaving the user in silence. Never
-                # raises; queue semantics are unchanged.
-                self._maybe_soft_ack(chatid, chattype, text)
+                # Cold-lane soft ack DISABLED (2026-10-09, user order
+                # after live voice-burst incident): the old
+                # _maybe_soft_ack fired a "排队第 N 位" notice the
+                # moment any batch was in flight, even when the wait
+                # was seconds, and repeated it per message in a burst.
+                # The user ordered that queue-position notice gone.
+                # The think stream opened below is the receipt signal
+                # on this lane. _maybe_soft_ack / soft_ack_text are
+                # kept defined (unused here) for rollback and for the
+                # unit tests that exercise them directly; queue
+                # semantics are unchanged.
+                pass
             elif diverted:
-                # Bridge lane: no cold soft ack, but if the bridge is
-                # busy the user still deserves a queue notice in
-                # bridge terms.
-                self._maybe_bridge_ack(chatid, chattype, msgid)
+                # Bridge lane (2026-10-09, aligned with Weixin): no
+                # cold soft ack AND no bridge queue ack — the think
+                # stream below already signals receipt. The message
+                # is only registered for the feedback scan's
+                # started / long-wait transition notices.
+                self._register_bridge_feedback(
+                    chatid, chattype, msgid, text)
             # Official pattern (SDK example + OpenClaw plugin): open a
             # stream reply immediately whose content is the native think
             # marker "<think></think>" — the WeCom client renders its own
@@ -2348,6 +2590,98 @@ class Gateway:
     def _outbox_offset(self) -> int:
         return read_offset(OUTBOX_OFFSET)
 
+    # ---------- outbound coalescing (v2 idle-gap, 2026-10-09) ----------
+    # Integration of wecom_outbound_coalesce_v2.Coalescer into the
+    # outbox loop, per that module's contract: every main-queue row
+    # is fed through the coalescer; only unbound "send" rows buffer
+    # (idle-gap / max-wait flush via due() once per tick), every
+    # other mode is a barrier that flushes pending buffers first and
+    # then dispatches itself, preserving order. Accounting choice
+    # (conservative): a buffered send row is CONSUMED from the main
+    # queue when fed — its payload lives in _coalesce_pending — and
+    # the merged dispatch accounts per ORIGINAL row id (one result
+    # row each; on failure each original is parked individually via
+    # _note_failure, so the retry lane re-dispatches it on its own,
+    # unmerged). The retry lane itself is NOT coalesced: parked rows
+    # keep the exact pre-2026-10-09 single-row failure semantics.
+
+    def _get_coalescer(self):
+        """The session's Coalescer, built lazily; None when the
+        module could not be loaded (outbox then dispatches rows
+        directly, exactly as before)."""
+        co = getattr(self, "_coalescer", None)
+        if co is None and Coalescer is not None:
+            co = Coalescer()
+            self._coalescer = co
+            if not hasattr(self, "_coalesce_pending"):
+                self._coalesce_pending = {}
+        return co
+
+    def _coalesce_feed(self, item: dict) -> list:
+        """Feed one main-queue row; return rows ready to dispatch
+        (flushed merged sends and/or the row itself as a barrier).
+        Fail-silent: a coalescer error falls back to dispatching
+        the row directly (barriers) or keeping a send row buffered
+        for the next due() flush (it is already registered in
+        _coalesce_pending, so it cannot be lost silently)."""
+        co = self._get_coalescer()
+        if co is None:
+            return [item]
+        if item.get("mode") == "send" and item.get("id"):
+            self._coalesce_pending[str(item["id"])] = item
+        try:
+            return co.feed(item)
+        except Exception as e:
+            log(f"coalesce feed failed (ignored): {e!r}")
+            return [item] if item.get("mode") != "send" else []
+
+    async def _dispatch_outbox_ready(self, ready: dict) -> bool:
+        """Dispatch one coalescer-ready row with per-original-id
+        accounting (the main pass's ok -> cleanup / fail -> park
+        rule, applied to EVERY original row a merged send stands
+        for). A merged row is dispatched once, enriched with the
+        first original row's fields the merged dict drops (e.g.
+        chat_type); dispatch writes the first id's result row, and
+        one extra result row is written here per remaining id."""
+        merged_ids = [str(m) for m in (ready.get("merged_ids") or [])]
+        if not merged_ids:
+            ok = await self.dispatch_outbox_item(ready)
+            item_id = str(ready.get("id") or "")
+            if ok:
+                self._cleanup_item(item_id)
+            else:
+                self._note_failure(ready)
+            return ok
+        pending = getattr(self, "_coalesce_pending", {})
+        originals = []
+        for mid_ in merged_ids:
+            orig = pending.pop(mid_, None)
+            if orig is not None:
+                originals.append(orig)
+        dispatch_item = dict(originals[0]) if originals else {}
+        for k, v in ready.items():
+            if k != "merged_ids":
+                dispatch_item[k] = v
+        dispatch_item["id"] = merged_ids[0]
+        dispatch_item["mode"] = "send"
+        dispatch_item["content"] = ready.get("content", "")
+        ok = await self.dispatch_outbox_item(dispatch_item)
+        for extra_id in merged_ids[1:]:
+            self.append_jsonl(OUTBOX_RESULTS, {
+                "id": extra_id, "mode": "send",
+                "ts": int(time.time()), "ok": bool(ok),
+                "errmsg": "" if ok else
+                "merged send failed; parked for individual retry",
+                "merged_into": merged_ids[0],
+            })
+        if ok:
+            for oid in merged_ids:
+                self._cleanup_item(oid)
+        else:
+            for orig in originals:
+                self._note_failure(orig)
+        return ok
+
     async def outbox_loop(self) -> None:
         """Park-and-continue outbox (2026-10-06): the main queue
         NEVER waits behind a failing row. Each cycle: (1) drain the
@@ -2362,6 +2696,19 @@ class Gateway:
         while True:
             await asyncio.sleep(1.0)
             await self.check_stream_watchdog()
+            # ---- coalescer due pass (2026-10-09) ----
+            # Buffers whose idle gap / max-wait cap is reached go
+            # out BEFORE any newer main-queue rows are read, so
+            # arrival order is preserved across the tick boundary.
+            _co = self._get_coalescer()
+            if _co is not None:
+                try:
+                    _due_rows = _co.due()
+                except Exception as e:
+                    log(f"coalesce due failed (ignored): {e!r}")
+                    _due_rows = []
+                for _ready in _due_rows:
+                    await self._dispatch_outbox_ready(_ready)
             # ---- main queue pass ----
             if OUTBOX.exists():
                 offset = self._outbox_offset()
@@ -2402,11 +2749,17 @@ class Gateway:
                             except OSError:
                                 pass
                             continue
-                        ok = await self.dispatch_outbox_item(item)
-                        if ok:
-                            self._cleanup_item(item_id)
-                        else:
-                            self._note_failure(item)
+                        # Coalescer (2026-10-09): the row is fed
+                        # first; whatever comes back ready (flushed
+                        # merged sends, then the row itself when it
+                        # is a barrier) is dispatched in order, each
+                        # with per-original-id accounting inside
+                        # _dispatch_outbox_ready. A buffered send
+                        # returns nothing here and is dispatched by
+                        # a later due() pass — it still counts as
+                        # consumed below.
+                        for _ready in self._coalesce_feed(item):
+                            await self._dispatch_outbox_ready(_ready)
                         # Success, park and dead-letter ALL advance
                         # the offset: the main queue moves on.
                         consumed += len(raw_line) + 1
@@ -2755,6 +3108,11 @@ class Gateway:
             result["errmsg"] = f"exception: {e}"
         self.append_jsonl(OUTBOX_RESULTS, result)
         log(f"outbox {mode} {item_id}: ok={result['ok']} err={result.get('errmsg', '')}")
+        if result["ok"] and mode in ("reply", "reply_file"):
+            # The round is closed: drop its bridge-feedback record
+            # so no started/wait notice can fire for it afterwards
+            # (2026-10-09, same hook as the Weixin gateway).
+            self._feedback_on_reply(item.get("msgid", ""))
         self.write_status()
         return bool(result["ok"])
 
@@ -2794,6 +3152,7 @@ class Gateway:
                 asyncio.create_task(self.reader_loop()),
                 asyncio.create_task(self.heartbeat_loop()),
                 asyncio.create_task(self.outbox_loop()),
+                asyncio.create_task(self.feedback_watch_loop()),
             ]
             try:
                 done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)

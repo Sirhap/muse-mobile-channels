@@ -129,9 +129,11 @@ def run_park_scenario():
 
     g = wc.Gateway.__new__(wc.Gateway)
     dispatched = []
+    dispatched_contents = []
 
     async def fail_only_stuck(item):
         dispatched.append(item.get("id"))
+        dispatched_contents.append(item.get("content", ""))
         return item.get("id") != "stuckreply"
 
     async def no_watchdog():
@@ -159,14 +161,19 @@ def run_park_scenario():
     off = int(wc.OUTBOX_OFFSET.read_text())
     parked = json.loads(wc.OUTBOX_PARKED.read_text())
     retry = json.loads(wc.OUTBOX_RETRY.read_text())
-    return off, dispatched, parked, retry
+    return off, dispatched, parked, retry, dispatched_contents
 
 
-off, dispatched, parked, retry = run_park_scenario()
+off, dispatched, parked, retry, dispatched_contents = run_park_scenario()
 check("main queue fully consumed despite stuck head",
       off >= wc.OUTBOX.stat().st_size)
+# Updated 2026-10-09 (coalescer v2 integrated): the two "send" rows
+# behind the stuck head now merge into ONE dispatch under the first
+# row's id, so "thirdrow" no longer appears as its own dispatch —
+# what matters is that both contents were delivered promptly.
 check("rows behind the stuck head were dispatched promptly",
-      "laterow" in dispatched and "thirdrow" in dispatched)
+      "laterow" in dispatched
+      and any("第三条" in c for c in dispatched_contents))
 check("stuck formal row is parked with payload, not dropped",
       "stuckreply" in parked
       and int(parked["stuckreply"].get("n") or 0) >= 2

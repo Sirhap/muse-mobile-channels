@@ -8,9 +8,11 @@ MERGE_CHANNELS. A merged msgid must be closed out gateway-side:
   feedback_clear.jsonl, which the Weixin gateway's feedback scan
   consumes (_consume_feedback_clear in weixin-bot/gateway.py);
   a failed write falls back to the bound pointer reply.
-- wecom: the WeCom gateway has NO feedback track/scan and never
-  reads feedback_clear.jsonl, and every diverted message holds an
-  open think stream that only a bound reply finishes in place.
+- wecom: the WeCom gateway never reads feedback_clear.jsonl
+  (it gained a feedback track/scan for started/wait notices on
+  2026-10-09, but no clear-file consumption), and every diverted
+  message holds an open think stream that only a bound reply
+  finishes in place.
   A silently-cleared msgid would hang until the stream watchdog
   (~540s) closes it with a false "taking too long" bubble, so the
   bridge must send the bound pointer reply directly.
@@ -106,14 +108,19 @@ check("weixin fallback: pointer reply on write failure",
       and wx2_rows[0].get("msgid") == "wx-merged-2"
       and wx2_rows[0].get("content") == nb.MERGE_POINTER_TEXT)
 
-# 5. Decision premise: the WeCom gateway really has no feedback
-#    scan/track and no feedback_clear consumption. If this ever
-#    fails, the routing in _silence_merged must be revisited.
+# 5. Decision premise (updated 2026-10-09): the WeCom gateway now
+#    HAS a feedback scan/track (wecom-align: started/wait notices
+#    ported from Weixin), but it still does NOT consume
+#    feedback_clear, and a merged msgid's think stream still needs
+#    a bound reply to finish in place — so the bridge routing in
+#    _silence_merged (pointer reply for wecom) is unchanged. The
+#    gateway's scan suppresses the started notice for merged
+#    msgids instead (bridge snapshot merged flag).
 wcgw = (ROOT / "wecom-bot" / "gateway.py").read_text(encoding="utf-8")
 check("premise: wecom gateway has no feedback_clear consumer",
       "feedback_clear" not in wcgw)
-check("premise: wecom gateway has no feedback scan/track",
-      "_feedback_scan_once" not in wcgw and "feedback_track" not in wcgw)
+check("premise: wecom gateway now has feedback scan/track (2026-10-09)",
+      "_feedback_scan_once" in wcgw and "feedback_track" in wcgw)
 check("premise: wecom stream watchdog exists (hang would surface)",
       "check_stream_watchdog" in wcgw)
 
