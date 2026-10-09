@@ -981,7 +981,10 @@ class ChannelWorker(threading.Thread):
         # update. If it is at least as new as every progress row,
         # drop history_dirty so step() does not add 「还在处理中」
         # beside that reply (including a dirty flag left pending
-        # by the 60s notice throttle).
+        # by the 60s notice throttle). activity_dirty is the same
+        # kind of flag but activity.list has no seq; it is cleared
+        # after the reply is delivered and this poll's activity
+        # fold, in _clear_superseded_activity_dirty.
         self._clear_superseded_history_dirty(turn, evs)
 
     def _clear_superseded_history_dirty(self, turn, evs):
@@ -1004,6 +1007,36 @@ class ChannelWorker(threading.Thread):
         if newest_reply and newest_reply >= newest_progress:
             turn["history_dirty"] = False
             self._turns_dirty = True
+
+    def _clear_superseded_activity_dirty(self, turn):
+        """Clear activity_dirty when a delivered reply already covers it.
+
+        Counterpart of _clear_superseded_history_dirty. activity.list
+        is not ordered by history seq, so the reply's last_reply_at
+        is the line: an event at or before that instant is the work
+        the reply just reported, and step() must not send
+        「还在处理中」 for it in the same turn. An event strictly
+        after last_reply_at is newer work and stays dirty.
+        Called after the reply has been delivered and after this
+        poll's _poll_activity, because that fold can set the flag
+        later than the history clear.
+        """
+        if not turn.get("activity_dirty") or not turn.get("reply_delivered"):
+            return
+        replied_at = turn.get("last_reply_at") or 0
+        if not replied_at:
+            return
+        newest = 0.0
+        for act in turn.get("activities") or []:
+            if not isinstance(act, dict):
+                continue
+            ts = _activity_ts_epoch(act.get("ts"))
+            if ts is not None and ts > newest:
+                newest = ts
+        if newest > replied_at:
+            return
+        turn["activity_dirty"] = False
+        self._turns_dirty = True
 
     def _outbox_ok_label(self, turn):
         """'true' / 'false' / 'pending' for the bound reply's outbox row."""
@@ -1100,6 +1133,7 @@ class ChannelWorker(threading.Thread):
             if self._poll_activity(turn):
                 turn["activity_dirty"] = True
                 self._turns_dirty = True
+            self._clear_superseded_activity_dirty(turn)
             status = self._session_status(turn["session_id"])
             if status is not None and status != turn.get("sess_status"):
                 turn["sess_status"] = status
