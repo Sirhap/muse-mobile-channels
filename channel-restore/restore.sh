@@ -195,6 +195,7 @@ main() {
   heal_one wecom-bot wecom-bot "$HOME_DIR/.config/wecom-bot/credentials.env" || FAIL=1
   heal_one weixin-bot weixin-bot "$HOME_DIR/.config/weixin-bot/credentials.env" || FAIL=1
   heal_bridge "$WS" "$HOME_DIR" || FAIL=1
+  heal_relay "$WS" "$HOME_DIR" || FAIL=1
 
   if [[ "$FAIL" == "0" ]]; then
     echo "channel-restore: all gateways healthy"
@@ -204,6 +205,29 @@ main() {
   exit "$FAIL"
 }
 
+
+heal_relay() {
+  # approval-relay: egress approvals -> channel notices + decisions.
+  local WS="$1" HOME_DIR="$2"
+  local svc=approval-relay
+  local src="$WS/approval-relay/approval-relay.service"
+  local dst="/etc/systemd/system/$svc.service"
+  if [[ ! -f "$src" ]]; then
+    echo "$svc: FAIL workspace unit copy missing: $src"
+    return 1
+  fi
+  if [[ ! -f "$dst" ]] || ! cmp -s "$src" "$dst"; then
+    cp "$src" "$dst" && echo "$svc: unit (re)installed from workspace copy"
+    systemctl daemon-reload
+  fi
+  if ! systemctl is-enabled --quiet "$svc" 2>/dev/null; then
+    systemctl enable "$svc" >/dev/null 2>&1 && echo "$svc: enabled"
+  fi
+  if ! systemctl is-active --quiet "$svc" 2>/dev/null; then
+    systemctl start "$svc" 2>/dev/null && echo "$svc: started"
+  fi
+  systemctl is-active --quiet "$svc" 2>/dev/null && echo "$svc: active"
+}
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   main "$@"
 fi

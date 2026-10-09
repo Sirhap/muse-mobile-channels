@@ -196,8 +196,8 @@ HOOK_STATE_DIR = muse_home() / "hooks" / "state" / "weixin-bot"
 CLI_WRAPPER = BASE / "weixin"
 CHAN_LABEL = "个人微信"
 
-SLASH_COMMANDS = {"ping", "status", "stop", "new", "check", "queue", "help", "subagent"}
-SLASH_ALIASES = {"自检": "check", "命令": "help", "副助手": "subagent", "新会话": "new"}
+SLASH_COMMANDS = {"ping", "status", "stop", "new", "check", "queue", "help", "subagent", "approvals", "approve", "deny"}
+SLASH_ALIASES = {"自检": "check", "命令": "help", "副助手": "subagent", "新会话": "new", "审批": "approvals", "批准": "approve", "拒绝": "deny"}
 
 # User-facing times in acks are rendered in the user's timezone; the VM
 # itself runs UTC, so plain localtime would show times 8h off.
@@ -674,6 +674,8 @@ SLASH_HELP_TEXT = """【命令表】在聊天里直接发，网关秒回、不�
 /new 开新会话：换一个全新的原生会话，之前的对话不再带入（别名 /新会话）
 /check 一次性自检，跑完即结束（别名 /自检）
 /help 本命令表（别名 /命令）
+/审批 待审批列表（网络/浏览器类审批，出现时也会主动通知）
+/批准 N 批准第 N 条（仅这次）；/批准 N 永久 永久批准同类；/拒绝 N 拒绝
 注：只有以上是命令；其他以 / 开头的话会当普通消息处理。"""
 
 
@@ -1010,6 +1012,50 @@ def slash_subagent_stop_ack(hook_state_dir, job_id):
                        {"type": "stop", "job_id": job_id, "ts": time.time()})
     return f"已提交停止 #{job_id}，副助手会在下一个检查点停下并回一句确认。"
 
+
+
+# ---------- /审批 /批准 /拒绝: egress approval relay ----------
+# The relay (~/workspace/approval-relay/) polls egress.approvals and
+# owns state.json (number -> approval); the gateways only read that
+# state to render/validate and append the user's decision to
+# decisions.jsonl, which the relay submits via egress.approval.decide.
+APPROVAL_RELAY_DIR = Path("/home/hatch/workspace/approval-relay")
+
+
+def _approval_items():
+    st = _read_json_file(APPROVAL_RELAY_DIR / "state.json", {}) or {}
+    items = st.get("items") or {}
+    return {n: it for n, it in items.items() if isinstance(it, dict)}
+
+
+def slash_approvals_text():
+    items = _approval_items()
+    pend = [(n, it) for n, it in
+            sorted(items.items(), key=lambda kv: int(kv[0]))
+            if it.get("status") == "pending"]
+    if not pend:
+        return "当前没有待审批。新的审批出现时我会主动发通知。"
+    lines = ["【待审批】"]
+    for n, it in pend:
+        lines.append(f"#{n} {it.get('who', '')}：{str(it.get('what', ''))[:60]}")
+    lines.append("回 /批准 N（仅这次）｜/批准 N 永久｜/拒绝 N")
+    return "\n".join(lines)
+
+
+def slash_approval_decide_ack(num, decision, channel):
+    items = _approval_items()
+    it = items.get(str(num))
+    if it is None:
+        return f"没有找到审批 #{num}。发 /审批 看当前列表。"
+    if it.get("status") != "pending":
+        return f"审批 #{num} 已经处理过了。"
+    label = {"allow_once": "批准（仅这次）", "allow_always": "批准（永久）",
+             "deny": "拒绝"}[decision]
+    if _append_jsonl_file(APPROVAL_RELAY_DIR / "decisions.jsonl",
+                          {"num": str(num), "decision": decision,
+                           "channel": channel, "ts": time.time()}):
+        return f"已提交{label} #{num}：{it.get('who', '')}。执行结果马上发你。"
+    return "提交失败：暂时写不了审批指令，请稍后再试。"
 
 
 # --- Subagent reply label enforcement (fix #2, 2026-10-04) -----
@@ -1623,6 +1669,19 @@ class Gateway:
                                "后台执行中，主对话不受影响；查进度：/subagent list")
                     else:
                         ack = "派发失败：暂时无法登记副助手任务，请稍后再试。"
+            elif name == "approvals":
+                ack = slash_approvals_text()
+            elif name in ("approve", "deny"):
+                toks = arg.split()
+                num = toks[0] if toks else ""
+                if not num.isdigit():
+                    ack = "用法：/批准 N（仅这次）、/批准 N 永久、/拒绝 N；N 发 /审批 查看。"
+                elif name == "deny":
+                    ack = slash_approval_decide_ack(num, "deny", "weixin")
+                elif len(toks) > 1 and toks[1] == "永久":
+                    ack = slash_approval_decide_ack(num, "allow_always", "weixin")
+                else:
+                    ack = slash_approval_decide_ack(num, "allow_once", "weixin")
             if ack is not None:
                 await self._send_slash_ack(client, creds, msg, from_user, ack)
             log(f"slash /{name} handled for {from_user}")
