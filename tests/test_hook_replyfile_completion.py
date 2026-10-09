@@ -19,21 +19,24 @@ S11 msgid answered only via reply_file + starvation carried=3
 S12 active batch + reply_file queued but result cancelled, old
     -> NOT completion (queued-but-undelivered still never counts
     as answered); and since the 2026-10-09 deathwatch order a
-    batch with no heartbeat and no outbox activity for
-    DEATH_WATCH_SECS (1800) is judged interrupted: fail-stop
-    (cancel + one failure notice, batch closed). The 2026-10-07
-    no-cap order still protects LIVE batches — no duration cap —
-    only life-sign silence is judged.
+    batch with no worker push for DEATH_WATCH_SECS (1800) is
+    judged interrupted. Status-push fix (same evening): the
+    FIRST loss auto-resumes once (re-wake + factual resume
+    notice, no cancel); only a SECOND loss fail-stops (cancel +
+    factual stop notice, batch closed). The 2026-10-07 no-cap
+    order still protects LIVE batches — no duration cap — only
+    loss of the worker's own pushes is judged (the detached
+    heartbeat file no longer counts as a life sign).
 S13 active batch + formal reply parked in the retry lane
     -> batch stays alive past cap: no fail-stop, not completed
 S14 detached batch + DELIVERED bound send row -> dropped silently
 S15 detached batch + reply queued but cancelled, old
-    -> deathwatch fires before silent retirement: fail-stop
-    (cancel + failure notice, detached dropped), NOT retired
-    to the graveyard
+    -> deathwatch fires before silent retirement: first loss
+    auto-resumes once (re-wake + notice, detached dropped),
+    NOT retired to the graveyard
 S1c control: silent batch, no outbox rows -> deathwatch
-    fail-stop at 1800s of life-sign silence (2026-10-09 order,
-    superseding the no-judgement part of the 2026-10-07 order)
+    first-loss auto-resume at 1800s without a worker push
+    (2026-10-09 orders; fail-stop only on the second loss)
 
 Fixture ages were rescaled on 2026-10-07 when the user raised
 BATCH_CAP_SECS 600 -> 3600: "aged past cap" fixtures now use
@@ -178,13 +181,16 @@ def run_channel(chan, botdir, hookst, script_name, cli_relpath, entry_fn):
     results([{"id": "RF5", "mode": "reply_file", "ok": False,
               "errmsg": "cancelled", "ts": NOW - 4940}])
     out = run_hook()
-    # Deathwatch (2026-10-09): last life sign is the queued reply
-    # row 4950s ago, no heartbeat -> judged interrupted: the batch
-    # is fail-stopped (cancel + failure notice), never completed.
-    check("S12 deathwatch fail-stop on cancelled reply",
-          "CALL: cancel" in calls() and "任务执行失败" in calls())
-    check("S12 batch closed by fail-stop, not completed",
-          not batch().get("msgids"))
+    # Deathwatch (2026-10-09; status-push fix same evening): the
+    # last worker push is the queued reply row 4950s ago -> first
+    # loss of worker pushes: auto-resume once (re-wake + resume
+    # notice), NOT cancelled, NOT completed either.
+    check("S12 first silence auto-resumes (no cancel, no fail notice)",
+          "CALL: cancel" not in calls() and "任务已停止" not in calls()
+          and "任务执行失败" not in calls()
+          and "自动续跑一次" in calls())
+    check("S12 batch re-woken as the resume batch, not completed",
+          batch().get("msgids") == ["F5"])
 
     # S13 formal reply parked in the retry lane keeps the batch alive
     reset()
@@ -228,14 +234,18 @@ def run_channel(chan, botdir, hookst, script_name, cli_relpath, entry_fn):
     results([{"id": "RF8", "mode": "reply", "ok": False,
               "errmsg": "cancelled", "ts": NOW - 4940}])
     out = run_hook()
-    # Deathwatch (2026-10-09) supersedes silent retirement: a
-    # detached batch with no life sign for 1800s is fail-stopped
-    # (cancel + failure notice) BEFORE the 3600s retire window,
-    # so the user is told instead of the batch vanishing quietly.
-    check("S15 detached deathwatch fail-stop on cancelled reply",
-          "CALL: cancel" in calls() and "任务执行失败" in calls())
-    check("S15 detached dropped, NOT silently retired",
-          not batch().get("detached") and "F8" not in retired())
+    # Deathwatch (2026-10-09; status-push fix same evening)
+    # supersedes silent retirement: a detached batch with no
+    # worker push for 1800s is auto-resumed once (re-wake +
+    # factual notice) BEFORE the 3600s retire window, so the user
+    # is told instead of the batch vanishing quietly.
+    check("S15 detached first silence auto-resumes (no cancel)",
+          "CALL: cancel" not in calls()
+          and "自动续跑一次" in calls()
+          and "任务执行失败" not in calls())
+    check("S15 detached dropped, re-woken active, NOT silently retired",
+          not batch().get("detached") and "F8" not in retired()
+          and batch().get("msgids") == ["F8"])
 
     # S11 reply_file counts as bound for starvation
     reset()
@@ -254,13 +264,16 @@ def run_channel(chan, botdir, hookst, script_name, cli_relpath, entry_fn):
     hookst_w("carried_msgids.txt", "D1\n")
     hookst_w("active_batch.json", {"msgids": ["D1"], "since": NOW - 3700, "detached": []})
     out = run_hook()
-    # Deathwatch (2026-10-09): 3700s with no heartbeat and no
-    # outbox activity = no life sign -> fail-stop (cancel +
-    # failure notice, batch closed). Live batches remain
-    # uncapped; only silence is judged.
-    check("S1c silent batch fail-stopped by deathwatch",
-          "CALL: cancel" in calls() and "任务执行失败" in calls()
-          and not batch().get("msgids"))
+    # Deathwatch (2026-10-09; status-push fix same evening):
+    # 3700s with no worker push at all = first loss -> auto-resume
+    # once (re-wake + factual resume notice, no cancel). A second
+    # loss would fail-stop. Live batches remain uncapped; only
+    # loss of the worker's own pushes is judged.
+    check("S1c silent batch auto-resumed once by deathwatch",
+          "CALL: cancel" not in calls()
+          and "自动续跑一次" in calls()
+          and "任务执行失败" not in calls()
+          and batch().get("msgids") == ["D1"])
 
 
 def wx_entry(mid, ts, text="发个图片"):
