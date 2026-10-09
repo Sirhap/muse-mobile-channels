@@ -85,6 +85,25 @@ BATCH_CAP_SECS = float("inf")
 # fail-stop block below). Queued-message preemption
 # (PREEMPT_WAIT_SECS) is unchanged, so new messages still cut in
 # just as fast; only the presumed-dead judgement waits longer.
+# (2026-10-09: that judgement now lives in DEATH_WATCH_SECS
+# below; BATCH_CAP_SECS itself stays float("inf") as above.)
+DEATH_WATCH_SECS = 1800
+# Death watch (2026-10-09): this is NOT a task-duration cap. A
+# batch with a heartbeat or any outbox progress keeps running
+# without limit, exactly as the 2026-10-07 "没有上限" order
+# requires. What it judges is total loss of life signs: the
+# worker heartbeat (heartbeat.py) ticks every 60s and a single
+# worker loop self-terminates within 900s (a live worker
+# re-arms or sends an update), so when heartbeat AND outbox
+# activity have BOTH been absent for DEATH_WATCH_SECS — twice
+# the longest possible silent-but-alive window — the worker
+# is not pausing, it is gone (real incident 2026-10-09: a
+# WeCom voice long task's heartbeat stopped ~15:22 and the
+# batch hung silently forever under the no-cap rule). Such a
+# batch is declared interrupted and handled with the
+# 2026-10-05 fail-stop semantics: msgids cancelled, ONE
+# failure notice sent, never auto-re-dispatched — retrying
+# is the user's call.
 CLAIM_TTL_SECS = 600
 # Preemption: queued messages must not wait behind a heartbeating long
 # batch forever. If the oldest queued message has waited
@@ -360,9 +379,13 @@ if batch_active:
             last_activity = _parked_mtime
     if batch_replied:
         batch_done = True
-    elif now - last_activity >= BATCH_CAP_SECS:
+    elif now - last_activity >= DEATH_WATCH_SECS:
         # Fail-stop (user spec, 2026-10-05): no reply, no outbox
-        # activity and no heartbeat for a full cap window = dead.
+        # activity and no heartbeat for a full death-watch
+        # window (DEATH_WATCH_SECS, 2026-10-09) = dead. Since
+        # 2026-10-07 BATCH_CAP_SECS is float("inf") and no longer
+        # gates this branch; the death watch keys on total loss
+        # of life signs, never on task age.
         # The messages are NOT handed to a takeover worker for a
         # late answer; the fail-stop block below cancels them and
         # sends one failure notice instead.
@@ -445,6 +468,20 @@ if detached:
             if _parked_mtime > dlast:
                 dlast = _parked_mtime
         if dreplied:
+            continue
+        if now - dlast >= DEATH_WATCH_SECS:
+            # Death watch (2026-10-09): heartbeat and outbox
+            # activity both gone for DEATH_WATCH_SECS — same
+            # fail-stop as the active batch (the fail-stop
+            # block cancels + notifies) and the entry is
+            # dropped. This runs BEFORE the retire branch
+            # below, so a dead detached batch is reported to
+            # the user instead of silently retiring at
+            # DETACHED_RETIRE_SECS with no notice at all.
+            for mid in d.get("msgids") or []:
+                e = by_id.get(mid)
+                if e is not None and e not in failed_entries:
+                    failed_entries.append(e)
             continue
         if now - dlast >= DETACHED_RETIRE_SECS:
             # Zombie retirement (2026-10-07): no delivered reply, no
@@ -563,9 +600,11 @@ if not dry:
             _t = (_e0.get("text") or "").strip() or "（无文字消息）"
             _notice = ("⏳ 提醒：任务「" + _t[:20] + "」已约 "
                        + str(_mins)
-                       + " 分钟没有任何进展（也没报错）。按你定的规矩"
-                         "它不会被自动停止，会继续挂着；要取消回 /stop，"
-                         "想让我接着办就说一声。")
+                       + " 分钟没有任何进展（也没报错）。"
+                         "有心跳或进展它就一直跑、没有时长上限；"
+                         "但若满 30 分钟始终没有任何心跳和进展，"
+                         "我会判定它已中断并向你报告，不会假装还在跑。"
+                         "要取消回 /stop。")
             _sent = False
             try:
                 r = subprocess.run([cli_path, "send", "--chatid",
