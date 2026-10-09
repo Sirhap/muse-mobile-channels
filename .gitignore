@@ -21,6 +21,9 @@
 !/tests/*.py
 !/docs/
 !/docs/*.md
+!/native-probe/
+!/native-probe/gw2.py
+!/native-probe/README.md
 !/slash-commands-2026-10-04.md
 !/native-bridge/
 !/native-bridge/native_bridge.py
