@@ -13,7 +13,15 @@ https://developer.work.weixin.qq.com/document/path/101463 :
 - replies / proactive messages queued in state/outbox.jsonl by the CLI
   (or the agent) are sent over the same connection:
     mode "reply" -> aibot_respond_msg using the original callback req_id
-                    (valid for 24h after the callback)
+                    (valid for 24h after the callback). Finishes the
+                    inbound think stream only when no earlier notice
+                    has already locked that bubble.
+    mode "reply_notice" -> aibot_respond_msg on that same req_id.
+                    The first notice finishes the think stream in
+                    place. Later notices use a new stream id, so the
+                    client shows them in outbox order instead of
+                    leaving them under a reply that rewrote the
+                    original bubble.
     mode "send"  -> aibot_send_msg (proactive; the target chat must have
                     messaged the bot before)
 - connection state is mirrored to state/status.json
@@ -1951,22 +1959,31 @@ class Gateway:
     # ---------- bridge-lane arrival feedback (2026-10-09) ----------
     # Ported from the Weixin gateway's diverted branch of
     # _maybe_arrival_feedback + _feedback_scan_once, adapted to the
-    # WeCom architecture: notices are unbound outbox "send" rows
-    # addressed by chatid (WeCom has no per-user send addressing, and
-    # the think stream of the message itself is never touched).
+    # Notices share the callback reply chain (mode reply_notice).
+    # An unbound aibot_send_msg is a new bubble at send time, while
+    # the formal reply used to finish the think stream that was
+    # opened under the user message, so that text stayed above
+    # notices that had already been sent. reply_notice is dispatched
+    # on the same req_id, in outbox order.
 
-    def _queue_notice(self, chatid, chattype, content, prefix):
-        """Append one unbound outbox "send" row for a feedback
-        notice. Unbound rows carry no msgid, so they never count as
-        batch activity or completion for any message."""
+    def _queue_notice(self, chatid, chattype, content, prefix, msgid=""):
+        """Append one msgid-bound reply_notice row.
+
+        The row carries the msgid so dispatch can place it on that
+        message's aibot_respond_msg chain. chatid stays on the row
+        for the case where the callback route is already gone.
+        Unbound mode=send is not used: those bubbles sort apart from
+        the stream the formal reply finishes.
+        """
         self.append_jsonl(OUTBOX, {
             "id": f"{prefix}-{uuid.uuid4().hex}",
-            "mode": "send",
+            "mode": "reply_notice",
+            "msgid": str(msgid or ""),
             "chatid": chatid,
             "chat_type": 2 if chattype == "group" else 1,
             "content": content,
         })
-        log(f"{prefix} notice queued for chat {chatid}: {content}")
+        log(f"{prefix} notice queued for chat {chatid} msgid={msgid}: {content}")
         return True
 
     def _register_bridge_feedback(self, chatid, chattype, msgid, text):
@@ -2073,7 +2090,7 @@ class Gateway:
                             STARTED_NOTICE_TEMPLATE.format(
                                 excerpt=rec.get("excerpt", ""),
                                 code=str(mid)[:8]),
-                            "started"):
+                            "started", mid):
                         sent += 1
                 elif (rec.get("queued") and mid in b_pos
                       and not rec.get("wait_reminded")):
@@ -2086,7 +2103,7 @@ class Gateway:
                                     n=b_pos[mid],
                                     dur=_dur_str(waited),
                                     code=str(mid)[:8]),
-                                "waitremind"):
+                                "waitremind", mid):
                             sent += 1
             return sent
         except Exception as e:
@@ -3015,6 +3032,111 @@ class Gateway:
             except Exception as e:
                 log(f"retry lane pass failed (continuing): {e}")
 
+    def _mark_stream_committed(self, msgid: str) -> None:
+        """Remember that the inbound think stream already holds a final text.
+
+        WeCom keeps a stream bubble where it was created and only
+        changes its words when the same stream id is sent again.
+        Once this flag is set, later text must use a new stream id
+        so it cannot rewrite that earlier bubble.
+        """
+        key = str(msgid or "")
+        reqmap = getattr(self, "reqmap", None)
+        info = reqmap.get(key) if isinstance(reqmap, dict) else None
+        if isinstance(info, dict):
+            info["stream_committed"] = True
+            try:
+                self._save_reqmap()
+            except OSError as exc:
+                log(f"reqmap save failed: {exc!r}")
+        streams = getattr(self, "open_streams", None)
+        if isinstance(streams, dict):
+            streams.pop(key, None)
+
+    async def _deliver_followup_text(self, req_id: str, content: str) -> dict:
+        """One new bubble on the callback req_id, created now.
+
+        The first use of a stream id creates a message; reusing the
+        inbound stream id would update the bubble under the user
+        message instead. finish is true so this bubble cannot be
+        rewritten either. A hard stream error falls back to markdown
+        on the same req_id, which is also a new message.
+        """
+        resp = await self.respond(
+            req_id,
+            {
+                "msgtype": "stream",
+                "stream": {
+                    "id": uuid.uuid4().hex,
+                    "finish": True,
+                    "content": content,
+                },
+            },
+        )
+        if isinstance(resp, dict) and resp.get("errcode") in (0, -1):
+            return resp
+        log(f"follow-up stream failed errcode="
+            f"{resp.get('errcode') if isinstance(resp, dict) else None}; "
+            f"markdown on the same req_id")
+        fallback = await self.respond(
+            req_id,
+            {"msgtype": "markdown", "markdown": {"content": content}},
+        )
+        if isinstance(fallback, dict):
+            return fallback
+        return {"errcode": -1, "errmsg": "no response"}
+
+    async def _deliver_followup_chunks(
+        self, item_id: str, req_id: str, info: dict, chunks: list[str],
+    ) -> dict:
+        """Send every not-yet-acked chunk as its own new reply bubble."""
+        sent = int(self._partial_for(item_id).get("sent_chunks") or 0)
+        resp: dict = {"errcode": 0}
+        for index, part in enumerate(chunks):
+            if index < sent:
+                continue
+            resp = await self._deliver_followup_text(req_id, part)
+            if not isinstance(resp, dict) or resp.get("errcode") != 0:
+                if isinstance(resp, dict) and resp.get("errcode") not in (0, -1):
+                    chatid = str(info.get("chatid") or "")
+                    if chatid:
+                        chat_type = 2 if info.get("chattype") == "group" else 1
+                        return await self._send_markdown_chunks(
+                            item_id, chatid, chat_type, chunks, start=index)
+                if not isinstance(resp, dict):
+                    return {"errcode": -1, "errmsg": "no response"}
+                return resp
+            self._mark_partial(item_id, {
+                "sent_chunks": index + 1,
+                "stream_finish_sent": True,
+            })
+        return resp
+
+    async def _send_notice_proactive(self, item: dict, info: dict, content: str) -> dict:
+        """Last resort when the callback req_id is already gone."""
+        chatid = str(item.get("chatid") or info.get("chatid") or "")
+        if not chatid:
+            return {"errcode": -1, "errmsg": "no req_id or chatid for reply_notice"}
+        chat_type = item.get("chat_type")
+        if chat_type is None:
+            chat_type = 2 if info.get("chattype") == "group" else 1
+        frame = await self.send_frame(
+            {
+                "cmd": "aibot_send_msg",
+                "headers": {"req_id": self.new_req_id("send")},
+                "body": {
+                    "chatid": chatid,
+                    "chat_type": int(chat_type),
+                    "msgtype": "markdown",
+                    "markdown": {"content": content},
+                },
+            },
+            wait_response=True,
+        )
+        if isinstance(frame, dict):
+            return frame
+        return {"errcode": -1, "errmsg": "no response"}
+
     async def dispatch_outbox_item(self, item: dict) -> bool:
         item_id = item.get("id", "")
         mode = item.get("mode", "")
@@ -3033,7 +3155,7 @@ class Gateway:
         # duplicates. reply_file is the media that belongs with that
         # reply (bridge writes text, then file0..fileN) and must still
         # be sent. Same rule as the Weixin gateway.
-        if mode == "update" and _mid and self._delivered_reply_before(item):
+        if mode in ("update", "reply_notice") and _mid and self._delivered_reply_before(item):
             result["errmsg"] = "suppressed: msgid already has a delivered formal reply"
             result["suppressed"] = True
             self.append_jsonl(OUTBOX_RESULTS, result)
@@ -3067,9 +3189,21 @@ class Gateway:
                 chunks = split_chunks(content) or [""]
                 partial = self._partial_for(item_id)
                 resp = {"errcode": 0} if partial.get("stream_finish_sent") else None
-                if stream_id and resp is None:
-                    # Close the stream opened when the message arrived: this
-                    # replaces the "thinking" placeholder with the answer.
+                anchor_free = bool(stream_id) and not info.get("stream_committed")
+                if info.get("stream_committed"):
+                    # An earlier notice already finished the think
+                    # stream. A second finish on that id would replace
+                    # its text and leave the answer above those notices.
+                    sent_n = int(partial.get("sent_chunks") or 0)
+                    if sent_n >= len(chunks):
+                        resp = {"errcode": 0}
+                    else:
+                        resp = await self._deliver_followup_chunks(
+                            item_id, orig_req_id, info, chunks)
+                elif anchor_free and resp is None:
+                    # Nothing visible has taken the think bubble yet, so
+                    # the answer itself is the first line under the user
+                    # message. Close that stream in place.
                     resp = await self.respond(
                         orig_req_id,
                         {
@@ -3079,6 +3213,7 @@ class Gateway:
                     )
                     if resp.get("errcode") == 0:
                         self._mark_partial(item_id, {"stream_finish_sent": True, "sent_chunks": 1})
+                        self._mark_stream_committed(str(item.get("msgid") or ""))
                     elif resp.get("errcode") == -1:
                         log(f"outbox reply {item_id}: stream finish ack timed out; retrying the stream, not a second markdown")
                     elif resp.get("errcode") != 0:
@@ -3114,8 +3249,12 @@ class Gateway:
                                 f"proactive fallback (req_id dead)")
                 # Overflow chunks (reply longer than CHUNK_LIMIT) follow as
                 # active messages to the same chat. A retry skips chunks
-                # whose send already returned success.
-                if isinstance(resp, dict) and resp.get("errcode") == 0 and len(chunks) > 1:
+                # whose send already returned success. Follow-up delivery
+                # already sent every chunk on the reply chain; do not
+                # send those again.
+                already_sent = int(self._partial_for(item_id).get("sent_chunks") or 0)
+                if (isinstance(resp, dict) and resp.get("errcode") == 0
+                        and len(chunks) > 1 and already_sent < len(chunks)):
                     target_chatid = info.get("chatid", "")
                     chat_type = 2 if info.get("chattype") == "group" else 1
                     if not target_chatid:
@@ -3127,6 +3266,50 @@ class Gateway:
                         resp = await self._send_markdown_chunks(
                             item_id, target_chatid, chat_type, chunks, start=1,
                         )
+            elif mode == "reply_notice":
+                # Started / wait / progress. Same req_id as the formal
+                # reply, in outbox order. The first one finishes the
+                # think stream (that bubble stays under the user
+                # message, and finish=true means WeCom will not accept
+                # a later rewrite). Every later one is a new stream id.
+                text = content or ""
+                if not text.strip():
+                    result["errmsg"] = "empty reply_notice"
+                    self.append_jsonl(OUTBOX_RESULTS, result)
+                    log(f"outbox reply_notice {item_id}: {result['errmsg']}")
+                    return True
+                info = self.reqinfo(_mid)
+                req_id = str(info.get("req_id") or "")
+                stream_id = str(info.get("stream_id") or "")
+                if req_id and stream_id and not info.get("stream_committed"):
+                    resp = await self.respond(
+                        req_id,
+                        {
+                            "msgtype": "stream",
+                            "stream": {
+                                "id": stream_id,
+                                "finish": True,
+                                "content": text,
+                            },
+                        },
+                    )
+                    if isinstance(resp, dict) and resp.get("errcode") == 0:
+                        self._mark_stream_committed(_mid)
+                    elif isinstance(resp, dict) and resp.get("errcode") == -1:
+                        log(f"outbox reply_notice {item_id}: anchor finish timed out")
+                    else:
+                        # The anchor finish did not land. Deliver the
+                        # notice as its own bubble and lock the flag
+                        # anyway, so a formal reply later in this same
+                        # pass cannot finish the think stream and sit
+                        # above this notice.
+                        resp = await self._deliver_followup_text(req_id, text)
+                        if isinstance(resp, dict) and resp.get("errcode") == 0:
+                            self._mark_stream_committed(_mid)
+                elif req_id:
+                    resp = await self._deliver_followup_text(req_id, text)
+                else:
+                    resp = await self._send_notice_proactive(item, info, text)
             elif mode == "update":
                 info = self.reqinfo(item.get("msgid", ""))
                 orig_req_id = info.get("req_id", "")

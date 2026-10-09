@@ -806,9 +806,14 @@ class ChannelWorker(threading.Thread):
         return turn
 
     def progress_notice(self, turn, age):
-        """One unbound progress message for a long-running turn, so a
+        """One progress message for a long-running turn, so a
         multi-minute native task never looks dead from the user's side.
         Live channels only; needs the route captured at divert time.
+
+        WeCom writes mode reply_notice bound to the msgid. The gateway
+        places that row on the same aibot_respond_msg chain as the
+        formal reply, in outbox order. Weixin has no such stream, so
+        it stays an unbound send.
 
         Once the bound formal reply for this msgid has been delivered,
         this returns without writing. The result already ended the
@@ -853,7 +858,8 @@ class ChannelWorker(threading.Thread):
             cid = turn.get("chatid", "")
             if not cid:
                 return
-            out = {"id": rid, "mode": "send", "chatid": cid,
+            out = {"id": rid, "mode": "reply_notice", "msgid": turn["msgid"],
+                   "chatid": cid,
                    "chat_type": 2 if turn.get("chattype") == "group" else 1,
                    "content": text, "queued_at": int(time.time())}
         else:
