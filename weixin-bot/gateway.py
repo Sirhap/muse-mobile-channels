@@ -544,7 +544,7 @@ SOFT_ACK_TEMPLATE = "已收到，排队第 {n} 位，当前任务进行中；/st
 # moment a normal message arrives — the same fire-and-forget path as
 # the soft ack. It carries no msgid, so it never counts as batch
 # activity/completion, and the late-suppression gate (which only
-# applies to update/reply_file) never touches it.
+# applies to update) never touches it.
 THINKING_NOTICE_TEXT = "🤔 正在思考中，请稍等…"
 # Burst guard: a quick follow-up within the cooldown reuses the
 # notice already on screen instead of stacking another one per
@@ -2502,11 +2502,12 @@ class Gateway:
     def _delivered_reply_before(item: dict) -> bool:
         """Sending-layer late suppression (fix, 2026-10-04 evening):
         True when an outbox row queued BEFORE this item is a formal
-        reply for the same msgid whose delivery result is ok. A late
-        update/reply_file queued by a racing orphan-takeover worker
-        can slip past the CLI gate in the window before the reply's
-        result lands; this check runs at dispatch time, after the
-        reply has actually been delivered, and drops it. Only rows
+        reply or reply_file for the same msgid whose delivery result
+        is ok. Dispatch uses this to drop a late progress update from
+        a racing orphan-takeover worker. It does not drop reply_file:
+        the bridge queues the media row after the text reply for the
+        same msgid, and that file is part of the answer (2026-10-09
+        LT2: text delivered, then the mp4 was swallowed). Only rows
         before this item count, so an update queued before its reply
         (normal progress order) is never suppressed. Fail-open."""
         try:
@@ -2924,7 +2925,11 @@ class Gateway:
             self.append_jsonl(OUTBOX_RESULTS, result)
             log(f"outbox {mode} {item_id}: skipped, cancelled msgid={_mid}")
             return True  # consumed: do not send, do not retry
-        if mode in ("update", "reply_file") and _mid and self._delivered_reply_before(item):
+        # Progress updates after a delivered formal reply are late
+        # duplicates. reply_file is the media that belongs with that
+        # reply (bridge writes text, then file0..fileN) and must still
+        # be sent.
+        if mode == "update" and _mid and self._delivered_reply_before(item):
             result["errmsg"] = "suppressed: msgid already has a delivered formal reply"
             result["suppressed"] = True
             self.append_jsonl(OUTBOX_RESULTS, result)

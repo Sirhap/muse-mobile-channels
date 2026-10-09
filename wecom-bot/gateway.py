@@ -1622,11 +1622,13 @@ class Gateway:
     def _delivered_reply_before(item: dict) -> bool:
         """Sending-layer late suppression (fix, 2026-10-04 evening,
         mirroring the weixin channel): True when an outbox row queued
-        BEFORE this item is a formal reply for the same msgid whose
-        delivery result is ok. Drops late update/reply_file rows from
-        racing orphan-takeover workers at dispatch time. Only rows
-        before this item count, so an update queued before its reply
-        (normal progress order) is never suppressed. Fail-open."""
+        BEFORE this item is a formal reply or reply_file for the same
+        msgid whose delivery result is ok. Dispatch uses this to drop
+        a late progress update. It does not drop reply_file: the
+        bridge queues the media row after the text reply for the same
+        msgid, and that file is part of the answer. Only rows before
+        this item count, so an update queued before its reply (normal
+        progress order) is never suppressed. Fail-open."""
         try:
             item_id = item.get("id", "")
             results: dict[str, dict] = {}
@@ -2922,7 +2924,11 @@ class Gateway:
             self.append_jsonl(OUTBOX_RESULTS, result)
             log(f"outbox {mode} {item_id}: skipped, cancelled msgid={_mid}")
             return True
-        if mode in ("update", "reply_file") and _mid and self._delivered_reply_before(item):
+        # Progress updates after a delivered formal reply are late
+        # duplicates. reply_file is the media that belongs with that
+        # reply (bridge writes text, then file0..fileN) and must still
+        # be sent. Same rule as the Weixin gateway.
+        if mode == "update" and _mid and self._delivered_reply_before(item):
             result["errmsg"] = "suppressed: msgid already has a delivered formal reply"
             result["suppressed"] = True
             self.append_jsonl(OUTBOX_RESULTS, result)
