@@ -582,10 +582,10 @@ THINKING_NOTICE_COOLDOWN_SECS = 20
 STOP_ACK_TEXT = "🛑 收到停止请求，正在优先处理。"
 MERGED_ACK_TEXT = "📩 已收到补充，会和前面一条一起处理。"
 
-BRIDGE_WAIT_TEMPLATE = "⏳ 还在排队（原生通道第 {n} 位）：前面任务还没结束，已等{dur}；/stop 取消"
+BRIDGE_WAIT_TEMPLATE = "⏳ 还在排队（原生通道第 {n} 位）：前面任务还没结束，已等{dur}〔#{code}〕；/stop 取消"
 MEDIA_ACK_TEMPLATE = "📎 已收到{what}，正在处理…"
-STARTED_NOTICE_TEMPLATE = "▶️ 排到你了，开始处理：「{excerpt}」"
-WAIT_REMIND_TEMPLATE = "⏳ 还在排队（第 {n} 位）：前面任务还没结束，已等{dur}；/stop 取消"
+STARTED_NOTICE_TEMPLATE = "▶️ 排到你了，开始处理：「{excerpt}」〔#{code}〕"
+WAIT_REMIND_TEMPLATE = "⏳ 还在排队（第 {n} 位）：前面任务还没结束，已等{dur}〔#{code}〕；/stop 取消"
 BURST_MERGE_WINDOW_SECS = 8
 WAIT_REMIND_SECS = 180
 
@@ -2055,7 +2055,8 @@ class Gateway:
                         if self._queue_notice(
                                 user,
                                 STARTED_NOTICE_TEMPLATE.format(
-                                    excerpt=rec.get("excerpt", "")),
+                                    excerpt=rec.get("excerpt", ""),
+                                    code=str(mid)[:8]),
                                 "started"):
                             sent += 1
                     elif mid in b_pos and not rec.get("wait_reminded"):
@@ -2066,7 +2067,8 @@ class Gateway:
                                     user,
                                     BRIDGE_WAIT_TEMPLATE.format(
                                         n=b_pos[mid],
-                                        dur=_dur_str(waited)),
+                                        dur=_dur_str(waited),
+                                        code=str(mid)[:8]),
                                     "waitremind"):
                                 sent += 1
                     continue
@@ -2075,7 +2077,8 @@ class Gateway:
                     if self._queue_notice(
                             user,
                             STARTED_NOTICE_TEMPLATE.format(
-                                excerpt=rec.get("excerpt", "")),
+                                excerpt=rec.get("excerpt", ""),
+                                code=str(mid)[:8]),
                             "started"):
                         sent += 1
                 elif mid in pos_map and not rec.get("wait_reminded"):
@@ -2085,7 +2088,8 @@ class Gateway:
                         if self._queue_notice(
                                 user,
                                 WAIT_REMIND_TEMPLATE.format(
-                                    n=pos_map[mid], dur=_dur_str(waited)),
+                                    n=pos_map[mid], dur=_dur_str(waited),
+                                    code=str(mid)[:8]),
                                 "waitremind"):
                             sent += 1
             return sent

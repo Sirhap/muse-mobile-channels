@@ -595,8 +595,8 @@ def _task_overview_text(channel, state_dir, hook_state_dir):
 # begins, and one BRIDGE_WAIT_TEMPLATE reminder after
 # WAIT_REMIND_SECS still queued. (The old "queued at position N"
 # arrival ack this replaces was WeCom-only leftover behaviour.)
-STARTED_NOTICE_TEMPLATE = "▶️ 排到你了，开始处理：「{excerpt}」"
-BRIDGE_WAIT_TEMPLATE = "⏳ 还在排队（原生通道第 {n} 位）：前面任务还没结束，已等{dur}；/stop 取消"
+STARTED_NOTICE_TEMPLATE = "▶️ 排到你了，开始处理：「{excerpt}」〔#{code}〕"
+BRIDGE_WAIT_TEMPLATE = "⏳ 还在排队（原生通道第 {n} 位）：前面任务还没结束，已等{dur}〔#{code}〕；/stop 取消"
 WAIT_REMIND_SECS = 180
 
 
@@ -2039,7 +2039,8 @@ class Gateway:
                     if self._queue_notice(
                             chatid, rec.get("chattype", ""),
                             STARTED_NOTICE_TEMPLATE.format(
-                                excerpt=rec.get("excerpt", "")),
+                                excerpt=rec.get("excerpt", ""),
+                                code=str(mid)[:8]),
                             "started"):
                         sent += 1
                 elif mid in b_pos and not rec.get("wait_reminded"):
@@ -2050,7 +2051,8 @@ class Gateway:
                                 chatid, rec.get("chattype", ""),
                                 BRIDGE_WAIT_TEMPLATE.format(
                                     n=b_pos[mid],
-                                    dur=_dur_str(waited)),
+                                    dur=_dur_str(waited),
+                                    code=str(mid)[:8]),
                                 "waitremind"):
                             sent += 1
             return sent

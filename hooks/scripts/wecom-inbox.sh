@@ -88,22 +88,21 @@ BATCH_CAP_SECS = float("inf")
 # (2026-10-09: that judgement now lives in DEATH_WATCH_SECS
 # below; BATCH_CAP_SECS itself stays float("inf") as above.)
 DEATH_WATCH_SECS = 1800
-# Death watch (2026-10-09): this is NOT a task-duration cap. A
-# batch with a heartbeat or any outbox progress keeps running
-# without limit, exactly as the 2026-10-07 "没有上限" order
-# requires. What it judges is total loss of life signs: the
-# worker heartbeat (heartbeat.py) ticks every 60s and a single
-# worker loop self-terminates within 900s (a live worker
-# re-arms or sends an update), so when heartbeat AND outbox
-# activity have BOTH been absent for DEATH_WATCH_SECS — twice
-# the longest possible silent-but-alive window — the worker
-# is not pausing, it is gone (real incident 2026-10-09: a
-# WeCom voice long task's heartbeat stopped ~15:22 and the
-# batch hung silently forever under the no-cap rule). Such a
-# batch is declared interrupted and handled with the
-# 2026-10-05 fail-stop semantics: msgids cancelled, ONE
-# failure notice sent, never auto-re-dispatched — retrying
-# is the user's call.
+# Death watch (2026-10-09, semantics reworked the same evening
+# by the status-push fix): this is NOT a task-duration cap. A
+# batch whose worker keeps pushing keeps running without limit,
+# exactly as the 2026-10-07 "没有上限" order requires. What it
+# watches is total loss of the worker's OWN pushes: only bound
+# outbox rows (update/reply) written by the worker itself count
+# as life -- the detached heartbeat.py file no longer counts
+# (user order: liveness must be the worker pushing for itself,
+# not a clock/file inference). When no worker push has arrived
+# for DEATH_WATCH_SECS the batch is routed, in order: covered
+# by a delivered follow-up reply -> silent drop; first loss ->
+# auto-resume ONCE via the orphan re-wake path plus one factual
+# notice; second loss -> fail-stop (cancel + ONE factual stop
+# notice stating the last real push, never an inferred
+# "execution failed" verdict).
 CLAIM_TTL_SECS = 600
 # Preemption: queued messages must not wait behind a heartbeating long
 # batch forever. If the oldest queued message has waited
@@ -160,9 +159,13 @@ except (OSError, json.JSONDecodeError):
 
 
 def _hb_ts(mid):
-    # Internal worker heartbeat (heartbeat.py): a fresh per-msgid
-    # file under <bot-state>/heartbeats/ proves the batch's worker
-    # is alive even when it sends no visible progress.
+    # DEPRECATED as liveness evidence (2026-10-09, user order: "不能
+    # 凭着代码、凭着时间去判断他到底有没有活着，得让他实际去推送"):
+    # heartbeat.py is a detached代打卡 process -- it ticks even when
+    # the worker itself is gone. Since this fix, ONLY the worker's own
+    # bound outbox pushes (update/reply rows) count as signs of life;
+    # this helper is kept for reference and is no longer consulted
+    # by the death watch or the stall notice.
     try:
         return os.path.getmtime(os.path.join(
             os.path.dirname(inbox_path), "heartbeats", str(mid)))
@@ -301,6 +304,7 @@ batch_active = bool(batch_ids) and batch_since > 0
 # batch must not be fail-stopped out from under the lane (the
 # gateway would then suppress the parked answer as cancelled).
 _delivered_modes = {}
+_delivered_reply_ts = {}
 _parked_msgids = set()
 _parked_mtime = 0.0
 try:
@@ -314,8 +318,14 @@ try:
             _m = _id2msgid.get(str(_rr.get("id") or ""))
             if _m:
                 _delivered_modes.setdefault(_m, set()).add(_rr.get("mode"))
+                if _rr.get("mode") in ("reply", "reply_file"):
+                    _rts = _rr.get("ts")
+                    if isinstance(_rts, (int, float)) and _rts > 0:
+                        if float(_rts) > _delivered_reply_ts.get(_m, 0.0):
+                            _delivered_reply_ts[_m] = float(_rts)
 except (OSError, json.JSONDecodeError, AttributeError):
     _delivered_modes = {}
+    _delivered_reply_ts = {}
 try:
     _ppath = os.path.join(os.path.dirname(outbox_path), "outbox_parked.json")
     _parked_mtime = os.path.getmtime(_ppath)
@@ -328,6 +338,132 @@ try:
 except (OSError, json.JSONDecodeError, AttributeError):
     _parked_msgids = set()
     _parked_mtime = 0.0
+
+# --- worker-push liveness helpers (2026-10-09 status-push fix) ---
+# Signs of life are ONLY the worker's own bound outbox rows: an
+# "update" progress push or a formal reply queued by the worker
+# itself, in its own loop, about its own batch. The detached
+# heartbeat.py timestamp is NOT evidence (see _hb_ts note).
+_inbox_by_id = {}
+for _e in entries:
+    if _e.get("msgid"):
+        _inbox_by_id[str(_e["msgid"])] = _e
+
+
+def _row_ts(r):
+    for k in ("queued_at", "ts"):
+        v = r.get(k)
+        if isinstance(v, (int, float)) and v > 0:
+            return float(v)
+    return 0.0
+
+
+def _last_push(ids):
+    """(ts, text) of the newest bound outbox row for ids -- the last
+    real push the worker itself made. (0.0, "") when it never pushed."""
+    _ids = {str(m) for m in ids}
+    _best = (0.0, "")
+    for _r in load_jsonl(outbox_path):
+        if str(_r.get("msgid") or "") in _ids:
+            _rt = _row_ts(_r)
+            if _rt > _best[0]:
+                _best = (_rt, str(_r.get("content") or _r.get("text") or ""))
+    return _best
+
+
+def _chatkey_of(e):
+    return str(e.get("chatid") or "")
+
+
+def _covered_by_followup(ids, since, last_act):
+    """Anti-false-failure guard (real incident 2026-10-09 18:35: a
+    task's completion report was delivered as the reply to the user's
+    NEXT message, and 30s later the original msgid was declared
+    "任务执行失败" because no reply was bound to IT). If a formal
+    reply to a follow-up message from the same chat -- a message that
+    arrived after this batch started -- was DELIVERED after this
+    batch's last own push, the work has been reported back; the batch
+    must be dropped silently, never failed. Returns the covering
+    msgid or None."""
+    _ids = {str(m) for m in ids}
+    _chats = {_chatkey_of(_inbox_by_id[m]) for m in _ids
+              if m in _inbox_by_id}
+    for _m2, _rts in _delivered_reply_ts.items():
+        if _m2 in _ids or _rts <= last_act:
+            continue
+        _e2 = _inbox_by_id.get(_m2)
+        if _e2 is None:
+            continue
+        _ts2 = _e2.get("ts")
+        if not (isinstance(_ts2, (int, float)) and float(_ts2) > since - 2):
+            continue
+        if _chats and _chatkey_of(_e2) not in _chats:
+            continue
+        return _m2
+    return None
+
+
+def _log_covered(ids, since, last_act, covering):
+    try:
+        with open(os.path.join(os.path.dirname(batch_path),
+                               "covered_drops.jsonl"),
+                  "a", encoding="utf-8") as _cf:
+            _cf.write(json.dumps(
+                {"msgids": sorted(str(m) for m in ids), "since": since,
+                 "last_activity": last_act, "covered_by": covering,
+                 "ts": now}, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+_resume_attempts_path = os.path.join(os.path.dirname(pending_path),
+                                     "resume_attempts.json")
+_resume_queue_path = os.path.join(os.path.dirname(pending_path),
+                                  "resume_queue.json")
+
+
+def _load_json_obj(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            _v = json.load(f)
+        return _v if isinstance(_v, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _save_json_obj(path, obj):
+    try:
+        _tmp = path + ".tmp"
+        with open(_tmp, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False)
+        os.replace(_tmp, path)
+    except OSError:
+        pass
+
+
+_resume_attempts = {str(k): float(v)
+                    for k, v in _load_json_obj(_resume_attempts_path).items()
+                    if isinstance(v, (int, float)) and now - float(v) < 7200}
+_resume_queue = _load_json_obj(_resume_queue_path)
+_resume_queue = {str(k): float(v) for k, v in _resume_queue.items()
+                 if isinstance(v, (int, float)) and now - float(v) < 7200}
+_resume_notice_entries = []
+
+
+def _route_death(e):
+    """First loss of worker pushes -> resume once (queue the msgid
+    for an orphan re-wake + one factual user notice). Second loss ->
+    fail-stop via failed_entries. Returns "resume" or "fail"."""
+    _mid = str(e["msgid"])
+    if _resume_attempts.get(_mid):
+        return "fail"
+    _resume_attempts[_mid] = now
+    _save_json_obj(_resume_attempts_path, _resume_attempts)
+    if _mid not in _resume_queue:
+        _resume_queue[_mid] = now
+        _save_json_obj(_resume_queue_path, _resume_queue)
+    _resume_notice_entries.append(e)
+    return "resume"
 
 batch_done = False
 orphaned_entries = []
@@ -343,8 +479,8 @@ if batch_active:
     # "update" notes do NOT end it, but they DO count as activity:
     # the cap clock runs from the batch's last activity, not from its
     # start, so a live worker on a long task keeps its batch by
-    # reporting progress (or by its internal heartbeat, folded in
-    # below), while a worker that died silently hits the cap and its
+    # reporting progress, while a worker that goes silent hits
+    # the death watch and its
     # batch is failed (fail-stop, no late takeover answer).
     outbox_rows = load_jsonl(outbox_path)
 
@@ -367,10 +503,9 @@ if batch_active:
         if rt >= batch_since - 2 and r.get("msgid") in batch_ids:
             if rt > last_activity:
                 last_activity = rt
-    for _mid in batch_ids:
-        _hb = _hb_ts(_mid)
-        if _hb > last_activity:
-            last_activity = _hb
+    # NOTE (2026-10-09 status-push fix): the detached heartbeat
+    # file is deliberately NOT folded into last_activity any more --
+    # only the worker's own bound outbox pushes above count as life.
     if any({"reply", "reply_file"} & _delivered_modes.get(str(_m), set())
            for _m in batch_ids):
         batch_replied = True
@@ -379,22 +514,32 @@ if batch_active:
             last_activity = _parked_mtime
     if batch_replied:
         batch_done = True
+        for _m in batch_ids:
+            if _resume_attempts.pop(str(_m), None) is not None:
+                _save_json_obj(_resume_attempts_path, _resume_attempts)
+            if _resume_queue.pop(str(_m), None) is not None:
+                _save_json_obj(_resume_queue_path, _resume_queue)
     elif now - last_activity >= DEATH_WATCH_SECS:
-        # Fail-stop (user spec, 2026-10-05): no reply, no outbox
-        # activity and no heartbeat for a full death-watch
-        # window (DEATH_WATCH_SECS, 2026-10-09) = dead. Since
-        # 2026-10-07 BATCH_CAP_SECS is float("inf") and no longer
-        # gates this branch; the death watch keys on total loss
-        # of life signs, never on task age.
-        # The messages are NOT handed to a takeover worker for a
-        # late answer; the fail-stop block below cancels them and
-        # sends one failure notice instead.
+        # Loss of life signs (2026-10-09 status-push fix): no
+        # formal reply and no push from the worker ITSELF for a full
+        # death-watch window. Since 2026-10-07 BATCH_CAP_SECS is
+        # float("inf") and never gates this; the watch keys on the
+        # worker's own pushes only, never on task age and never on
+        # the detached heartbeat file. Routing, in order:
+        # (1) covered by a follow-up reply -> drop silently;
+        # (2) first loss -> auto-resume once (orphan re-wake);
+        # (3) second loss -> fail-stop (cancel + factual notice).
         batch_done = True
         by_id = {e["msgid"]: e for e in entries}
-        for mid in batch.get("msgids") or []:
-            e = by_id.get(mid)
-            if e is not None:
-                failed_entries.append(e)
+        _cov = _covered_by_followup(batch_ids, batch_since,
+                                    last_activity)
+        if _cov:
+            _log_covered(batch_ids, batch_since, last_activity, _cov)
+        else:
+            for mid in batch.get("msgids") or []:
+                e = by_id.get(mid)
+                if e is not None and _route_death(e) == "fail":
+                    failed_entries.append(e)
 
 def is_stop_request(text):
     # Conservative matcher for stop/cancel imperatives: short
@@ -457,10 +602,9 @@ if detached:
             if r.get("msgid") in dids and rt >= dsince - 2:
                 if rt > dlast:
                     dlast = rt
-        for _mid in dids:
-            _hb = _hb_ts(_mid)
-            if _hb > dlast:
-                dlast = _hb
+        # Detached batches follow the same worker-push-only
+        # liveness rule as the active batch (2026-10-09 fix): the
+        # detached heartbeat file no longer feeds dlast.
         if any({"reply", "reply_file", "send"}
                & _delivered_modes.get(str(_m), set()) for _m in dids):
             dreplied = True
@@ -468,19 +612,30 @@ if detached:
             if _parked_mtime > dlast:
                 dlast = _parked_mtime
         if dreplied:
+            for _m in dids:
+                if _resume_attempts.pop(str(_m), None) is not None:
+                    _save_json_obj(_resume_attempts_path,
+                                   _resume_attempts)
+                if _resume_queue.pop(str(_m), None) is not None:
+                    _save_json_obj(_resume_queue_path, _resume_queue)
             continue
         if now - dlast >= DEATH_WATCH_SECS:
-            # Death watch (2026-10-09): heartbeat and outbox
-            # activity both gone for DEATH_WATCH_SECS — same
-            # fail-stop as the active batch (the fail-stop
-            # block cancels + notifies) and the entry is
-            # dropped. This runs BEFORE the retire branch
-            # below, so a dead detached batch is reported to
-            # the user instead of silently retiring at
-            # DETACHED_RETIRE_SECS with no notice at all.
+            # Death watch (2026-10-09, reworked by the same day's
+            # status-push fix): the worker's own pushes gone for
+            # DEATH_WATCH_SECS -- same routing as the active batch:
+            # covered -> silent drop; first loss -> resume once;
+            # second loss -> fail-stop (cancel + factual notice).
+            # This runs BEFORE the retire branch below, so a lost
+            # detached batch is reported instead of silently
+            # retiring at DETACHED_RETIRE_SECS with no notice.
+            _cov = _covered_by_followup(dids, dsince, dlast)
+            if _cov:
+                _log_covered(dids, dsince, dlast, _cov)
+                continue
             for mid in d.get("msgids") or []:
                 e = by_id.get(mid)
-                if e is not None and e not in failed_entries:
+                if (e is not None and e not in failed_entries
+                        and _route_death(e) == "fail"):
                     failed_entries.append(e)
             continue
         if now - dlast >= DETACHED_RETIRE_SECS:
@@ -520,6 +675,31 @@ if retire_rows and not dry:
     except OSError:
         pass
 
+# --- resume queue merge (2026-10-09 status-push fix) ---
+# Msgids routed to a one-time auto-resume wait in resume_queue.json
+# until a wake actually carries them (the claims-recording block at
+# the end removes them once emitted). Merging here puts them on the
+# normal orphan path: claims, starvation accounting and the payload's
+# "orphaned" list all apply, with resume=True marking the reason.
+if _resume_queue:
+    _rq_by_id = {e["msgid"]: e for e in entries}
+    for _mid in list(_resume_queue):
+        _e = _rq_by_id.get(_mid) or _rq_by_id.get(str(_mid))
+        if _e is None or _e in orphaned_entries:
+            continue
+        orphaned_entries.append(_e)
+        _ts = _e.get("ts")
+        _waited = (round((now - float(_ts)) / 60, 1)
+                   if isinstance(_ts, (int, float)) and _ts else None)
+        orphan_info.append(
+            {"msgid": _e["msgid"],
+             "text": (_e.get("text") or "")[:500],
+             "waited_mins": _waited, "resume": True,
+             "resume_note": "上一名 worker 已中断（没再收到它本人的"
+                            "推送）：先检查已有产物和进度，从断点续做，"
+                            "不要从头重做；这是唯一一次自动续跑，"
+                            "完成后照常正式回复本条。"})
+
 # --- orphan claims: atomic takeover guard ---
 # When a wake hands orphaned messages to a worker they are claimed
 # for CLAIM_TTL_SECS (recorded in the state-write phase below);
@@ -556,7 +736,8 @@ if orphaned_entries:
 # incident 2026-10-07: homepage-image batch last activity 16:31,
 # heartbeat aged out 16:45, user still uninformed at 16:52).
 # So a batch (active or detached) with no delivered reply, no bound
-# outbox activity and no heartbeat for STALL_NOTICE_SECS gets ONE
+# bound outbox pushes from the worker itself for
+# STALL_NOTICE_SECS gets ONE
 # unbound stall notice per hour. The batch is NOT cancelled, NOT
 # orphaned, and the notice (unbound, no msgid) never counts as
 # batch activity.
@@ -598,12 +779,20 @@ if not dry:
                 continue
             _mins = int((now - _last) // 60)
             _t = (_e0.get("text") or "").strip() or "（无文字消息）"
-            _notice = ("⏳ 提醒：任务「" + _t[:20] + "」已约 "
-                       + str(_mins)
-                       + " 分钟没有任何进展（也没报错）。"
-                         "有心跳或进展它就一直跑、没有时长上限；"
-                         "但若满 30 分钟始终没有任何心跳和进展，"
-                         "我会判定它已中断并向你报告，不会假装还在跑。"
+            _code = str(_e0.get("msgid") or "")[:8]
+            _lp_ts, _lp_text = _last_push(_mids)
+            _lp_when = (time.strftime("%H:%M",
+                                      time.localtime(_lp_ts))
+                        if _lp_ts else
+                        time.strftime("%H:%M", time.localtime(_last)))
+            _lp_ex = ("「" + _lp_text[:30] + "」") if _lp_text else ""
+            _notice = ("⏳ 提醒：任务「" + _t[:20] + "」〔#" + _code
+                       + "〕最后一次本人推送是 " + _lp_when + _lp_ex
+                       + "，之后已约 " + str(_mins)
+                       + " 分钟没再收到它的推送（也没报错）。"
+                         "它本人再推送就继续跑、没有时长上限；"
+                         "若满 30 分钟仍无它本人的推送，我会先自动"
+                         "续跑一次并如实告诉你，不会假装还在跑。"
                          "要取消回 /stop。")
             _sent = False
             try:
@@ -625,6 +814,34 @@ if not dry:
                     json.dump(_sn, f, ensure_ascii=False)
             except OSError:
                 pass
+
+# --- resume notices (2026-10-09 status-push fix) ---
+# One factual notice per msgid routed to auto-resume this poll:
+# what happened is stated as fact (last real worker push, then
+# nothing), never as an inferred verdict. Fail-silent like the
+# stall notices; a failed send does not block the resume itself.
+if not dry and _resume_notice_entries:
+    for _re in _resume_notice_entries:
+        _rmid = str(_re.get("msgid") or "")
+        _lp_ts, _lp_text = _last_push([_rmid])
+        _lp_when = (time.strftime("%H:%M", time.localtime(_lp_ts))
+                    if _lp_ts else "无记录")
+        _lp_ex = ("「" + _lp_text[:30] + "」") if _lp_text else ""
+        _rt = (_re.get("text") or "").strip() or "（无文字消息）"
+        _rnotice = ("♻️ 原任务已中断，已自动续跑一次：「" + _rt[:20]
+                    + "」〔#" + _rmid[:8] + "〕（它最后一次本人推送是 "
+                    + _lp_when + _lp_ex
+                    + "，之后没再收到；续跑的 worker 会先查已有产物"
+                      "再接着做，不从头重来。）")
+        try:
+                r = subprocess.run([cli_path, "send", "--chatid",
+                                    str(_re.get("chatid") or ""),
+                                    "--chat-type",
+                                    "2" if _re.get("chattype") == "group" else "1",
+                                    "--text", _rnotice],
+                                   capture_output=True, timeout=20)
+        except Exception:
+            pass
 
 # --- fail-stop execution ---
 # For every batch declared dead above: cancel each msgid through
@@ -659,13 +876,28 @@ if not dry:
         _parts = []
         for e in failed_entries[:3]:
             _t = (e.get("text") or "").strip() or "（无文字消息）"
-            _parts.append("「" + _t[:20] + "」")
+            _mid = str(e.get("msgid") or "")
+            _lp_ts, _lp_text = _last_push([_mid])
+            if _lp_ts:
+                _lp = ("（最后推送 "
+                       + time.strftime("%H:%M",
+                                       time.localtime(_lp_ts))
+                       + ("「" + _lp_text[:24] + "」" if _lp_text
+                          else "")
+                       + "，之后未再收到）")
+            else:
+                _lp = "（无它本人的推送记录）"
+            _parts.append("「" + _t[:20] + "」〔#" + _mid[:8] + "〕"
+                          + _lp)
         _fe = next((e for e in failed_entries if e.get("chatid")), None)
         if _fe is not None:
             _fn_pending.append({
                 "ts": now, "chatid": _fe.get("chatid"),
                 "chat_type": 2 if _fe.get("chattype") == "group" else 1,
-                "text": "⚠️ 任务执行失败，已停止：" + "、".join(_parts)
+                "text": "⚠️ 任务已停止（续跑后仍没再收到它本人的推送）："
+                        + "、".join(_parts)
+                        + "。这不是已确认的执行失败，是它不再推送、"
+                          "已按规矩停止等待"
                         + "。需要重试直接告诉我。"})
     if _fn_pending:
         _fn_still = []
@@ -1009,8 +1241,13 @@ if not dry and detached_dirty and not new and not (batch_active and batch_done):
 if not dry and new and orphan_info:
     # Record takeover claims for the orphans this wake carries, so
     # later polls do not hand the same messages to another worker.
+    # Resume msgids carried by this wake leave the resume queue:
+    # their one auto-resume has now actually been dispatched.
     for o in orphan_info:
         claims[o["msgid"]] = now
+        if o.get("resume") and _resume_queue.pop(
+                str(o["msgid"]), None) is not None:
+            _save_json_obj(_resume_queue_path, _resume_queue)
     try:
         tmp = claims_path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
@@ -1444,6 +1681,10 @@ payload = {"count": len(new), "messages": out, "history": history,
            "starved_priority": starved_priority,
            "debounce_waiting": waiting, "queued": len(pending_entries),
            "history_meta": history_meta}
+_resumed_ids = [str(o.get("msgid")) for o in orphan_info
+                if o.get("resume")]
+if _resumed_ids:
+    payload["resumed_msgids"] = _resumed_ids
 if failed_entries:
     # Informational only: these batches were declared dead this
     # poll and fail-stopped by the hook itself (cancelled + failure
