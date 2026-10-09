@@ -43,9 +43,11 @@ PROG_FIRST_SECS = 120
 PROG_EVERY_SECS = 300
 ESCALATE_SECS = 1200        # turn age where progress notices turn into
                             # an actionable "looks stuck, /stop it" warning
-ACTIVITY_POLL_SECS = 60     # activity.list cadence during a long turn
-                            # (P3: coarse progress signals folded into
-                            # the existing progress notices only)
+# activity.list is an account-wide call, so it stays coarser than the
+# history poll (POLL_SECS). 12s is inside the 10–15s band: new activity
+# is noticed within one cycle, while progress bubbles stay capped by
+# LT_EVENT_PROG_MIN_SECS below (faster polling must not mean more sends).
+ACTIVITY_POLL_SECS = 12
 IDLE_PUSH_EVERY_SECS = 20   # idle-session scan cadence (see idle_push_scan)
 # --- LT2 long-task trailing loop + session self-heal (2026-10-08) -----
 # Ported from the reference implementation, muse-cli's chat.py
@@ -54,14 +56,27 @@ IDLE_PUSH_EVERY_SECS = 20   # idle-session scan cadence (see idle_push_scan)
 # LT2 behaviour is gated per channel by a longtask-<channel> flag
 # file (see longtask_mode); with the flag absent every code path
 # below is inert and behaviour is byte-for-byte the pre-LT2 bridge.
-TRAILING_QUIET_SECS = 30    # LT2: status completed + this much silence
-                            # after the last reply closes the turn
-                            # (chat.py's QUIET, stretched for channels)
-TRAILING_MAX_SECS = 600     # LT2: hard cap on the trailing window;
-                            # later arrivals are the idle scan's job,
-                            # continuing on the SAME cursor (spec 3)
+# Quiet window (2026-10-09): aligned to chat.py's QUIET of 10s.
+# The previous 30s stretch had no recorded reason; it only held the
+# channel turn open longer after the platform had already finished.
+# Close still requires sessions.get status == "completed", so a tool
+# gap while the session is running is not cut off by these 10s.
+# A segment that lands after close still rides idle_push_scan on the
+# same cursor.
+TRAILING_QUIET_SECS = 10
+# No wall-clock cap on the trailing window (2026-10-09). chat.py ends
+# on silence only: each new reply renews QUIET, and there is no total
+# duration limit. That matches the user rule 「没有上限」 (the same rule
+# that removed the cold-path fail-stop duration cap). A session that
+# stays "running" is not force-closed; ESCALATE_SECS still names /stop.
+# DEATH_WATCH_SECS=1800 on the cold hook path is a different mechanism
+# (a worker that has gone silent) and is intentionally unchanged.
+# Later arrivals after a silence close continue through idle_push_scan
+# on the same cursor.
 LT_EVENT_PROG_MIN_SECS = 60   # LT2: min gap between event-triggered
-                                # progress notices for one turn
+                                # progress notices for one turn. Applies
+                                # to both activity.list and history-delta
+                                # triggers so neither source can spam.
 IDLE_FAIL_ALERT_STREAK = 3    # LT2: idle-scan failures before alerting
 IDLE_ALERT_MIN_SECS = 3600    # LT2: min gap between idle-scan alerts
 MERGE_CHANNELS = {"weixin", "test", "wecom"}
@@ -242,6 +257,46 @@ def outbox_already_has(ch, row_id):
         return f'"id": "{row_id}"' in tail
     except OSError:
         return False
+
+
+def outbox_result_ok(ch, row_id):
+    """Latest gateway verdict for one outbox row id.
+
+    The gateway (not the bridge) appends ``{id, ok, ...}`` to
+    outbox_results.jsonl after dispatch. Returns True or False when
+    that file has a row for ``row_id``, or None when the gateway has
+    not recorded one yet or the channel is not live. None means
+    pending, not failure: dispatch is asynchronous and the trailing
+    close does not wait on it (a wait would pin the queue to WeChat
+    send latency). Callers log the verdict so a live check can grep
+    ``outbox_ok=``.
+
+    The bound reply is written at the start of the turn. With no
+    trailing cap the results file can grow well past that row before
+    close, so this reads the whole file once (close is not the hot
+    path). The latest row for the id wins.
+    """
+    if not row_id or not live_mode(ch):
+        return None
+    p = os.path.join(CFG["channels"][ch]["bot_state"],
+                     "outbox_results.jsonl")
+    try:
+        with open(p, "rb") as f:
+            text = f.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+    verdict = None
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or row_id not in line:
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if rec.get("id") == row_id and "ok" in rec:
+            verdict = True if rec.get("ok") is True else False
+    return verdict
 
 
 def cancelled_ids(ch):
@@ -498,6 +553,29 @@ def is_turn_reply(ev, baseline):
     return True
 
 
+def _history_progress_event(ev, baseline):
+    """True when a history row should refresh a long-task progress notice.
+
+    Completed turn replies are delivered as their own bubbles, so they
+    are not a second "still working" trigger. The user's inbound echo
+    is not progress either. An in-progress assistant row (no completed
+    status yet) and tool/function rows are.
+    """
+    if (ev.get("seq") or 0) <= baseline:
+        return False
+    name = ev.get("event_name") or ""
+    if name == "message.assistant":
+        return not is_turn_reply(ev, baseline)
+    if name in ("message.user", "message.human", "user.message") \
+            or name.startswith("message.user") \
+            or name.startswith("message.human"):
+        return False
+    lowered = name.lower()
+    if "tool" in lowered or "function" in lowered:
+        return True
+    return False
+
+
 def _activity_ts_epoch(raw):
     """Epoch seconds for an activity timestamp (ISO-8601 string or
     number); None when unparseable."""
@@ -712,11 +790,14 @@ class ChannelWorker(threading.Thread):
                 # LT2 trailing-loop state (inert unless longtask_mode):
                 # reply_delivered flips on the first delivered reply,
                 # cursor_seq is the unified cursor shared with the
-                # idle scan, last_reply_at/trailing_since drive the
-                # quiet/max close conditions.
+                # idle scan, last_reply_at drives the silence close.
+                # hist_seen_seq starts at baseline so the first history
+                # poll can treat later rows as new progress; a turn
+                # loaded without the field baselines once instead.
                 "reply_delivered": False, "cursor_seq": baseline,
                 "last_reply_at": 0, "trailing_since": 0,
-                "activity_dirty": False, "last_event_prog": 0}
+                "activity_dirty": False, "history_dirty": False,
+                "hist_seen_seq": baseline, "last_event_prog": 0}
         self.log(f"turn sent msgid={row['msgid']} "
                  f"baseline={baseline}")
         return turn
@@ -861,6 +942,111 @@ class ChannelWorker(threading.Thread):
                 best_ev, best_text = ev, text
         return best_ev, best_text
 
+    def _note_history_progress(self, turn, evs):
+        """Mark history_dirty when chat.history grew with progress rows.
+
+        History is already read every POLL_SECS. This is the second
+        progress trigger beside activity.list: in-progress assistant
+        text and tool/function rows, not the user's own echo and not
+        a completed reply (that reply is delivered on its own).
+        The first time a stored turn has no hist_seen_seq, this only
+        baselines the watermark so an upgrade does not fire a notice
+        for history the turn has already lived through. Notices are
+        still spaced by LT_EVENT_PROG_MIN_SECS in step().
+        """
+        baseline = turn.get("baseline") or 0
+        prev = turn.get("hist_seen_seq")
+        hi = baseline
+        for ev in evs or []:
+            seq = ev.get("seq") or 0
+            if seq > hi:
+                hi = seq
+        if prev is None:
+            turn["hist_seen_seq"] = hi
+            self._turns_dirty = True
+        elif hi > prev:
+            fresh = False
+            for ev in evs or []:
+                seq = ev.get("seq") or 0
+                if seq <= prev:
+                    continue
+                if _history_progress_event(ev, baseline):
+                    fresh = True
+                    break
+            turn["hist_seen_seq"] = hi
+            self._turns_dirty = True
+            if fresh:
+                turn["history_dirty"] = True
+        # A completed reply already in this history is the user's
+        # update. If it is at least as new as every progress row,
+        # drop history_dirty so step() does not add 「还在处理中」
+        # beside that reply (including a dirty flag left pending
+        # by the 60s notice throttle). activity_dirty is the same
+        # kind of flag but activity.list has no seq; it is cleared
+        # after the reply is delivered and this poll's activity
+        # fold, in _clear_superseded_activity_dirty.
+        self._clear_superseded_history_dirty(turn, evs)
+
+    def _clear_superseded_history_dirty(self, turn, evs):
+        """Clear history_dirty when a completed reply supersedes it."""
+        if not turn.get("history_dirty"):
+            return
+        baseline = turn.get("baseline") or 0
+        newest_reply = 0
+        newest_progress = 0
+        for ev in evs or []:
+            seq = ev.get("seq") or 0
+            if seq <= baseline:
+                continue
+            if is_turn_reply(ev, baseline):
+                if seq > newest_reply:
+                    newest_reply = seq
+            elif _history_progress_event(ev, baseline):
+                if seq > newest_progress:
+                    newest_progress = seq
+        if newest_reply and newest_reply >= newest_progress:
+            turn["history_dirty"] = False
+            self._turns_dirty = True
+
+    def _clear_superseded_activity_dirty(self, turn):
+        """Clear activity_dirty when a delivered reply already covers it.
+
+        Counterpart of _clear_superseded_history_dirty. activity.list
+        is not ordered by history seq, so the reply's last_reply_at
+        is the line: an event at or before that instant is the work
+        the reply just reported, and step() must not send
+        「还在处理中」 for it in the same turn. An event strictly
+        after last_reply_at is newer work and stays dirty.
+        Called after the reply has been delivered and after this
+        poll's _poll_activity, because that fold can set the flag
+        later than the history clear.
+        """
+        if not turn.get("activity_dirty") or not turn.get("reply_delivered"):
+            return
+        replied_at = turn.get("last_reply_at") or 0
+        if not replied_at:
+            return
+        newest = 0.0
+        for act in turn.get("activities") or []:
+            if not isinstance(act, dict):
+                continue
+            ts = _activity_ts_epoch(act.get("ts"))
+            if ts is not None and ts > newest:
+                newest = ts
+        if newest > replied_at:
+            return
+        turn["activity_dirty"] = False
+        self._turns_dirty = True
+
+    def _outbox_ok_label(self, turn):
+        """'true' / 'false' / 'pending' for the bound reply's outbox row."""
+        ok = outbox_result_ok(self.ch, bridge_row_id(turn["msgid"]))
+        if ok is True:
+            return "true"
+        if ok is False:
+            return "false"
+        return "pending"
+
     def poll_turn(self, turn):
         ids = turn.get("ids") or [turn["msgid"]]
         if any(mid in cancelled_ids(self.ch) for mid in ids):
@@ -876,6 +1062,8 @@ class ChannelWorker(threading.Thread):
         # the pre-LT2 single-reply behaviour.
         gated = longtask_mode(self.ch)
         evs = self.history_events(turn["session_id"])
+        if gated:
+            self._note_history_progress(turn, evs)
         started = False
         now_t = time.time()
         for ev in evs:
@@ -896,7 +1084,7 @@ class ChannelWorker(threading.Thread):
                 if seq <= (turn.get("cursor_seq") or turn["baseline"]):
                     continue
                 mid = _ev_mid(ev)
-                self._deliver_idle(text, mid or f"seq{seq}")
+                self._deliver_idle(text, mid or f"seq{seq}", route=turn)
                 self._turn_reply_marks.append((seq, mid))
                 turn["cursor_seq"] = seq
                 turn["last_reply_at"] = int(now_t)
@@ -931,31 +1119,31 @@ class ChannelWorker(threading.Thread):
             turn["reply_started"] = True
             self._turns_dirty = True
         if gated and turn.get("reply_delivered"):
-            # LT2 trailing window. New activity still marks the
-            # turn dirty so step() can fire an event progress
-            # notice. Close conditions: the platform says the
-            # session turn is completed AND the quiet window since
-            # the last reply has elapsed (TRAILING_QUIET_SECS), or
-            # the trailing window hits its hard cap
-            # (TRAILING_MAX_SECS) — later arrivals then continue
-            # through idle_push_scan on the same unified cursor.
-            # A running status never closes on silence alone.
+            # LT2 trailing window. New activity or a history delta
+            # marks the turn dirty so step() can fire an event
+            # progress notice (still capped at one per
+            # LT_EVENT_PROG_MIN_SECS). The only close is silence:
+            # sessions.get says completed AND TRAILING_QUIET_SECS
+            # have passed since the last reply. There is no
+            # wall-clock cap. A running status never closes on
+            # silence alone. A failed status query also does not
+            # close the turn (no signal is not "completed").
+            # After close, later arrivals continue through
+            # idle_push_scan on the same unified cursor.
             if self._poll_activity(turn):
                 turn["activity_dirty"] = True
                 self._turns_dirty = True
+            self._clear_superseded_activity_dirty(turn)
             status = self._session_status(turn["session_id"])
             if status is not None and status != turn.get("sess_status"):
                 turn["sess_status"] = status
                 self._turns_dirty = True
             now2 = time.time()
-            if now2 - (turn.get("trailing_since") or now2) \
-                    >= TRAILING_MAX_SECS:
-                self.log(f"trailing window capped msgid={turn['msgid']}")
-                return "done"
             if status == "completed" and \
                     now2 - (turn.get("last_reply_at") or now2) \
                     >= TRAILING_QUIET_SECS:
-                self.log(f"trailing window closed msgid={turn['msgid']}")
+                self.log(f"trailing window closed msgid={turn['msgid']} "
+                         f"outbox_ok={self._outbox_ok_label(turn)}")
                 return "done"
             return "running"
         # No completed reply delivered (yet). Cross-check the
@@ -999,7 +1187,29 @@ class ChannelWorker(threading.Thread):
             self._turns_dirty = True
         return "running"
 
-    def _deliver_idle(self, text, key):
+    def _idle_address(self, route):
+        """Address fields for an unbound send.
+
+        A trailing segment passes the open turn so the extra bubble
+        goes to the same user/chat as that turn (the bound reply is
+        routed by msgid; this row is not). An idle-scan push has no
+        turn and falls back to the channel config, which is the
+        configured owner of that channel.
+        """
+        route = route or {}
+        cfg = CFG["channels"][self.ch]
+        if self.ch == "weixin":
+            return {"to_user_id": route.get("from_user")
+                    or cfg.get("from_user_id", "")}
+        if self.ch == "wecom":
+            chattype = route.get("chattype") or ""
+            return {
+                "chatid": route.get("chatid") or cfg.get("chatid", ""),
+                "chat_type": 2 if chattype == "group" else 1,
+            }
+        return {}
+
+    def _deliver_idle(self, text, key, route=None):
         """Push one session-originated assistant message the user never
         asked for in a bridge turn (a background-task result, a browser
         result, a proactive report). Such messages used to sit in the
@@ -1008,7 +1218,9 @@ class ChannelWorker(threading.Thread):
         idle gap never reached the channel (lost twice on 2026-10-07:
         00:36 browser verdict, 01:31 browser-install verdict). Sent as
         unbound sends, mirroring progress_notice addressing; [[FILE:]]
-        markers are honoured the same way as in turn replies."""
+        markers are honoured the same way as in turn replies.
+        ``route`` is the open turn for a trailing segment; idle-scan
+        callers omit it and the channel config is used."""
         files, kept = [], []
         for line in text.splitlines():
             s = line.strip()
@@ -1023,29 +1235,21 @@ class ChannelWorker(threading.Thread):
             f"idle:{self.ch}:{key}".encode()).hexdigest()[:12]
         if outbox_already_has(self.ch, rid):
             return
-        cfg = CFG["channels"][self.ch]
         now = int(time.time())
+        addr = self._idle_address(route)
         rows = []
         if body:
             r = {"id": rid, "mode": "send", "content": body,
                  "queued_at": now}
-            if self.ch == "weixin":
-                r["to_user_id"] = cfg.get("from_user_id", "")
-            elif self.ch == "wecom":
-                r["chatid"] = cfg.get("chatid", "")
-                r["chat_type"] = 1
-            else:
+            r.update(addr)
+            if self.ch not in ("weixin", "wecom"):
                 r["text"] = body
             rows.append(r)
         for i, p in enumerate(files):
             r = {"id": f"{rid}-f{i}", "mode": "send_file",
                  "file_path": p, "content": body if i == 0 else "",
                  "queued_at": now}
-            if self.ch == "weixin":
-                r["to_user_id"] = cfg.get("from_user_id", "")
-            elif self.ch == "wecom":
-                r["chatid"] = cfg.get("chatid", "")
-                r["chat_type"] = 1
+            r.update(addr)
             rows.append(r)
         for r in rows:
             append_jsonl(outbox_path(self.ch), r)
@@ -1226,17 +1430,22 @@ class ChannelWorker(threading.Thread):
                 if outcome == "running":
                     age = int(time.time()) - turn["sent_at"]
                     nxt = turn.get("next_prog") or 0
-                    # LT2 spec 4 (gated): fresh activity is a
-                    # progress EVENT — fire the notice now (throttled
-                    # to one per LT_EVENT_PROG_MIN_SECS) instead of
-                    # waiting for the 120/300 timer, and push the
-                    # timed notice out so the two never stack.
+                    # LT2 spec 4 (gated): fresh activity OR a history
+                    # delta is a progress EVENT — fire the notice now
+                    # (throttled to one per LT_EVENT_PROG_MIN_SECS)
+                    # instead of waiting for the 120/300 timer, and
+                    # push the timed notice out so the two never stack.
+                    # The throttle is what keeps the 12s activity poll
+                    # and the 2s history poll from spamming.
                     fired = False
-                    if longtask_mode(ch) and turn.get("activity_dirty") \
+                    event_dirty = turn.get("activity_dirty") \
+                        or turn.get("history_dirty")
+                    if longtask_mode(ch) and event_dirty \
                             and time.time() - \
                             (turn.get("last_event_prog") or 0) \
                             >= LT_EVENT_PROG_MIN_SECS:
                         turn["activity_dirty"] = False
+                        turn["history_dirty"] = False
                         turn["last_event_prog"] = int(time.time())
                         turn["next_prog"] = int(time.time()) \
                             + PROG_EVERY_SECS
