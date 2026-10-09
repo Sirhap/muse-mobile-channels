@@ -32,6 +32,7 @@ native-bridge/spool/
 native-bridge/shadow/
 native-bridge/enabled-*
 native-bridge/divert-*
+native-bridge/longtask-*
 native-bridge/queue_admin-*.jsonl
 native-bridge/probe_*.py
 .venv/
