@@ -1042,6 +1042,39 @@ def slash_approvals_text():
     return "\n".join(lines)
 
 
+def _approval_pending_submission(num):
+    """Decision already written for num but not yet consumed by the relay.
+
+    Mirrors the WeCom gateway helper of the same name: the relay
+    consumes decisions.jsonl by byte offset and only then flips
+    state.json to decided:*, so a decision submitted on one channel
+    still reads "pending" until the relay's next cycle. The first
+    submission wins; later submits for the same num must not append
+    a duplicate row (live incident #8, 2026-10-09).
+    """
+    try:
+        off = int((APPROVAL_RELAY_DIR / "decisions.offset")
+                  .read_text().strip())
+    except (OSError, ValueError):
+        off = 0
+    try:
+        with open(APPROVAL_RELAY_DIR / "decisions.jsonl",
+                  encoding="utf-8") as f:
+            f.seek(off)
+            lines = f.read().splitlines()
+    except OSError:
+        return None
+    found = None
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if str(row.get("num")) == str(num) and row.get("decision"):
+            found = row["decision"]
+    return found
+
+
 def slash_approval_decide_ack(num, decision, channel):
     items = _approval_items()
     it = items.get(str(num))
@@ -1051,6 +1084,13 @@ def slash_approval_decide_ack(num, decision, channel):
         return f"审批 #{num} 已经处理过了。"
     label = {"allow_once": "批准（仅这次）", "allow_always": "批准（永久）",
              "deny": "拒绝"}[decision]
+    prev = _approval_pending_submission(num)
+    if prev is not None:
+        prev_label = {"allow_once": "批准（仅这次）",
+                      "allow_always": "批准（永久）",
+                      "deny": "拒绝"}.get(prev, prev)
+        return (f"审批 #{num} 已提交过（{prev_label}），"
+                f"等执行结果就行，不用重复提交。")
     if _append_jsonl_file(APPROVAL_RELAY_DIR / "decisions.jsonl",
                           {"num": str(num), "decision": decision,
                            "channel": channel, "ts": time.time()}):

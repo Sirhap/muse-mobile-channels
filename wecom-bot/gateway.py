@@ -1123,6 +1123,41 @@ def slash_approvals_text():
     return "\n".join(lines)
 
 
+def _approval_pending_submission(num):
+    """Decision already written for num but not yet consumed by the relay.
+
+    The relay consumes decisions.jsonl by byte offset (decisions.offset)
+    and only then flips state.json to decided:*, so between a text
+    /批准 and the relay's next cycle the item still reads "pending"
+    and a second submit (e.g. a late-arriving card for the same
+    approval, live incident #8 on 2026-10-09) would append a duplicate
+    row and surface as a spurious failure/dup notice. Rows at or after
+    the offset are the not-yet-consumed submissions; the first one
+    wins, later submits for the same num must not append again.
+    """
+    try:
+        off = int((APPROVAL_RELAY_DIR / "decisions.offset")
+                  .read_text().strip())
+    except (OSError, ValueError):
+        off = 0
+    try:
+        with open(APPROVAL_RELAY_DIR / "decisions.jsonl",
+                  encoding="utf-8") as f:
+            f.seek(off)
+            lines = f.read().splitlines()
+    except OSError:
+        return None
+    found = None
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if str(row.get("num")) == str(num) and row.get("decision"):
+            found = row["decision"]
+    return found
+
+
 def slash_approval_decide_ack(num, decision, channel):
     items = _approval_items()
     it = items.get(str(num))
@@ -1132,11 +1167,68 @@ def slash_approval_decide_ack(num, decision, channel):
         return f"审批 #{num} 已经处理过了。"
     label = {"allow_once": "批准（仅这次）", "allow_always": "批准（永久）",
              "deny": "拒绝"}[decision]
+    prev = _approval_pending_submission(num)
+    if prev is not None:
+        prev_label = {"allow_once": "批准（仅这次）",
+                      "allow_always": "批准（永久）",
+                      "deny": "拒绝"}.get(prev, prev)
+        return (f"审批 #{num} 已提交过（{prev_label}），"
+                f"等执行结果就行，不用重复提交。")
     if _append_jsonl_file(APPROVAL_RELAY_DIR / "decisions.jsonl",
                           {"num": str(num), "decision": decision,
                            "channel": channel, "ts": time.time()}):
         return f"已提交{label} #{num}：{it.get('who', '')}。执行结果马上发你。"
     return "提交失败：暂时写不了审批指令，请稍后再试。"
+
+
+# Approval cards (sent by the approval relay as task_id appr-<num>)
+# carry three decision buttons instead of 确认/取消. A click is a
+# complete decision by itself: the gateway writes it to the relay's
+# decisions.jsonl exactly like a /批准 command, so no agent turn is
+# woken for it (the click's inbox row is marked auto_handled).
+APPROVAL_CARD_KEYS = {"appr_once": "allow_once",
+                      "appr_always": "allow_always",
+                      "appr_deny": "deny"}
+APPROVAL_CARD_LABELS = {"allow_once": "已批准·仅这次 ✅",
+                        "allow_always": "已批准·永久 ✅",
+                        "deny": "已拒绝 ❌"}
+
+
+def approval_card_decide(task_id, event_key):
+    """Decide an approval from a card click.
+
+    Returns (card_title, ok) for the card update, or None when the
+    click is not an approval decision (ordinary cards keep their
+    existing agent-wake path).
+    """
+    if not str(task_id or "").startswith("appr-"):
+        return None
+    decision = APPROVAL_CARD_KEYS.get(event_key or "")
+    if decision is None:
+        return None
+    num = str(task_id)[len("appr-"):]
+    if not num.isdigit():
+        return None
+    # Idempotency (live incident #8, 2026-10-09): a card can arrive
+    # AFTER the same approval was already decided by text. The click
+    # is then not a failure — show the decision that is actually in
+    # effect and submit nothing again.
+    it = _approval_items().get(num)
+    if it is not None:
+        status = str(it.get("status") or "")
+        if status.startswith("decided:"):
+            prev = status.split(":", 1)[1]
+            if prev in APPROVAL_CARD_LABELS:
+                return APPROVAL_CARD_LABELS[prev], True
+        elif status != "pending":
+            return "已失效 ❌", False
+        prev = _approval_pending_submission(num)
+        if prev in APPROVAL_CARD_LABELS:
+            return APPROVAL_CARD_LABELS[prev], True
+    ack = slash_approval_decide_ack(num, decision, "wecom-card")
+    if ack.startswith("已提交"):
+        return APPROVAL_CARD_LABELS[decision], True
+    return "提交失败 ❌", False
 
 
 # --- Subagent reply label enforcement (fix #2, 2026-10-04) -----
@@ -2258,6 +2350,12 @@ class Gateway:
                 decided = event_key or "点击"
             if sel_text:
                 decided = f"{decided}（选了：{sel_text}）"
+            # Approval cards: the click IS the decision — submit it
+            # to the approval relay directly (no agent turn), and let
+            # the card update below show the decision itself.
+            appr_result = approval_card_decide(task_id, event_key)
+            if appr_result is not None:
+                decided = appr_result[0]
             if task_id:
                 card.update(
                     {
@@ -2283,6 +2381,13 @@ class Gateway:
                 }
                 self._save_reqmap()
             title = card.get("title") or "确认卡片"
+            if appr_result is not None:
+                inbox_text = (f"[审批卡片点击] 「{title}」 task_id={task_id} "
+                              f"决定={APPROVAL_CARD_KEYS[event_key]} "
+                              f"提交={'成功' if appr_result[1] else '失败'}")
+            else:
+                inbox_text = (f"[卡片点击] 「{title}」 task_id={task_id} "
+                              f"选择={decided} (event_key={event_key})")
             self.append_jsonl(
                 INBOX,
                 {
@@ -2292,15 +2397,29 @@ class Gateway:
                     "chatid": chatid,
                     "from_userid": from_userid,
                     "msgtype": "event",
-                    "text": f"[卡片点击] 「{title}」 task_id={task_id} 选择={decided} (event_key={event_key})",
+                    "text": inbox_text,
                     "media": [],
-                    "auto_handled": False,
+                    # Approval clicks are fully handled by the gateway
+                    # itself; waking an agent for them would just add
+                    # a redundant "已收到" reply per decision.
+                    "auto_handled": appr_result is not None,
                     "raw": body,
                 },
             )
             self.msgs_received += 1
             self._mark_seen(str(msgid or ""))
             if task_id:
+                if appr_result is not None:
+                    update_title = appr_result[0]
+                    update_sub = (f"「{title}」— 决定已提交，执行结果随后以文字通知。"
+                                  if appr_result[1] else
+                                  f"「{title}」— 提交失败，请改用文字 /批准 或在 Muse 应用里处理。")
+                elif sel_text:
+                    update_title = "已确认 ✅" if event_key == "btn_confirm" else "已取消 ❌" if event_key == "btn_cancel" else "已提交 ✅" if is_submit else "已收到 ✅"
+                    update_sub = f"「{title}」— 你选了：{sel_text}"
+                else:
+                    update_title = "已确认 ✅" if event_key == "btn_confirm" else "已取消 ❌" if event_key == "btn_cancel" else "已提交 ✅" if is_submit else "已收到 ✅"
+                    update_sub = f"「{title}」— Muse 已收到，正在处理后续。"
                 try:
                     resp = await self.send_frame(
                         {
@@ -2311,9 +2430,9 @@ class Gateway:
                                 "template_card": {
                                     "card_type": "text_notice",
                                     "main_title": {
-                                        "title": "已确认 ✅" if event_key == "btn_confirm" else "已取消 ❌" if event_key == "btn_cancel" else "已提交 ✅" if is_submit else "已收到 ✅"
+                                        "title": update_title
                                     },
-                                    "sub_title_text": (f"「{title}」— 你选了：{sel_text}" if sel_text else f"「{title}」— Muse 已收到，正在处理后续。")[:112],
+                                    "sub_title_text": update_sub[:112],
                                     # text_notice updates are rejected without a
                                     # valid card_action (errcode 42045, verified
                                     # live 2026-10-04: every click update failed
