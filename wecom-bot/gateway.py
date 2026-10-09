@@ -603,11 +603,14 @@ def _task_overview_text(channel, state_dir, hook_state_dir):
 # arrival ack at all — the in-place think stream opened for every
 # inbound message already signals receipt, and a message arriving
 # before the running turn starts replying is merged into that turn
-# by the bridge. A message that truly has to wait is announced by
-# the feedback scan instead: STARTED_NOTICE_TEMPLATE when its turn
-# begins, and one BRIDGE_WAIT_TEMPLATE reminder after
-# WAIT_REMIND_SECS still queued. (The old "queued at position N"
-# arrival ack this replaces was WeCom-only leftover behaviour.)
+# by the bridge. The feedback scan announces the turn itself:
+# STARTED_NOTICE_TEMPLATE exactly once when the snapshot shows this
+# msgid active and not merged — a queued waiter and an idle bridge
+# that starts the turn directly (register-time queued=False) alike —
+# and one BRIDGE_WAIT_TEMPLATE reminder after WAIT_REMIND_SECS for a
+# record that was actually queued. Merged turns never get the
+# started notice. (The old "queued at position N" arrival ack this
+# replaces was WeCom-only leftover behaviour and stays gone.)
 STARTED_NOTICE_TEMPLATE = "▶️ 排到你了，开始处理：「{excerpt}」〔#{code}〕"
 BRIDGE_WAIT_TEMPLATE = "⏳ 还在排队（原生通道第 {n} 位）：前面任务还没结束，已等{dur}〔#{code}〕；/stop 取消"
 WAIT_REMIND_SECS = 180
@@ -1342,7 +1345,10 @@ class Gateway:
         # via_bridge}. A record lives from a diverted message's
         # arrival until its formal reply is delivered (see
         # _feedback_on_reply); _feedback_scan_once drives the
-        # started / long-wait transition notices from it.
+        # started / long-wait transition notices from it. `queued`
+        # is the register-time snapshot (something was already
+        # ahead); it gates the wait reminder only. Started fires
+        # from the live active snapshot, including queued=False.
         self.feedback_track: dict[str, dict] = {}
         # Outbound coalescer (v2 idle-gap): built lazily by the
         # outbox loop; _coalesce_pending keeps the original rows of
@@ -1967,11 +1973,15 @@ class Gateway:
         """Register a diverted message for transition notices.
 
         NO arrival ack is sent (aligned with Weixin 2026-10-09):
-        the think stream signals receipt. The record is marked
-        queued only when the bridge already has work running or
-        queued and this message is not itself the running one —
-        an idle bridge starts its turn at once, so there is nothing
-        to announce. Stop imperatives are never tracked: they are
+        the think stream signals receipt, and the removed
+        queue-position ack stays removed. The record is marked
+        queued only when the bridge snapshot already has work
+        running or queued and this message is not itself the
+        running one. That flag gates the long-wait reminder only.
+        An idle snapshot (active empty, queue empty) stores
+        queued=False; the feedback scan still emits exactly one
+        started notice once this msgid shows up active and not
+        merged. Stop imperatives are never tracked: they are
         handled by the cancel path, not the queue. Fire-and-forget:
         any failure is logged and swallowed."""
         try:
@@ -2014,12 +2024,14 @@ class Gateway:
             pass
 
     def _feedback_scan_once(self, now=None):
-        """Transition notices for bridge-queued messages: poll the
-        bridge queue snapshot once and queue, per tracked queued
-        message,
-        - a "started" notice when it moves queued -> active, and
-        - one "still waiting" reminder when it has sat in the
-          bridge queue for WAIT_REMIND_SECS.
+        """Transition notices for diverted messages: poll the bridge
+        queue snapshot once and queue, per tracked via_bridge message,
+        - a "started" notice when it is active and not merged, whether
+          or not register marked it queued (an idle bridge stores
+          queued=False; that record used to be skipped, so a direct
+          idle→active start never announced), and
+        - one "still waiting" reminder when a record that was actually
+          queued has sat in the bridge queue for WAIT_REMIND_SECS.
         A message the bridge merged into the running turn (snapshot
         active entry flagged merged) never "starts" on its own, so
         its started notice is suppressed for good — the bound
@@ -2039,7 +2051,12 @@ class Gateway:
             b_pos = {str(m): i + 1 for i, m in enumerate(b_queued)}
             sent = 0
             for mid, rec in list(track.items()):
-                if not rec.get("via_bridge") or not rec.get("queued"):
+                # Watch every diverted turn. `queued` is only the
+                # register-time "something was already ahead" bit and
+                # gates the wait reminder below; requiring it here
+                # dropped idle→active starts (live: long video, formal
+                # reply delivered, no 「▶️ 排到你了」).
+                if not rec.get("via_bridge"):
                     continue
                 if now - float(rec.get("ts") or now) > 7200:
                     track.pop(mid, None)
@@ -2058,7 +2075,8 @@ class Gateway:
                                 code=str(mid)[:8]),
                             "started"):
                         sent += 1
-                elif mid in b_pos and not rec.get("wait_reminded"):
+                elif (rec.get("queued") and mid in b_pos
+                      and not rec.get("wait_reminded")):
                     waited = now - float(rec.get("queued_at") or now)
                     if waited >= WAIT_REMIND_SECS:
                         rec["wait_reminded"] = True
