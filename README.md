@@ -10,7 +10,10 @@ Dual mobile channels for Muse, running in parallel on one VM:
   wrapper `wecom`). systemd unit: `wecom-bot.service`.
 - `channel-restore/` — self-heal for both gateways: `restore.sh` reinstalls /
   restarts the systemd units if they vanish (e.g. after a VM replacement);
-  `channel-restore.timer` runs it every 5 minutes.
+  `channel-restore.timer` runs it every 5 minutes. The timer unit is
+  deleted by the same replacement, so it cannot restart itself. The
+  heartbeat checklist and the external read-only check are
+  [HEARTBEAT.md](HEARTBEAT.md) and `channel-restore/liveness-probe.sh`.
 - `slash-commands-2026-10-04.md` — the in-chat slash command table
   (/ping /status /queue /jump /stop /new /help /check /subagent) implemented
   by the gateways.
