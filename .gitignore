@@ -19,6 +19,8 @@
 !/hooks/definitions/*.json
 !/tests/
 !/tests/*.py
+!/docs/
+!/docs/*.md
 !/slash-commands-2026-10-04.md
 !/native-bridge/
 !/native-bridge/native_bridge.py
