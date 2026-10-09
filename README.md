@@ -27,7 +27,11 @@ env file outside the tree:
 - WeCom: `~/.config/wecom-bot/credentials.env` (`WECOM_CRED_FILE`)
 
 Runtime state (`state/`), virtualenvs (`.venv/`), and backups (`*.bak-*`)
-are gitignored.
+are gitignored. Hatch probe scratch is too: everything under
+`native-probe/` except `gw2.py` and `README.md`, plus
+`outbound-probe-draft-*.md` anywhere in the tree. How to classify a
+leftover file once the hatch `git status` list is in hand is
+`docs/hatch-untracked-disposition.md`.
 
 ## Run
 

@@ -62,9 +62,10 @@
 - 下一步：接受现状（文档化）或再加一层独立于 VM 的存活探测，二选一并记录。
 
 ### 11. 未跟踪草稿待处置
-- `channel-restore/outbound-probe-draft-2026-10-08.md` 自 2026-10-08 起未跟踪悬置。
-- 2026-10-09：当前 git 树（main 及本分支）里没有这个文件，工作区也是干净的。不能在没有正文的情况下代为提交或删除。
-- 下一步：在仍留着该未跟踪文件的 VM 上打开它，有用就提交，没用就删。不要在别的克隆里凭记忆重写一份。
+- `channel-restore/outbound-probe-draft-2026-10-08.md` 自 2026-10-08 起未跟踪悬置。hatch `/home/hatch/workspace` 另有约 21 条未跟踪 `??`（此前报告为该草稿 + `native-probe/*` 探针归档）。本克隆没有这些文件，逐条瓷单未到。
+- 2026-10-09：不能在没有正文的情况下代为提交或删除，也不要在别的克隆里凭记忆重写。
+- 处置计划与忽略规则：`docs/hatch-untracked-disposition.md`。`.gitignore` 已忽略 `native-probe/` 下除 `gw2.py` 与 `README.md` 以外的内容，以及任意目录的 `outbound-probe-draft-*.md`。忽略只让 git 不再把它们报成脏文件，磁盘上的文件还在。
+- 下一步：在 hatch 上按该文档先导出瓷单再填表。keep 才补否定规则并提交；delete 只删表里点名的路径，且不在这项的准备提交里做。生产文件（网关、桥、hooks、`channel-restore/restore.sh` 与 unit）不删。
 
 ### 12. 企微合并消息指针回复（平台差异，非 bug，备查）
 - 企微网关不消费 `feedback_clear`，被合并消息必须单独发一条「（已并入上一条处理）」指针回复关 think stream，微信侧是静默清除。平台限制，无修复计划，仅防误判为 bug 重查。
