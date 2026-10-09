@@ -72,6 +72,12 @@ suspends BOTH hooks, and silently swallows waiting messages (learned
 twice in production, 2026-10-05). Change definitions only through the
 hooks API, never by editing the JSON in place.
 
+Cold-channel death watch (`DEATH_WATCH_SECS=1800` in the inbox hooks)
+has a written drill plan and a default-off sandbox script. Do not run
+either against the live hatch until that plan's authorization line is
+filled in: `docs/cold-death-drill-2026-10-09.md`,
+`ops/cold_death_drill.py`.
+
 ## Tests
 
 Sandbox suites live in `tests/`. They run the real hook scripts and
