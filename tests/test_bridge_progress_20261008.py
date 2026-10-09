@@ -49,6 +49,21 @@ nb.CFG["channels"]["weixin"]["bot_state"] = str(WX)
 nb.CFG["channels"]["wecom"]["bot_state"] = str(WC)
 nb.STATE_F = str(SBX / "state.json")
 nb.STATUS_F = str(SBX / "status.json")
+# BASE must be sandboxed too (found 2026-10-08 during the LT2
+# production rollout): longtask_mode() reads longtask-<channel>
+# flag files from BASE, so with the real BASE this suite's section-1
+# expectations (gate-off poll_turn semantics) silently depended on
+# no production longtask-weixin flag existing. Once that flag was
+# created, 1A/1B/1D2/1F failed with correct gate-on trailing
+# behaviour. Sandbox BASE from the start so the suite is hermetic.
+# The sandbox must mirror the production flags this suite relies
+# on: enabled-<channel> present (live addressing in deliver_reply),
+# longtask-<channel> absent (gate-off semantics in section 1), and
+# a shadow/ dir for the paths BASE-relative helpers can build.
+nb.BASE = str(SBX)
+(SBX / "shadow").mkdir(parents=True, exist_ok=True)
+for _flag in ("enabled-weixin", "enabled-wecom"):
+    (SBX / _flag).touch()
 
 RESULTS = []
 
