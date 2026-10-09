@@ -51,6 +51,21 @@ nb.CFG["channels"]["weixin"]["bot_state"] = str(WX)
 nb.CFG["channels"]["wecom"]["bot_state"] = str(WC)
 nb.STATE_F = str(SBX / "state.json")
 nb.STATUS_F = str(SBX / "status.json")
+# BASE must be sandboxed too (found 2026-10-09 when Grok ran this
+# suite from a fresh clone and got 22/30): live_mode() reads
+# enabled-<channel> flag files from BASE and shadow delivery writes
+# BASE/shadow/<channel>-outbox.jsonl. With the production BASE the
+# suite silently borrowed the live flags and shadow dir; in a fresh
+# clone (no enabled-* flags, no shadow/) every delivery in
+# sections 2-6 went to the shadow outbox instead of the sandbox
+# bot_state outbox and failed. Same fix the progress suite got in
+# 13816b4: point BASE at the sandbox, mirror the production flags
+# the suite relies on (enabled-<channel> present so addressing is
+# live, longtask-<channel> absent), and provide a shadow/ dir.
+nb.BASE = str(SBX)
+(SBX / "shadow").mkdir(parents=True, exist_ok=True)
+for _flag in ("enabled-weixin", "enabled-wecom"):
+    (SBX / _flag).touch()
 
 RESULTS = []
 
