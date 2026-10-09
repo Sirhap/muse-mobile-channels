@@ -254,6 +254,18 @@ check("A outbox_result_ok: missing id is pending",
       nb.outbox_result_ok("weixin", "no-such-row") is None)
 check("A outbox_result_ok: shadow channel is pending",
       nb.outbox_result_ok("wecom", nb.bridge_row_id("m-ok")) is None)
+old_id = nb.bridge_row_id("m-old")
+pad = "".join(
+    json.dumps({"id": f"pad-{i}", "ok": True}, ensure_ascii=False) + "\n"
+    for i in range(12000))
+(WX / "outbox_results.jsonl").write_text(
+    json.dumps({"id": old_id, "ok": False}) + "\n"
+    + json.dumps({"id": old_id, "ok": True}) + "\n"
+    + pad,
+    encoding="utf-8")
+check("A outbox_result_ok: verdict older than 256KB still found",
+      (WX / "outbox_results.jsonl").stat().st_size > 262144
+      and nb.outbox_result_ok("weixin", old_id) is True)
 
 # ---------------------------------------------------------------- B
 # No wall-clock cap: far past the old 600s, a fresh last reply keeps
@@ -477,6 +489,68 @@ set_state("weixin", turns=[turn], last_boundary_ts=0, session_id="sid1")
 w.step(str(spool), None)
 rows = [r for r in read_jsonl(WX / "outbox.jsonl") if r.get("mode") == "send"]
 check("G user echo is not a progress trigger", rows == [])
+
+
+def tool_ev(seq):
+    return {"event_name": "tool.invoke", "seq": seq,
+            "payload": {"name": "shell"}}
+
+
+(WX / "outbox.jsonl").unlink(missing_ok=True)
+stub = StubGW()
+stub.status = "running"
+stub.history = [tool_ev(11), asst(12, "最终答案")]
+w = worker_with("weixin", stub)
+turn = make_turn(msgid="m-sup", sent_at=sent,
+                 last_activity_poll=int(time.time()),
+                 hist_seen_seq=10)
+set_state("weixin", turns=[turn], last_boundary_ts=0, session_id="sid1")
+w.step(str(spool), None)
+sup_sends = [r for r in read_jsonl(WX / "outbox.jsonl")
+             if r.get("mode") == "send"]
+check("G reply supersedes same-batch tool progress",
+      [r["content"] for r in replies_for("m-sup")] == ["最终答案"]
+      and not any("还在处理中" in (r.get("content") or "")
+                  for r in sup_sends))
+check("G superseded history_dirty is cleared",
+      nb.load_state()["channels"]["weixin"]["turns"][0].get(
+          "history_dirty") is False)
+
+(WX / "outbox.jsonl").unlink(missing_ok=True)
+stub = StubGW()
+stub.status = "running"
+stub.history = [tool_ev(11), asst(12, "后到的答案")]
+w = worker_with("weixin", stub)
+turn = make_turn(msgid="m-sup2", sent_at=sent,
+                 last_activity_poll=int(time.time()),
+                 hist_seen_seq=11, history_dirty=True,
+                 last_event_prog=int(time.time())
+                 - nb.LT_EVENT_PROG_MIN_SECS - 1)
+set_state("weixin", turns=[turn], last_boundary_ts=0, session_id="sid1")
+w.step(str(spool), None)
+sup_sends = [r for r in read_jsonl(WX / "outbox.jsonl")
+             if r.get("mode") == "send"]
+check("G a pending dirty flag does not outlive the reply",
+      [r["content"] for r in replies_for("m-sup2")] == ["后到的答案"]
+      and not any("还在处理中" in (r.get("content") or "")
+                  for r in sup_sends))
+
+(WX / "outbox.jsonl").unlink(missing_ok=True)
+stub = StubGW()
+stub.status = "running"
+stub.history = [asst(11, "先回一段"), tool_ev(12)]
+w = worker_with("weixin", stub)
+turn = make_turn(msgid="m-sup3", sent_at=sent,
+                 last_activity_poll=int(time.time()),
+                 hist_seen_seq=10)
+set_state("weixin", turns=[turn], last_boundary_ts=0, session_id="sid1")
+w.step(str(spool), None)
+sup_sends = [r for r in read_jsonl(WX / "outbox.jsonl")
+             if r.get("mode") == "send"]
+check("G a tool row newer than the reply still notifies",
+      [r["content"] for r in replies_for("m-sup3")] == ["先回一段"]
+      and any("还在处理中" in (r.get("content") or "")
+              for r in sup_sends))
 
 stub = StubGW()
 stub.status = "running"

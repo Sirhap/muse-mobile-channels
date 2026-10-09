@@ -270,6 +270,11 @@ def outbox_result_ok(ch, row_id):
     close does not wait on it (a wait would pin the queue to WeChat
     send latency). Callers log the verdict so a live check can grep
     ``outbox_ok=``.
+
+    The bound reply is written at the start of the turn. With no
+    trailing cap the results file can grow well past that row before
+    close, so this reads the whole file once (close is not the hot
+    path). The latest row for the id wins.
     """
     if not row_id or not live_mode(ch):
         return None
@@ -277,14 +282,11 @@ def outbox_result_ok(ch, row_id):
                      "outbox_results.jsonl")
     try:
         with open(p, "rb") as f:
-            f.seek(0, os.SEEK_END)
-            size = f.tell()
-            f.seek(max(0, size - 262144))
-            tail = f.read().decode("utf-8", "replace")
+            text = f.read().decode("utf-8", "replace")
     except OSError:
         return None
     verdict = None
-    for line in tail.splitlines():
+    for line in text.splitlines():
         line = line.strip()
         if not line or row_id not in line:
             continue
@@ -962,21 +964,46 @@ class ChannelWorker(threading.Thread):
         if prev is None:
             turn["hist_seen_seq"] = hi
             self._turns_dirty = True
+        elif hi > prev:
+            fresh = False
+            for ev in evs or []:
+                seq = ev.get("seq") or 0
+                if seq <= prev:
+                    continue
+                if _history_progress_event(ev, baseline):
+                    fresh = True
+                    break
+            turn["hist_seen_seq"] = hi
+            self._turns_dirty = True
+            if fresh:
+                turn["history_dirty"] = True
+        # A completed reply already in this history is the user's
+        # update. If it is at least as new as every progress row,
+        # drop history_dirty so step() does not add 「还在处理中」
+        # beside that reply (including a dirty flag left pending
+        # by the 60s notice throttle).
+        self._clear_superseded_history_dirty(turn, evs)
+
+    def _clear_superseded_history_dirty(self, turn, evs):
+        """Clear history_dirty when a completed reply supersedes it."""
+        if not turn.get("history_dirty"):
             return
-        if hi <= prev:
-            return
-        fresh = False
+        baseline = turn.get("baseline") or 0
+        newest_reply = 0
+        newest_progress = 0
         for ev in evs or []:
             seq = ev.get("seq") or 0
-            if seq <= prev:
+            if seq <= baseline:
                 continue
-            if _history_progress_event(ev, baseline):
-                fresh = True
-                break
-        turn["hist_seen_seq"] = hi
-        self._turns_dirty = True
-        if fresh:
-            turn["history_dirty"] = True
+            if is_turn_reply(ev, baseline):
+                if seq > newest_reply:
+                    newest_reply = seq
+            elif _history_progress_event(ev, baseline):
+                if seq > newest_progress:
+                    newest_progress = seq
+        if newest_reply and newest_reply >= newest_progress:
+            turn["history_dirty"] = False
+            self._turns_dirty = True
 
     def _outbox_ok_label(self, turn):
         """'true' / 'false' / 'pending' for the bound reply's outbox row."""
