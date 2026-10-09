@@ -723,12 +723,15 @@ try:
                      chattype="group", sent_at=sent_h, next_prog=0,
                      text="生成一段视频")
     w.progress_notice(turn, 12 * 60)
-    run_sends = [r for r in read_jsonl(wc_out) if r.get("mode") == "send"]
+    run_sends = [r for r in read_jsonl(wc_out)
+                 if r.get("mode") == "reply_notice"]
     check("H still-running turn still gets the 12-minute notice",
           len(run_sends) == 1
+          and run_sends[0].get("msgid") == "6f3fcd57-run"
           and "还在处理中" in (run_sends[0].get("content") or "")
           and "12 分钟" in (run_sends[0].get("content") or "")
-          and "6f3fcd57" in (run_sends[0].get("content") or ""))
+          and "6f3fcd57" in (run_sends[0].get("content") or "")
+          and not any(r.get("mode") == "send" for r in read_jsonl(wc_out)))
 
     wc_out.unlink(missing_ok=True)
     done = make_turn(msgid="6f3fcd57-done", chatid="grp-live",
@@ -753,7 +756,7 @@ try:
                     and r.get("msgid") == "6f3fcd57-same"]
     same_files = [r for r in same_rows if r.get("mode") == "reply_file"
                   and r.get("msgid") == "6f3fcd57-same"]
-    same_prog = [r for r in same_rows if r.get("mode") == "send"
+    same_prog = [r for r in same_rows if r.get("mode") == "reply_notice"
                  and "还在处理中" in (r.get("content") or "")]
     check("H same step delivers the formal text",
           [r.get("content") for r in same_replies] == ["视频已生成"])
@@ -786,7 +789,7 @@ try:
               session_id="sid1")
     w.step(str(wc_spool), None)
     later_rows = read_jsonl(wc_out)
-    later_prog = [r for r in later_rows if r.get("mode") == "send"
+    later_prog = [r for r in later_rows if r.get("mode") == "reply_notice"
                   and "还在处理中" in (r.get("content") or "")]
     later_tail = [r for r in later_rows if r.get("mode") == "send"
                   and r.get("content") == "补充说明"]
