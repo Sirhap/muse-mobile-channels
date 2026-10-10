@@ -15,7 +15,7 @@ systemd units, or hook definitions.
 | 时间 | 2026-10-10 14:25 Asia/Shanghai |
 | 渠道 | `wecom` |
 | 会收到演练通知的会话 | `chatid=wrzLPjBgAAU5nM4RBfC6pUN5TegxRbOA` `chattype=group` |
-| 演练 msgid | 授权当时填写演练 A 轮 `drill-deathwatch-20261010142934-wecom`。验收通过的是演练 4b `drill-deathwatch-1791616087-wecom4b`。A 至 4a 仍为 FAIL，见下一节 |
+| 演练 msgid | `drill-deathwatch-1791616087-wecom4b`（wecom4b，验收 PASS）。授权当时填写的 A 轮 `drill-deathwatch-20261010142934-wecom` 及 B–4a 为失败轮，见下一节 |
 | 范围 | 沙箱 + 线上第二判 |
 | 队列当时为空 | 是 |
 
@@ -25,14 +25,14 @@ systemd units, or hook definitions.
 
 ## 线上结果（2026-10-10，演练 4b 验收 PASS）
 
-同一张授权表下，演练 4b 验收 PASS，待办第 5 项据此划掉。授权表里当初填写的 msgid 仍是演练 A 轮。通过条件是停止通知的 hatch 原文同时含「任务已停止」和字面大写 `DRILL`（演练句为「【DRILL 冷判死】」），并且 `outbox_results.jsonl` 里同一 id 为 `ok=true`。展示路径会吞掉「【DRILL】」。判定时用 hatch outbox 的 base64 或 repr，演练 4b 的通过依据是这段原文。演练 A 到演练 4a 仍记 FAIL。
+同一张授权表下，演练 4b / wecom4b 验收 PASS，待办第 5 项据此划掉。授权表里的过关 msgid 是 `drill-deathwatch-1791616087-wecom4b`。通过条件是停止通知的 hatch 原文同时含「任务已停止」和字面大写 `DRILL`（演练句为「【DRILL 冷判死】」），并且 `outbox_results.jsonl` 里同一 id 为 `ok=true`。纯文本或展示链路会吞掉「【DRILL…】」前缀，导致误判。判定时用 hatch outbox 的 B64、repr，或 `"DRILL" in content`。演练 A 到演练 4a 仍记 FAIL。
 
 | 轮次 | 结论 | msgid | outbox id |
 | --- | --- | --- | --- |
 | 演练 A | FAIL | `drill-deathwatch-20261010142934-wecom` | `963d4892d454` |
 | 演练 B | FAIL（PASS 作废） | `drill-deathwatch-20261010143433-wecom2` | `b4143d0b7681` |
 | 演练 C | FAIL，已回滚 | `drill-deathwatch-1791614953-wecom3` | `a87618d6800b` |
-| 演练 4a | FAIL | 本次未附 | 本次未附 |
+| 演练 4a（wecom4） | FAIL（幻影 FOUND=False） | 未单列 | `da1dee713c7c` |
 | 演练 4b | PASS | `drill-deathwatch-1791616087-wecom4b` | `3a6457e42768` |
 
 演练 A 失败。since `1791611874`。`cancelled.json` 只多了这一条 msgid（ts `1791613779.79`）。停止通知 outbox id `963d4892d454`，`outbox_results` `ok=true`，ts `1791613781`。正文含「任务已停止」，摘录是「演练消息，不是用户」〔#drill-de〕，没有字面大写 `DRILL`。没有「自动续跑一次」，没有误取消其他 msgid，这一轮没有走回滚。服务保持活动，`DEATH_WATCH_SECS` 未改。快照：`SNAP=/tmp/death-watch-drill-snap-20261010142920`（hatch）。
@@ -41,9 +41,13 @@ systemd units, or hook definitions.
 
 演练 C 失败并已回滚。msgid `drill-deathwatch-1791614953-wecom3`，停止通知 outbox id `a87618d6800b`，正文没有字面大写 `DRILL`。回滚已经做完。
 
-演练 4a 仍记 FAIL。这次结案没有附它的 msgid 和 outbox id。
+演练 4a 仍记 FAIL。outbox id `da1dee713c7c`（wecom4，幻影 FOUND=False）。msgid 未单列。展示链路吞掉「【DRILL…】」前缀。
 
-演练 4b 验收 PASS。msgid `drill-deathwatch-1791616087-wecom4b`。停止通知 outbox id `3a6457e42768`，`ok=true`。hatch base64 解出的正文同时含「任务已停止」和「【DRILL 冷判死】」。
+演练 4b 验收 PASS。msgid `drill-deathwatch-1791616087-wecom4b`。会话 `chatid=wrzLPjBgAAU5nM4RBfC6pUN5TegxRbOA` `chattype=group`。since `1791614187`。停止通知 outbox id `3a6457e42768`，`outbox_results` `ok=true`，ts≈`1791616092`。快照：`SNAP=/tmp/death-watch-drill-snap4b-20261010070807`（hatch）。`cancelled.json` 只多了这一条 msgid。没有误取消其他 msgid。没有「自动续跑一次」。`DEATH_WATCH_SECS` 未改。服务保持活动。hatch 原文（CONTENT_B64 解码）：
+
+⚠️ 任务已停止（续跑后仍没再收到它本人的推送）：「【DRILL 冷判死】演练消息，不是用户」〔#drill-de〕（无它本人的推送记录）。这不是已确认的执行失败，是它不再推送、已按规矩停止等待。需要重试直接告诉我。
+
+CONTENT_B64：`4pqg77iPIOS7u+WKoeW3suWBnOatou+8iOe7rei3keWQjuS7jeayoeWGjeaUtuWIsOWug+acrOS6uueahOaOqOmAge+8ie+8muOAjOOAkERSSUxMIOWGt+WIpOatu+OAkea8lOe7g+a2iOaBr++8jOS4jeaYr+eUqOaIt+OAjeOAlCNkcmlsbC1kZeOAle+8iOaXoOWug+acrOS6uueahOaOqOmAgeiusOW9le+8ieOAgui/meS4jeaYr+W3suehruiupOeahOaJp+ihjOWksei0pe+8jOaYr+Wug+S4jeWGjeaOqOmAgeOAgeW3suaMieinhOefqeWBnOatouetieW+heOAgumcgOimgemHjeivleebtOaOpeWRiuivieaIkeOAgg==`
 
 ## 现在的判死到底看什么
 
@@ -347,4 +351,4 @@ CLI，没有 `outbox_results.jsonl` 的 `ok=true`，也不能代替用户看见�
 有没有误伤。没做线上投递就不要把第 5 项划掉。沙箱通过只说明仓库钩子的分流还在，
 生产实证仍是那一条真的 `ok=true`。
 
-2026-10-10 的回填写在上文「线上结果」和待办第 5 项。演练 4b（msgid `drill-deathwatch-1791616087-wecom4b`，outbox `3a6457e42768`，`ok=true`）验收 PASS：hatch base64 正文同时含「任务已停止」和「【DRILL 冷判死】」。第 5 项已划掉。演练 A 到演练 4a 仍记 FAIL。展示路径会吞掉「【DRILL】」，正文判定用 hatch outbox 的 base64 或 repr。
+2026-10-10 的回填写在上文「线上结果」和待办第 5 项。演练 4b / wecom4b（msgid `drill-deathwatch-1791616087-wecom4b`，outbox `3a6457e42768`，`ok=true`，ts≈`1791616092`）验收 PASS 关单：hatch base64 正文同时含「任务已停止」和「【DRILL 冷判死】」。第 5 项已划掉。演练 A 到演练 4a 仍记 FAIL（4a outbox `da1dee713c7c`，幻影 FOUND=False）。展示链路会吞掉「【DRILL…】」前缀，正文判定用 hatch outbox 的 B64、repr 或 `"DRILL" in content`。
