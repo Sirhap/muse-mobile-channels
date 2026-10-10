@@ -7,14 +7,17 @@ chat.py's Chat.send resident loop):
   A. Trailing loop: three reply segments in one turn are delivered
      one by one (first as the bound reply, the rest as unbound idle
      sends), the unified cursor advances, and the turn closes only
-     after status=completed + TRAILING_QUIET_SECS of silence.
-     Re-delivery of an already-pushed segment is deduped. Closing
-     consults outbox_results for the bound reply (ok / pending).
+     after TWO consecutive polls of status=completed +
+     TRAILING_QUIET_SECS of silence with no newer history row. The
+     first such poll only arms trailing_quiet_seen. Re-delivery of
+     an already-pushed segment is deduped. Closing consults
+     outbox_results for the bound reply (ok / pending).
   B. There is no wall-clock cap. A turn that has been trailing for
      much longer than the old 600s cap stays open while the last
-     reply is fresh. It closes only on completed + quiet. After
-     that close, idle_push_scan continues on the SAME cursor and
-     pushes a later arrival exactly once.
+     reply is fresh. It closes only on two consecutive
+     completed+quiet polls. After that close, idle_push_scan
+     continues on the SAME cursor and pushes a later arrival
+     exactly once.
   C. A new activity event triggers an immediate progress_notice via
      step() (even before PROG_FIRST_SECS) carrying the 最近动态 line;
      with no new event and age < 120s, no notice is sent.
@@ -26,6 +29,13 @@ chat.py's Chat.send resident loop):
      raises exactly ONE visible alert (hourly cap).
   F. Gate off (wecom carries no longtask flag in the sandbox):
      poll_turn keeps the pre-LT2 single-reply behaviour.
+  I. Trailing close is two beats. One completed+quiet poll arms
+     trailing_quiet_seen and stays running. A late history row on
+     the next poll is delivered and clears the mark. Two consecutive
+     completed+quiet polls with no new row close on the second.
+     A return to running, or a failed sessions.get, clears the mark.
+     The queued successor does not _start_next until that confirming
+     poll. Gate off still closes on the first reply.
 
 The real bridge module is imported with channel bot_state, STATE_F,
 STATUS_F and BASE redirected into a sandbox (flag files live there,
@@ -97,6 +107,7 @@ class StubGW:
     def __init__(self):
         self.history = []
         self.status = "running"
+        self.status_exc = None
         self.activity = {"days": []}
         self.dead_sids = set()
         self.fail_exc = None
@@ -123,6 +134,8 @@ class StubGW:
                 raise self.fail_exc
             return {"chat_events": list(self.history)}
         if method == "sessions.get":
+            if self.status_exc:
+                raise self.status_exc
             return {"session_id": (path_params or {}).get("id"),
                     "status": self.status}
         if method == "activity.list":
@@ -147,7 +160,8 @@ def make_turn(**over):
          "text": "帮我做件事", "from_user": "u1", "chatid": "",
          "chattype": "", "next_prog": 0, "ids": ["m-base"],
          "reply_started": False, "sess_status": None,
-         "status_completed_seen": False, "activities": [],
+         "status_completed_seen": False, "trailing_quiet_seen": False,
+         "activities": [],
          "activity_seen": [], "last_activity_poll": 0,
          "last_activity": None, "reply_delivered": False,
          "cursor_seq": 10, "last_reply_at": 0, "trailing_since": 0,
@@ -234,7 +248,14 @@ def _capture_ok(ch, row_id):
 
 nb.outbox_result_ok = _capture_ok
 try:
-    check("A completed + quiet elapsed -> done",
+    hist_before = stub.history_calls
+    check("A completed + quiet: first poll stays running",
+          w.poll_turn(turn) == "running")
+    check("A first quiet poll arms trailing_quiet_seen, no close",
+          turn.get("trailing_quiet_seen") is True
+          and seen_ok == {}
+          and stub.history_calls == hist_before + 1)
+    check("A second completed + quiet poll -> done",
           w.poll_turn(turn) == "done")
 finally:
     nb.outbox_result_ok = orig_ok
@@ -286,7 +307,10 @@ check("B long trailing window stays open (no hard cap)",
 check("B in-window late segment still delivered",
       len(sends_with("仍在滴入")) == 1)
 turn["last_reply_at"] = int(time.time()) - nb.TRAILING_QUIET_SECS - 1
-check("B completed + quiet elapsed closes without a cap",
+check("B completed + quiet: first poll waits",
+      w.poll_turn(turn) == "running"
+      and turn.get("trailing_quiet_seen") is True)
+check("B second completed + quiet poll closes without a cap",
       w.poll_turn(turn) == "done")
 set_state("weixin", session_id="sid1", idle_push_seq=22,
           idle_pushed_ids=["am21", "am22"])
@@ -807,6 +831,179 @@ finally:
     (SBX / "longtask-wecom").unlink(missing_ok=True)
 check("H wecom flags removed again",
       not nb.live_mode("wecom") and not nb.longtask_mode("wecom"))
+
+# ---------------------------------------------------------------- I
+# Two-beat trailing close. History is read once at the top of
+# poll_turn; the close decision must not read it again or sleep.
+# Section A/B above is the same contract on the original scenarios.
+
+
+def poll_quiet(worker, turn, stub_gw):
+    """One poll_turn, counting history reads and any sleep."""
+    slept = []
+    real_sleep = time.sleep
+
+    def _trap(secs):
+        slept.append(secs)
+
+    time.sleep = _trap
+    before = stub_gw.history_calls
+    try:
+        outcome = worker.poll_turn(turn)
+    finally:
+        time.sleep = real_sleep
+    return outcome, stub_gw.history_calls - before, slept
+
+
+def quiet_delivered(msgid, seq=11, text="旧回复", sess_status="running"):
+    """A trailing turn whose last reply is already past the quiet window."""
+    quiet_at = int(time.time()) - nb.TRAILING_QUIET_SECS - 1
+    stub_gw = StubGW()
+    stub_gw.status = "completed"
+    stub_gw.history = [asst(seq, text)]
+    worker = worker_with("weixin", stub_gw)
+    turn = make_turn(
+        msgid=msgid, reply_delivered=True, cursor_seq=seq,
+        last_reply_at=quiet_at, trailing_since=quiet_at - 30,
+        reply_started=True, hist_seen_seq=seq, sess_status=sess_status,
+        last_activity_poll=int(time.time()))
+    return stub_gw, worker, turn, quiet_at
+
+
+stub, w, turn, quiet_at = quiet_delivered("m-i1", text="旧回复静默")
+outcome, reads, slept = poll_quiet(w, turn, stub)
+check("I1 quiet full + status just completed + no new history -> running",
+      outcome == "running")
+check("I1 arms trailing_quiet_seen beside sess_status, does not close",
+      turn.get("trailing_quiet_seen") is True
+      and turn.get("sess_status") == "completed")
+check("I1 history read once before the decision, no sleep",
+      reads == 1 and slept == [])
+check("I1 already-seen reply is not sent again",
+      sends_with("旧回复静默") == [])
+
+stub.history.append(asst(12, "补上的尾段"))
+outcome, reads, slept = poll_quiet(w, turn, stub)
+check("I2 next poll delivers the late segment and stays running",
+      outcome == "running" and len(sends_with("补上的尾段")) == 1
+      and turn.get("cursor_seq") == 12)
+check("I2 last_reply_at refreshed and confirmation cleared",
+      turn.get("last_reply_at", 0) > quiet_at
+      and not turn.get("trailing_quiet_seen")
+      and reads == 1 and slept == [])
+
+stub, w, turn, _quiet = quiet_delivered("m-i3", seq=31, text="静默满无新行")
+outcome, reads, slept = poll_quiet(w, turn, stub)
+check("I3 first completed+quiet poll stays running",
+      outcome == "running" and turn.get("trailing_quiet_seen") is True
+      and reads == 1 and slept == [])
+outcome, reads, slept = poll_quiet(w, turn, stub)
+check("I3 second completed+quiet poll with no new reply is done",
+      outcome == "done" and reads == 1 and slept == [])
+
+stub, w, turn, _quiet = quiet_delivered("m-i4", seq=41, text="中途又跑")
+check("I4 first completed+quiet poll arms the mark",
+      w.poll_turn(turn) == "running"
+      and turn.get("trailing_quiet_seen") is True)
+stub.status = "running"
+check("I4 status back to running clears the mark and stays open",
+      w.poll_turn(turn) == "running"
+      and turn.get("trailing_quiet_seen") is False
+      and turn.get("sess_status") == "running")
+stub.status = "completed"
+check("I4 completed again still needs another poll",
+      w.poll_turn(turn) == "running"
+      and turn.get("trailing_quiet_seen") is True)
+check("I4 the poll after the fresh arm is done",
+      w.poll_turn(turn) == "done")
+
+stub, w, turn, _quiet = quiet_delivered("m-i5", seq=51, text="状态查询失败")
+check("I5 arm before the status failure",
+      w.poll_turn(turn) == "running"
+      and turn.get("trailing_quiet_seen") is True)
+stub.status_exc = RuntimeError("sessions.get down")
+before = stub.history_calls
+check("I5 sessions.get failure does not close",
+      w.poll_turn(turn) == "running")
+check("I5 failure clears the confirmation mark, history read once",
+      turn.get("trailing_quiet_seen") is False
+      and stub.history_calls == before + 1)
+stub.status_exc = None
+check("I5 a later completed poll must arm again, not close",
+      w.poll_turn(turn) == "running"
+      and turn.get("trailing_quiet_seen") is True)
+
+(WX / "outbox.jsonl").unlink(missing_ok=True)
+quiet_at = int(time.time()) - nb.TRAILING_QUIET_SECS - 1
+stub = StubGW()
+stub.status = "completed"
+stub.history = [asst(61, "确认拍前")]
+w = worker_with("weixin", stub)
+turn = make_turn(
+    msgid="m-i6", reply_delivered=True, cursor_seq=61,
+    last_reply_at=quiet_at, trailing_since=quiet_at,
+    reply_started=True, hist_seen_seq=61, sess_status="running",
+    last_activity_poll=int(time.time()))
+set_state("weixin", turns=[turn], last_boundary_ts=0,
+          session_id="sid1", spool_offset=0, preamble_done=True)
+spool_i = SBX / "spool" / "weixin.jsonl"
+spool_i.write_text(
+    json.dumps({"msgid": "m-i6-next", "text": "下一条",
+                "from_user": "u1"}, ensure_ascii=False) + "\n",
+    encoding="utf-8")
+w.read_offset = 0
+start_calls = []
+
+
+def _record_start_next():
+    start_calls.append(True)
+
+
+w._start_next = _record_start_next
+w.step(str(spool_i), None)
+saved = nb.load_state()["channels"]["weixin"]["turns"]
+check("I6 hold poll persists the mark and does not _start_next",
+      start_calls == []
+      and len(saved) == 1
+      and saved[0]["msgid"] == "m-i6"
+      and saved[0].get("trailing_quiet_seen") is True
+      and saved[0].get("sess_status") == "completed"
+      and [row.get("msgid") for row, _n in w.queue] == ["m-i6-next"]
+      and stub.opened == []
+      and stub.history_calls == 1)
+w.step(str(spool_i), None)
+saved = nb.load_state()["channels"]["weixin"]["turns"]
+check("I6 confirming poll is when _start_next may run",
+      start_calls == [True] and saved == []
+      and stub.history_calls == 2)
+
+check("I7 longtask flag absent on wecom", not nb.longtask_mode("wecom"))
+stub = StubGW()
+stub.status = "completed"
+stub.history = [asst(71, "门控外立刻结束")]
+w = worker_with("wecom", stub)
+turn = make_turn(msgid="m-i7")
+check("I7 gate off: first reply is done immediately",
+      w.poll_turn(turn) == "done")
+rows = [r for r in read_jsonl(SBX / "shadow" / "wecom-outbox.jsonl")
+        if r.get("mode") == "reply" and r.get("msgid") == "m-i7"]
+check("I7 gate off: reply delivered, confirmation mark unused",
+      [r["content"] for r in rows] == ["门控外立刻结束"]
+      and not turn.get("trailing_quiet_seen")
+      and not turn.get("reply_delivered"))
+
+set_state("test", session_id="sid-init", preamble_done=True,
+          last_boundary_ts=0, rotate_main=False, fresh_start=False,
+          session_turns={"main": 0},
+          session_started={"main": int(time.time())})
+stub = StubGW()
+w = worker_with("test", stub)
+born = w.start_turn(
+    {"msgid": "m-init", "text": "hi", "from_user": "u1"}, w.cs())
+check("I new turns persist trailing_quiet_seen beside sess_status",
+      born.get("trailing_quiet_seen") is False
+      and born.get("sess_status") is None
+      and born.get("status_completed_seen") is False)
 
 failed = [n for n, ok in RESULTS if not ok]
 print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} passed")
