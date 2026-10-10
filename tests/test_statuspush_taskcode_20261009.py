@@ -6,9 +6,13 @@ the user can match progress / started / wait notices to a task:
 - both gateways' STARTED / BRIDGE_WAIT (and Weixin WAIT_REMIND)
   templates contain the {code} placeholder and format without error;
 - the native bridge progress_notice output contains the code.
-Run: ~/workspace/wecom-bot/.venv/bin/python (gateways) -- the bridge
-part subprocesses ~/muse-test-venv/bin/python when available.
+
+Gateway and bridge sources resolve from the repository root
+(the parent of this tests/ directory). The optional bridge probe
+subprocesses ~/muse-test-venv/bin/python when that interpreter exists.
+Run: python3 tests/test_statuspush_taskcode_20261009.py
 """
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -22,13 +26,18 @@ def check(name, cond, extra=""):
           + ((" | " + str(extra)[:200]) if extra and not cond else ""))
 
 
-WS = Path.home() / "workspace"
-sys.path.insert(0, str(WS / "wecom-bot"))
-sys.path.insert(0, str(WS / "weixin-bot"))
+# Monorepo layout: wecom-bot/ and weixin-bot/ sit next to tests/.
+# Adversarial matrix M6 failed on a Cursor box whose home had no
+# ~/workspace/wecom-bot (FileNotFoundError on gateway.py).
+REPO = Path(__file__).resolve().parents[1]
+WECOM_GATEWAY = REPO / "wecom-bot" / "gateway.py"
+WEIXIN_GATEWAY = REPO / "weixin-bot" / "gateway.py"
+NATIVE_BRIDGE = REPO / "native-bridge" / "native_bridge.py"
+sys.path.insert(0, str(REPO / "wecom-bot"))
+sys.path.insert(0, str(REPO / "weixin-bot"))
 
 # --- gateway templates (import is heavy; read + exec just the
 # template constants and format them the way the scans do) ---
-import re
 
 
 def tpl(path, name):
@@ -38,8 +47,8 @@ def tpl(path, name):
 
 
 MID = "abcd1234efgh5678"
-for chan, path in (("wecom", WS / "wecom-bot/gateway.py"),
-                   ("weixin", WS / "weixin-bot/gateway.py")):
+for chan, path in (("wecom", WECOM_GATEWAY),
+                   ("weixin", WEIXIN_GATEWAY)):
     s = tpl(path, "STARTED_NOTICE_TEMPLATE")
     check(f"{chan} STARTED carries code",
           s is not None and "{code}" in s
@@ -50,15 +59,15 @@ for chan, path in (("wecom", WS / "wecom-bot/gateway.py"),
           w is not None and "{code}" in w
           and "〔#abcd1234〕" in w.format(n=2, dur="3分钟", code=MID[:8]),
           w)
-w2 = tpl(WS / "weixin-bot/gateway.py", "WAIT_REMIND_TEMPLATE")
+w2 = tpl(WEIXIN_GATEWAY, "WAIT_REMIND_TEMPLATE")
 check("weixin WAIT_REMIND carries code",
       w2 is not None and "{code}" in w2
       and "〔#abcd1234〕" in w2.format(n=1, dur="3分钟", code=MID[:8]),
       w2)
 
 # format call sites in both gateways pass code=
-for chan, path in (("wecom", WS / "wecom-bot/gateway.py"),
-                   ("weixin", WS / "weixin-bot/gateway.py")):
+for chan, path in (("wecom", WECOM_GATEWAY),
+                   ("weixin", WEIXIN_GATEWAY)):
     src = Path(path).read_text(encoding="utf-8")
     n = src.count("code=str(mid)[:8]")
     check(f"{chan} gateway format sites pass code", n >= 2, n)
@@ -97,13 +106,11 @@ print("SOURCE-ONLY")
 '''
     r = subprocess.run([str(venv), "-c", probe],
                        capture_output=True, text=True, timeout=60)
-    src = (WS / "native-bridge/native_bridge.py").read_text(
-        encoding="utf-8")
+    src = NATIVE_BRIDGE.read_text(encoding="utf-8")
     check("bridge progress_notice embeds task code",
           "〔#{turn['msgid'][:8]}〕" in src, r.stderr[-200:])
 else:
-    src = (WS / "native-bridge/native_bridge.py").read_text(
-        encoding="utf-8")
+    src = NATIVE_BRIDGE.read_text(encoding="utf-8")
     check("bridge progress_notice embeds task code",
           "〔#{turn['msgid'][:8]}〕" in src)
 
