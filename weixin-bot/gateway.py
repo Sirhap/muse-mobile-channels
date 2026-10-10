@@ -58,6 +58,12 @@ from channel_common import (  # noqa: E402
 BASE = Path(__file__).resolve().parent
 STATE = BASE / "state"
 INBOX = STATE / "inbox.jsonl"
+# Raw retention for bridge-diverted messages (2026-10-11): diverted
+# messages skip INBOX, so without this their original payload —
+# including the ref_msg structure needed to debug quote parsing —
+# was lost. Same entry shape as INBOX; NOT consumed by the cold
+# lane, so no double processing.
+DIVERTED_RAW = STATE / "diverted_raw.jsonl"
 OUTBOX = STATE / "outbox.jsonl"
 OUTBOX_RESULTS = STATE / "outbox_results.jsonl"
 OUTBOX_OFFSET = STATE / "outbox.offset"
@@ -1543,6 +1549,15 @@ class Gateway:
 
     # ---------- inbound ----------
 
+    # Quoted-item type spellings seen across iLink payload shapes:
+    # numeric codes (as in item_list) or plain names, int or str.
+    _REF_TYPE_NAMES = {
+        1: "text", 2: "image", 3: "voice", 4: "file", 5: "video",
+        "1": "text", "2": "image", "3": "voice", "4": "file",
+        "5": "video", "text": "text", "image": "image",
+        "voice": "voice", "file": "file", "video": "video",
+    }
+
     @staticmethod
     def _ref_annotation(ref: dict) -> str | None:
         """Short suffix naming the quoted (referenced) message.
@@ -1552,40 +1567,101 @@ class Gateway:
         the inbound line); every other quote shape degrades to a
         typed marker instead of being dropped silently — on
         2026-10-10 a quoted non-text message reached the agent as a
-        bare word with no hint anything was quoted. Fail-silent: any
-        structural surprise yields the generic marker, never a raise.
+        bare word with no hint anything was quoted. A live quote on
+        2026-10-11 still landed on the generic marker, so the parser
+        now tolerates the iLink shape variants (item under
+        message_item / item / item_list[0] / ref itself, type as int,
+        numeric string or name, text under several keys) while a
+        real captured payload is collected via diverted_raw.jsonl
+        to pin the exact shape. Fail-silent: any structural surprise
+        yields the generic marker, never a raise.
         """
         try:
             if not isinstance(ref, dict) or not ref:
                 return None
-            ref_item = ref.get("message_item") or {}
-            rtype = ref_item.get("type")
-            if rtype == 1:
-                rt = (ref_item.get("text_item") or {}).get("text", "")
+
+            def _trunc(s: str) -> str:
+                return s[:200] + "…" if len(s) > 200 else s
+
+            def _str(v) -> str:
+                return v if isinstance(v, str) else ""
+
+            # Locate the quoted item across container variants.
+            item = None
+            for cand in (ref.get("message_item"), ref.get("item")):
+                if isinstance(cand, dict) and cand:
+                    item = cand
+                    break
+            if item is None:
+                il = ref.get("item_list")
+                if (isinstance(il, list) and il
+                        and isinstance(il[0], dict) and il[0]):
+                    item = il[0]
+            if item is None and ("type" in ref or "item_type" in ref
+                                 or "text_item" in ref):
+                item = ref
+            item = item or {}
+
+            raw_type = item.get("type", item.get("item_type"))
+            rtype = Gateway._REF_TYPE_NAMES.get(raw_type)
+
+            def _node_text(node: str) -> str:
+                n = item.get(node) or {}
+                if isinstance(n, dict):
+                    return _str(n.get("text", ""))
+                return ""
+
+            def _item_text() -> str:
+                v = item.get("text")
+                if isinstance(v, str):
+                    return v
+                if isinstance(v, dict):
+                    return _str(v.get("content", ""))
+                return ""
+
+            def _quoted_text() -> str:
+                # Candidate order: structured node, flat item text,
+                # then the ref-level spellings (title/text/content).
+                for v in (_node_text("text_item"), _item_text(),
+                          _str(ref.get("title")), _str(ref.get("text")),
+                          _str(ref.get("content"))):
+                    if v:
+                        return v
+                return ""
+
+            if rtype == "text":
+                rt = _quoted_text()
                 if rt:
-                    if len(rt) > 200:
-                        rt = rt[:200] + "…"
-                    return f"（引用：{rt}）"
-            elif rtype == 2:
+                    return f"（引用：{_trunc(rt)}）"
+            elif rtype == "image":
                 return "（引用：[图片]）"
-            elif rtype == 5:
+            elif rtype == "video":
                 return "（引用：[视频]）"
-            elif rtype == 4:
-                fname = (ref_item.get("file_item") or {}).get(
-                    "file_name", "")
+            elif rtype == "file":
+                fnode = item.get("file_item") or {}
+                fname = (_str(fnode.get("file_name", ""))
+                         if isinstance(fnode, dict) else "")
+                fname = (fname or _str(item.get("file_name"))
+                         or _str(ref.get("file_name")))
                 if fname:
                     return f"（引用：[文件 {fname}]）"
                 return "（引用：[文件]）"
-            elif rtype == 3:
-                vt = (ref_item.get("voice_item") or {}).get("text", "")
+            elif rtype == "voice":
+                vt = _node_text("voice_item") or _item_text()
                 if vt:
-                    if len(vt) > 200:
-                        vt = vt[:200] + "…"
-                    return f"（引用：{vt}）"
+                    return f"（引用：{_trunc(vt)}）"
                 return "（引用：[语音]）"
-            if ref.get("title"):
-                return f"（引用：{ref['title']}）"
-            if ref_item or ref.get("msgid") or ref.get("message_id"):
+            if rtype is None:
+                # Untyped ref: a ref-level text spelling (or the
+                # historical title) still names the quoted content.
+                rt = _quoted_text()
+                if rt:
+                    return f"（引用：{_trunc(rt)}）"
+            has_trace = bool(
+                item or ref.get("message_item") or ref.get("item")
+                or ref.get("item_list") or ref.get("msgid")
+                or ref.get("message_id") or ref.get("id"))
+            if has_trace:
                 return "（引用：[消息]）"
         except Exception:
             return "（引用：[消息]）"
@@ -2272,6 +2348,15 @@ class Gateway:
                      "ts": int(time.time())})
                 diverted = True
                 log(f"msg {msgid} diverted to native bridge")
+                # Keep the original payload for diverted messages
+                # (quote-structure debugging, 2026-10-11). Fail-
+                # silent: a retention failure must not break the
+                # divert that just succeeded.
+                try:
+                    self.append_jsonl(DIVERTED_RAW, entry)
+                except Exception as e:
+                    log(f"diverted raw retention failed for "
+                        f"{msgid}: {e}")
             except Exception as e:
                 log(f"native divert failed, using inbox: {e}")
         if not diverted:
