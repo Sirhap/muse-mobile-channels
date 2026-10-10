@@ -226,7 +226,7 @@ g6._save_parked(parked)
 sent_texts.clear()
 asyncio.run(g6._maybe_notify_level_up(None, {}, "lvrow", "u1", 1))
 asyncio.run(g6._maybe_notify_level_up(None, {}, "lvrow", "u1", 1))
-lv_notices = [c for (_t, c) in sent_texts if "L1 档" in c]
+lv_notices = [c for (_t, c) in sent_texts if "已压缩重试" in c]
 check("level-up notice sent exactly once per rung", len(lv_notices) == 1)
 rec = g6._load_parked()["lvrow"]
 check("level-up state persisted in parked record",

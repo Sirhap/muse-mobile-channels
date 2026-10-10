@@ -136,7 +136,7 @@ check("reply_file dispatch ok", ok is True)
 check("reply_file delivered compressed path",
       delivered.get("path", "").endswith(".jpg"))
 check("caption has compression note",
-      any("已自动压缩发送" in t for t in sent_texts))
+      any("（已压缩）" in t for t in sent_texts))
 
 sent_texts.clear()
 delivered.clear()
@@ -147,7 +147,7 @@ check("send_file dispatch ok", ok is True)
 check("send_file delivered compressed path",
       delivered.get("path", "").endswith(".jpg"))
 check("send_file synthetic note caption",
-      any(t.strip() == "（文件较大，已自动压缩发送）" for t in sent_texts))
+      any(t.strip() == "（已压缩）" for t in sent_texts))
 
 # ---------- 1/2/3. outbox loop: exemption, notify-once, dead-letter ----------
 LOOP = SBX / "loop"

@@ -542,7 +542,7 @@ def is_stop_request(text):
     return False
 
 
-SOFT_ACK_TEMPLATE = "已收到，排队第 {n} 位，当前任务进行中；/stop 取消"
+SOFT_ACK_TEMPLATE = "收到，排队第 {n} 位"
 
 # Thinking notice (user request, 2026-10-04): WeCom shows a native
 # thinking placeholder via its stream <think></think> first frame;
@@ -554,7 +554,7 @@ SOFT_ACK_TEMPLATE = "已收到，排队第 {n} 位，当前任务进行中；/st
 # the soft ack. It carries no msgid, so it never counts as batch
 # activity/completion, and the late-suppression gate (which only
 # applies to update) never touches it.
-THINKING_NOTICE_TEXT = "🤔 正在思考中，请稍等…"
+THINKING_NOTICE_TEXT = "🤔 思考中…"
 # Burst guard: a quick follow-up within the cooldown reuses the
 # notice already on screen instead of stacking another one per
 # message. Replies normally take longer than this window, so a
@@ -588,13 +588,13 @@ THINKING_NOTICE_COOLDOWN_SECS = 20
 # clears that message's record (see _feedback_on_reply), so the idle
 # path needs no time cooldown at all; burst control lives in the
 # merged branch, which only fires while a message is unanswered.
-STOP_ACK_TEXT = "🛑 收到停止请求，正在优先处理。"
-MERGED_ACK_TEXT = "📩 已收到补充，会和前面一条一起处理。"
+STOP_ACK_TEXT = "🛑 正在停止"
+MERGED_ACK_TEXT = "📩 已并入上一条"
 
-BRIDGE_WAIT_TEMPLATE = "⏳ 还在排队（原生通道第 {n} 位）：前面任务还没结束，已等{dur}〔#{code}〕；/stop 取消"
-MEDIA_ACK_TEMPLATE = "📎 已收到{what}，正在处理…"
-STARTED_NOTICE_TEMPLATE = "▶️ 排到你了，开始处理：「{excerpt}」〔#{code}〕"
-WAIT_REMIND_TEMPLATE = "⏳ 还在排队（第 {n} 位）：前面任务还没结束，已等{dur}〔#{code}〕；/stop 取消"
+BRIDGE_WAIT_TEMPLATE = "⏳ 排队中（第 {n} 位，已等{dur}）"
+MEDIA_ACK_TEMPLATE = "📎 已收到{what}，处理中"
+STARTED_NOTICE_TEMPLATE = "▶️ 开始处理：「{excerpt}」"
+WAIT_REMIND_TEMPLATE = "⏳ 排队中（第 {n} 位，已等{dur}）"
 BURST_MERGE_WINDOW_SECS = 8
 WAIT_REMIND_SECS = 180
 
@@ -2108,8 +2108,7 @@ class Gateway:
                         if self._queue_notice(
                                 user,
                                 STARTED_NOTICE_TEMPLATE.format(
-                                    excerpt=rec.get("excerpt", ""),
-                                    code=str(mid)[:8]),
+                                    excerpt=rec.get("excerpt", "")),
                                 "started"):
                             sent += 1
                     elif mid in b_pos and not rec.get("wait_reminded"):
@@ -2120,8 +2119,7 @@ class Gateway:
                                     user,
                                     BRIDGE_WAIT_TEMPLATE.format(
                                         n=b_pos[mid],
-                                        dur=_dur_str(waited),
-                                        code=str(mid)[:8]),
+                                        dur=_dur_str(waited)),
                                     "waitremind"):
                                 sent += 1
                     continue
@@ -2130,8 +2128,7 @@ class Gateway:
                     if self._queue_notice(
                             user,
                             STARTED_NOTICE_TEMPLATE.format(
-                                excerpt=rec.get("excerpt", ""),
-                                code=str(mid)[:8]),
+                                excerpt=rec.get("excerpt", "")),
                             "started"):
                         sent += 1
                 elif mid in pos_map and not rec.get("wait_reminded"):
@@ -2141,8 +2138,7 @@ class Gateway:
                         if self._queue_notice(
                                 user,
                                 WAIT_REMIND_TEMPLATE.format(
-                                    n=pos_map[mid], dur=_dur_str(waited),
-                                    code=str(mid)[:8]),
+                                    n=pos_map[mid], dur=_dur_str(waited)),
                                 "waitremind"):
                             sent += 1
             return sent
@@ -2592,6 +2588,48 @@ class Gateway:
         except Exception:
             return False
 
+    @staticmethod
+    def _same_reply_text_delivered(item: dict, content: str) -> bool:
+        """True when this reply_file's text is already the delivered
+        formal reply for the same msgid. The queue row supplies the
+        text to compare (including the subagent-label normalization
+        applied to a reply at dispatch), and OUTBOX_RESULTS must say
+        that row landed ok; a merely queued or failed reply does not
+        suppress the file caption. Fail-open, like
+        _delivered_reply_before."""
+        try:
+            if not content or not OUTBOX.exists():
+                return False
+            results: dict[str, dict] = {}
+            if OUTBOX_RESULTS.exists():
+                for line in OUTBOX_RESULTS.read_text(encoding="utf-8").splitlines():
+                    try:
+                        r = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if r.get("id"):
+                        results[r["id"]] = r
+            msgid = str(item.get("msgid", "") or "")
+            for line in OUTBOX.read_text(encoding="utf-8").splitlines():
+                try:
+                    o = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if o.get("id") == item.get("id"):
+                    continue
+                if o.get("mode") != "reply" or str(o.get("msgid", "")) != msgid:
+                    continue
+                queued = str(o.get("content", "") or "")
+                if content not in (queued,
+                                   normalize_subagent_content(msgid, queued)):
+                    continue
+                res = results.get(o.get("id"))
+                if res is not None and res.get("ok") is True:
+                    return True
+            return False
+        except Exception:
+            return False
+
     async def _typing_best_effort(self, client, creds, to, token_ctx, status):
         """Typing is cosmetic: never let it block or lose a sent reply."""
         try:
@@ -2954,8 +2992,7 @@ class Gateway:
             self._save_parked(parked)
             await self.send_text(
                 client, creds, to,
-                f"（这个文件已多次发送失败，这次降到 L{level} 档压缩"
-                "发送；原文件没动，在 VM 上可取）",
+                "⚠️ 文件发送失败，已压缩重试（原文件未动）",
                 "", "", 2, f"{item_id}:levelup")
         except Exception as e:
             log(f"level-up notice failed for {item_id}: {e}")
@@ -3043,9 +3080,12 @@ class Gateway:
                 if was_compressed and lvl > 0:
                     await self._maybe_notify_level_up(
                         client, creds, item_id, to, lvl)
-                caption = content or f"📎 {orig_name}"
+                if not content or self._same_reply_text_delivered(item, content):
+                    caption = f"📎 {orig_name}"
+                else:
+                    caption = content
                 if was_compressed:
-                    caption += "\n（文件较大，已自动压缩发送）"
+                    caption += "（已压缩）"
                 # The caption is a separate text message sent BEFORE
                 # the file. If the file step then fails transiently,
                 # a naive retry re-sends the caption every attempt —
@@ -3091,7 +3131,7 @@ class Gateway:
                             await self._maybe_notify_level_up(
                                 client, creds, item_id, to, lvl)
                         content = (content + "\n" if content else "") \
-                            + "（文件较大，已自动压缩发送）"
+                            + "（已压缩）"
                 if content and not self._caption_already_sent(item_id):
                     cap_resp = await self.send_text(
                         client, creds, to, content, "", "", 2, f"{item_id}:caption",

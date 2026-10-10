@@ -900,21 +900,9 @@ if not dry:
                 continue
             _mins = int((now - _last) // 60)
             _t = (_e0.get("text") or "").strip() or "（无文字消息）"
-            _code = str(_e0.get("msgid") or "")[:8]
-            _lp_ts, _lp_text = _last_push(_mids)
-            _lp_when = (time.strftime("%H:%M",
-                                      time.localtime(_lp_ts))
-                        if _lp_ts else
-                        time.strftime("%H:%M", time.localtime(_last)))
-            _lp_ex = ("「" + _lp_text[:30] + "」") if _lp_text else ""
-            _notice = ("⏳ 提醒：任务「" + _t[:20] + "」〔#" + _code
-                       + "〕最后一次本人推送是 " + _lp_when + _lp_ex
-                       + "，之后已约 " + str(_mins)
-                       + " 分钟没再收到它的推送（也没报错）。"
-                         "它本人再推送就继续跑、没有时长上限；"
-                         "若满 30 分钟仍无它本人的推送，我会先自动"
-                         "续跑一次并如实告诉你，不会假装还在跑。"
-                         "要取消回 /stop。")
+            _notice = ("⏳ 任务「" + _t[:20] + "」已 " + str(_mins)
+                       + " 分钟无推送（未报错），再推即继续；"
+                         "满 30 分钟无推送将自动续跑，/stop 取消")
             _sent = False
             try:
                 r = subprocess.run([cli_path, "send", "--chatid",
@@ -943,17 +931,8 @@ if not dry:
 # stall notices; a failed send does not block the resume itself.
 if not dry and _resume_notice_entries:
     for _re in _resume_notice_entries:
-        _rmid = str(_re.get("msgid") or "")
-        _lp_ts, _lp_text = _last_push([_rmid])
-        _lp_when = (time.strftime("%H:%M", time.localtime(_lp_ts))
-                    if _lp_ts else "无记录")
-        _lp_ex = ("「" + _lp_text[:30] + "」") if _lp_text else ""
         _rt = (_re.get("text") or "").strip() or "（无文字消息）"
-        _rnotice = ("♻️ 原任务已中断，已自动续跑一次：「" + _rt[:20]
-                    + "」〔#" + _rmid[:8] + "〕（它最后一次本人推送是 "
-                    + _lp_when + _lp_ex
-                    + "，之后没再收到；续跑的 worker 会先查已有产物"
-                      "再接着做，不从头重来。）")
+        _rnotice = "♻️ 任务中断，已自动续跑：「" + _rt[:20] + "」"
         try:
                 r = subprocess.run([cli_path, "send", "--chatid",
                                     str(_re.get("chatid") or ""),
@@ -997,29 +976,16 @@ if not dry:
         _parts = []
         for e in failed_entries[:3]:
             _t = (e.get("text") or "").strip() or "（无文字消息）"
-            _mid = str(e.get("msgid") or "")
-            _lp_ts, _lp_text = _last_push([_mid])
-            if _lp_ts:
-                _lp = ("（最后推送 "
-                       + time.strftime("%H:%M",
-                                       time.localtime(_lp_ts))
-                       + ("「" + _lp_text[:24] + "」" if _lp_text
-                          else "")
-                       + "，之后未再收到）")
-            else:
-                _lp = "（无它本人的推送记录）"
-            _parts.append("「" + _t[:20] + "」〔#" + _mid[:8] + "〕"
-                          + _lp)
+            _parts.append("「" + _t[:20] + "」")
         _fe = next((e for e in failed_entries if e.get("chatid")), None)
         if _fe is not None:
             _fn_pending.append({
                 "ts": now, "chatid": _fe.get("chatid"),
                 "chat_type": 2 if _fe.get("chattype") == "group" else 1,
-                "text": "⚠️ 任务已停止（续跑后仍没再收到它本人的推送）："
+                "text": "⚠️ 任务已停止："
                         + "、".join(_parts)
-                        + "。这不是已确认的执行失败，是它不再推送、"
-                          "已按规矩停止等待"
-                        + "。需要重试直接告诉我。"})
+                        + "（30 分钟无推送，续跑后仍无推送；"
+                          "非确认失败，要重试告诉我）"})
     if _fn_pending:
         _fn_still = []
         for n in _fn_pending:
@@ -1581,9 +1547,7 @@ if not dry:
     # error) does the old pending-notice ride-along remain, as a
     # fallback, so a failure is never silently dropped.
     for _fjid in failed_now:
-        _frec = jobs.get(_fjid) or {}
-        _ftext = (f"【副助手 #{_fjid} 失败】该任务两次无响应，已放弃。"
-                  f"（任务：「{str(_frec.get('text') or '')[:40]}」）")
+        _ftext = "【副助手失败】两次无响应，已放弃"
         _sent = False
         if entries:
             _chatid = entries[-1].get("chatid") or ""

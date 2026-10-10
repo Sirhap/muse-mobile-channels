@@ -52,10 +52,10 @@ RESULTS = []
 MSGID = "88c3db3e-live"
 ANCHOR = "stream-anchor"
 REQ = "req-anchor"
-STARTED = "▶️ 排到你了，开始处理：「生成视频」〔#88c3db3e〕"
-PROGRESS = "⏳ 还在处理中（已跑约 2 分钟，思考中）：「生成视频」〔#88c3db3e〕"
+STARTED = "▶️ 开始处理：「生成视频」"
+PROGRESS = "⏳ 处理中（约 2 分钟）：「生成视频」"
 FORMAL = "视频已生成"
-WAIT = "⏳ 还在排队（原生通道第 1 位）：前面任务还没结束，已等3分钟〔#88c3db3e〕"
+WAIT = "⏳ 排队中（第 1 位，已等3分钟）"
 
 
 def check(name, cond):
@@ -458,8 +458,8 @@ def scenario_bridge_progress_emitter():
           and rows[0].get("mode") == "reply_notice"
           and rows[0].get("msgid") == "88c3db3e-live"
           and rows[0].get("chatid") == "sirhao"
-          and "还在处理中" in rows[0].get("content", "")
-          and "88c3db3e" in rows[0].get("content", ""))
+          and "处理中" in rows[0].get("content", "")
+          and rows[0].get("content", "") == PROGRESS)
     (state / "outbox.jsonl").unlink()
     done = dict(running)
     done["reply_delivered"] = True
