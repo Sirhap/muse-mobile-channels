@@ -11,13 +11,13 @@ systemd units, or hook definitions.
 
 | 项 | 填写 |
 | --- | --- |
-| 授权人 | |
-| 时间 | |
-| 渠道 | `wecom`（优先）或 `weixin` |
-| 会收到演练通知的会话 | 企微 `chatid` + `chattype`，或微信 `from_user_id` |
-| 演练 msgid | `drill-deathwatch-` 开头 |
-| 范围 | 仅沙箱 / 沙箱 + 线上第二判 |
-| 队列当时为空 | |
+| 授权人 | tom Jack |
+| 时间 | 2026-10-10 14:25 Asia/Shanghai |
+| 渠道 | `wecom` |
+| 会收到演练通知的会话 | `chatid=wrzLPjBgAAU5nM4RBfC6pUN5TegxRbOA` `chattype=group` |
+| 演练 msgid | `drill-deathwatch-20261010142934-wecom` |
+| 范围 | 沙箱 + 线上第二判 |
+| 队列当时为空 | 是 |
 
 线上投递只在上一表填完、并且「范围」写明包含线上之后才做。沙箱脚本同样等这张表出现「仅沙箱」或更宽的范围再跑；写这份计划的人在开发机 `/tmp` 里验证过脚本本身，那一次不是演练，也没有连 hatch。
 
