@@ -13,6 +13,7 @@
 !/wecom-bot/
 !/channel-restore/
 !/channel_common.py
+!/death_watch_activity.py
 !/hooks/
 !/hooks/scripts/
 !/hooks/scripts/*.sh

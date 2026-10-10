@@ -57,6 +57,7 @@ if [[ ! -f "$INBOX" ]]; then
 fi
 
 PAYLOAD="$(python3 - "$SEEN" "$INBOX" "$OUTBOX" "$PENDING" "$BATCH" "$JUMP" "$BOUNDARY" "$CLAIMS" "$QA" "$STARVE" "$SUBJOBS" "$SUBREQ" "$SUBCMD" "$CLI" "$CONTEXT" "$CARRIED" "$CLEARED" <<'PYEOF'
+import importlib.util
 import json, os, subprocess, sys, time
 
 seen_path, inbox_path, outbox_path, pending_path, batch_path, jump_path, boundary_path, claims_path, qa_path, starve_path, subjobs_path, subreq_path, subcmd_path, cli_path, context_path, carried_path, cleared_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7], sys.argv[8], sys.argv[9], sys.argv[10], sys.argv[11], sys.argv[12], sys.argv[13], sys.argv[14], sys.argv[15], sys.argv[16], sys.argv[17]
@@ -97,11 +98,17 @@ DEATH_WATCH_SECS = 1800
 # (user order: liveness must be the worker pushing for itself,
 # not a clock/file inference). When no worker push has arrived
 # for DEATH_WATCH_SECS the batch is routed, in order: covered
-# by a delivered follow-up reply -> silent drop; first loss ->
-# auto-resume ONCE via the orphan re-wake path plus one factual
-# notice; second loss -> fail-stop (cancel + ONE factual stop
+# by a delivered follow-up reply -> silent drop; real activity
+# still visible on the bridge or in worker_activity.json ->
+# hold (no resume, no cancel, resume_attempts untouched, the
+# batch stays under watch; the outbox silence clock is NOT
+# restarted); first loss with no such signal -> auto-resume
+# ONCE via the orphan re-wake path plus one factual notice;
+# second loss -> fail-stop (cancel + ONE factual stop
 # notice stating the last real push, never an inferred
-# "execution failed" verdict).
+# "execution failed" verdict). A missing or unreadable probe
+# is not life: the hook then uses the resume/cancel path.
+# See death_watch_activity.py.
 CLAIM_TTL_SECS = 600
 # Preemption: queued messages must not wait behind a heartbeating long
 # batch forever. If the oldest queued message has waited
@@ -465,11 +472,113 @@ _resume_queue = {str(k): float(v) for k, v in _resume_queue.items()
 _resume_notice_entries = []
 
 
+def _load_activity_probe():
+    """Load death_watch_activity.py, or None when it cannot be loaded.
+
+    A missing probe degrades to the outbox-only decision. It must
+    not freeze the watch and must not raise into the hook poll.
+    """
+    path = (os.environ.get("DEATH_WATCH_ACTIVITY_PY")
+            or "/home/hatch/workspace/death_watch_activity.py")
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "death_watch_activity", path)
+        if spec is None or spec.loader is None:
+            return None
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    except (OSError, SyntaxError, ImportError, AttributeError, ValueError):
+        return None
+
+
+_activity_probe = _load_activity_probe()
+_BRIDGE_STATE = (os.environ.get("DEATH_WATCH_BRIDGE_STATE")
+                 or "/home/hatch/workspace/native-bridge/state.json")
+_WORKER_ACTIVITY = os.path.join(os.path.dirname(inbox_path),
+                                "worker_activity.json")
+_activity_hold_path = os.path.join(os.path.dirname(pending_path),
+                                   "activity_holds.json")
+_activity_probe_path = os.path.join(os.path.dirname(pending_path),
+                                    "activity_probe.json")
+
+
+def _assess_msgid(msgid):
+    """Probe result for one msgid. Never raises. Missing probe => not alive."""
+    if _activity_probe is None:
+        return {"alive": False, "source": None, "activity_ts": None,
+                "degraded": ["probe-missing"]}
+    try:
+        info = _activity_probe.assess(
+            str(msgid), now=now, window=DEATH_WATCH_SECS,
+            bridge_state_path=_BRIDGE_STATE,
+            worker_activity_path=_WORKER_ACTIVITY)
+    except Exception:
+        return {"alive": False, "source": None, "activity_ts": None,
+                "degraded": ["probe-error"]}
+    if not isinstance(info, dict):
+        return {"alive": False, "source": None, "activity_ts": None,
+                "degraded": ["probe-error"]}
+    return info
+
+
+def _note_activity_hold(pairs):
+    """Remember why a silent batch was left running. Best-effort."""
+    cur = _load_json_obj(_activity_hold_path)
+    for mid, info in pairs:
+        cur[str(mid)] = {
+            "ts": now,
+            "source": info.get("source"),
+            "activity_ts": info.get("activity_ts"),
+            "degraded": list(info.get("degraded") or []),
+        }
+    _save_json_obj(_activity_hold_path, cur)
+
+
+def _note_probe_degraded(rows):
+    """Record a death-watch probe that produced no signal because a source failed."""
+    _save_json_obj(_activity_probe_path, {
+        "ts": now, "rows": rows})
+
+
+def _activity_blocks(msgids):
+    """True when any msgid still has real activity.
+
+    One alive msgid holds the whole batch: siblings are not resumed
+    and not cancelled on this poll. A degraded source is not life.
+    When nothing is alive and a source failed, the failure is
+    recorded and the caller proceeds with resume/cancel.
+    """
+    holds = []
+    degraded = []
+    for mid in msgids:
+        info = _assess_msgid(str(mid))
+        if info.get("alive"):
+            holds.append((str(mid), info))
+        elif info.get("degraded"):
+            degraded.append({"msgid": str(mid),
+                             "degraded": list(info.get("degraded") or [])})
+    if holds:
+        _note_activity_hold(holds)
+        return True
+    if degraded:
+        _note_probe_degraded(degraded)
+    return False
+
+
 def _route_death(e):
     """First loss of worker pushes -> resume once (queue the msgid
     for an orphan re-wake + one factual user notice). Second loss ->
-    fail-stop via failed_entries. Returns "resume" or "fail"."""
+    fail-stop via failed_entries.
+
+    Real activity is checked again here, before either write, so a
+    caller cannot resume or cancel a msgid the probe still calls
+    alive. Returns "hold", "resume", or "fail". "hold" does not
+    record a resume attempt.
+    """
     _mid = str(e["msgid"])
+    if _activity_blocks([_mid]):
+        return "hold"
     if _resume_attempts.get(_mid):
         return "fail"
     _resume_attempts[_mid] = now
@@ -542,15 +651,20 @@ if batch_active:
         # worker's own pushes only, never on task age and never on
         # the detached heartbeat file. Routing, in order:
         # (1) covered by a follow-up reply -> drop silently;
-        # (2) first loss -> auto-resume once (orphan re-wake);
-        # (3) second loss -> fail-stop (cancel + factual notice).
-        batch_done = True
+        # (2) bridge/worker real activity still fresh -> hold
+        #     (no resume, no cancel, batch stays);
+        # (3) first loss -> auto-resume once (orphan re-wake);
+        # (4) second loss -> fail-stop (cancel + factual notice).
         by_id = {e["msgid"]: e for e in entries}
         _cov = _covered_by_followup(batch_ids, batch_since,
                                     last_activity)
         if _cov:
+            batch_done = True
             _log_covered(batch_ids, batch_since, last_activity, _cov)
+        elif _activity_blocks(batch.get("msgids") or []):
+            pass
         else:
+            batch_done = True
             for mid in batch.get("msgids") or []:
                 e = by_id.get(mid)
                 if e is not None and _route_death(e) == "fail":
@@ -638,14 +752,19 @@ if detached:
             # Death watch (2026-10-09, reworked by the same day's
             # status-push fix): the worker's own pushes gone for
             # DEATH_WATCH_SECS -- same routing as the active batch:
-            # covered -> silent drop; first loss -> resume once;
-            # second loss -> fail-stop (cancel + factual notice).
+            # covered -> silent drop; real activity -> keep
+            # watching; first loss -> resume once; second loss ->
+            # fail-stop (cancel + factual notice).
             # This runs BEFORE the retire branch below, so a lost
             # detached batch is reported instead of silently
             # retiring at DETACHED_RETIRE_SECS with no notice.
             _cov = _covered_by_followup(dids, dsince, dlast)
             if _cov:
                 _log_covered(dids, dsince, dlast, _cov)
+                continue
+            if _activity_blocks(d.get("msgids") or []):
+                detached_activity.append((list(dids), dsince, dlast))
+                kept_detached.append(d)
                 continue
             for mid in d.get("msgids") or []:
                 e = by_id.get(mid)
@@ -760,11 +879,13 @@ STALL_NOTICE_SECS = 1200
 if not dry:
     _stall_candidates = []
     if batch_active and not batch_done:
-        if now - last_activity >= STALL_NOTICE_SECS:
+        if (now - last_activity >= STALL_NOTICE_SECS
+                and not _activity_blocks(batch_ids)):
             _stall_candidates.append(
                 (list(batch_ids), batch_since, last_activity))
     for _dids, _dsince, _dlast in detached_activity:
-        if now - _dlast >= STALL_NOTICE_SECS:
+        if (now - _dlast >= STALL_NOTICE_SECS
+                and not _activity_blocks(_dids)):
             _stall_candidates.append((_dids, _dsince, _dlast))
     if _stall_candidates:
         _sn_path = os.path.join(os.path.dirname(pending_path),

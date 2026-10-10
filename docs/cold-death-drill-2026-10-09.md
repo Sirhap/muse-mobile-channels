@@ -37,7 +37,16 @@ mtime 不再算数。正式回复只要还在 `outbox_parked.json` 里，文件 
 里 `ok=true` 的 `reply` / `reply_file`），本批走静默丢弃：写入
 `covered_drops.jsonl`，不取消，不发通知。这是 2026-10-09 18:35 误报之后加的护栏。
 
-没有后续回复盖住、又连续 1800 秒没有 worker 自己的推送时，按损失次数分流：
+没有后续回复盖住、又连续 1800 秒没有 worker 自己的推送时，先做一次真实活动探测，再按损失次数分流。探测说还活着，就停在这里：不续跑、不取消、不写 `resume_attempts.json`，批次留在原来的位置继续看。出站静默时钟不重置。活动信号一旦旧过 1800 秒，同一轮轮询就按已经累计的出站静默走下面的续跑或取消，不再另给 1800 秒。
+
+探测源（`death_watch_activity.py`，钩子只读）：
+
+1. 桥 `state.json` 里绑定了这个 msgid 的回合（`msgid` 本身，或合并进 `ids`）。下面任一落在 1800 秒内算活着，更具体的来源优先记入 `activity_holds.json`：`activities[].ts` / `activity_seen` 里的活动时间（`bridge-activity`）；`last_reply_at`（`bridge-reply`）；`sess_status` 为 `running` 且 `last_activity_poll` 也在窗口内（`bridge-running`）。只靠 `last_activity_poll`、队列快照、`status.json` 或心跳文件 mtime 都不算。`running` 但轮询时间已经旧过窗口，视为冻结状态，不当成还活着。
+2. 渠道 state 目录的 `worker_activity.json`：`{"<msgid>": {"ts": <epoch>}}`，也接受裸 epoch。认文件里的时间戳，不认文件 mtime。这是 worker 自己写下的存活信号，不是 `heartbeat.py` 的代打卡。
+
+失败降级：文件不存在等于没有信号，不是错误。文件在但解析不了，记入 `activity_probe.json` 的 `degraded`，这一路也不算活着。两路都没有新鲜信号时，才走原来的续跑 / 取消。一路坏了不会挡住另一路的新鲜信号。探针模块本身加载失败同样不算活着，钩子退回只看出站静默。1200 秒的停滞提醒在探测说还活着时也不发，避免通知里承诺「马上续跑」而这一轮其实按住了。
+
+没有后续回复盖住、探测也说真死时，按损失次数分流：
 
 1. 第一次：不取消。`resume_attempts.json` 记下这个 msgid（记录保留约 2 小时），
    走孤儿续跑把原消息再唤醒一次，并给用户发一条「♻️ 原任务已中断，已自动续跑一次」。
@@ -90,7 +99,7 @@ python3 ops/cold_death_drill.py
 `/home/hatch`，或者 `DEATH_WATCH_SECS = 1800` 不在了，脚本失败退出，
 不会改常量再跑。
 
-两边渠道各跑七个场景，都用合成 msgid，不读生产 inbox：
+两边渠道各跑下面这些场景，都用合成 msgid，不读生产 inbox。前七个是原来的出站静默分流，后面是续跑 / 取消之前的真实活动探测：
 
 | 场景 | 期望 |
 | --- | --- |
@@ -101,6 +110,26 @@ python3 ops/cold_death_drill.py
 | `first-loss-despite-heartbeat-file` | 心跳文件是新的，但没有 worker 推送：仍走第一次续跑，不取消 |
 | `first-loss-resume` | 静默超过 1800 秒：CLI 出现「自动续跑一次」，没有 `cancel`，批次被重新挂上 |
 | `second-loss-cancel-notice` | `resume_attempts.json` 里已有该 msgid：CLI 出现 `cancel --msgid` 和「任务已停止」，没有「自动续跑一次」，也没有「任务执行失败」，批次清空 |
+| `alive-despite-outbox-silence` | 出站推送已旧过 1800 秒，但桥上该 msgid 的活动时间是新的：不续跑、不取消、不发停滞提醒，批次还在，`activity_holds.json` 的 source 是 `bridge-activity`，`resume_attempts` 没有这条 |
+| `alive-muse-running` | 没有活动事件，但 `sess_status=running` 且 `last_activity_poll` 在窗口内：按住，source 是 `bridge-running` |
+| `alive-worker-over-silence` | 桥上没有这个 msgid，`worker_activity.json` 里的 ts 是新的：按住，source 是 `worker-activity`。出站静默单独不够续跑 |
+| `alive-merged-binding` | msgid 只出现在回合的 `ids` 里，`last_reply_at` 是新的：按住，source 是 `bridge-reply` |
+| `alive-detached` | 同上，但是 detached 批次：条目留在 `detached`，不续跑、不取消 |
+| `stale-activity-resumes` | 桥上有绑定，但活动、回复、轮询都旧过窗口：仍走第一次续跑 |
+| `frozen-running-resumes` | `sess_status` 仍是 `running`，轮询时间已旧：不当成还活着，走第一次续跑 |
+| `corrupt-bridge-degrades` | `state.json` 不是合法 JSON：`activity_probe.json` 记下 `unreadable:state.json`，然后走第一次续跑 |
+| `second-stale-cancels` | 已有续跑记录，桥上的活动也旧了：取消并发「任务已停止」 |
+
+可复跑的沙箱命令（这不是线上演练）：
+
+```sh
+python3 tests/test_death_watch_activity.py
+DEATH_WATCH_DRILL=1 \
+DEATH_WATCH_DRILL_CONFIRM=sandbox-only \
+python3 ops/cold_death_drill.py
+```
+
+`DEATH_WATCH_SECS` 保持 1800。不要加 `--live`，不要设 `DEATH_WATCH_DRILL_LIVE`。
 
 通过时进程退出码 0，并打印 `SANDBOX ONLY`。这证明的是仓库里这份钩子的分流，
 不证明线上钩子进程、真 CLI、真网关投递。线上投递是下一节，而且默认不做。
@@ -144,6 +173,7 @@ python3 ops/cold_death_drill.py
   有的话判死会被静默盖住，演练会假通过。
 - `outbox_parked.json` 里没有本次 msgid。
 - 本次 msgid 在 inbox、seen、carried、cancelled 里都不存在。
+- 桥 `state.json` 里没有这个 msgid 的新鲜活动（`activities` / `last_reply_at` / `running` 加新鲜 `last_activity_poll`），渠道 state 里也没有它的 `worker_activity.json` 记录。有的话钩子会按住，不取消，演练会看起来没触发。文件读不了同样不会被当成还活着，但那是降级，不是本计划要的通过条件。
 
 `since` 必须早于现在至少 1800 秒，否则判死不触发。用 `now - 1900`，给一轮
 轮询留余量。同会话只要有 `ts > since - 2` 且正式回复已送达的消息，就换一个
