@@ -381,8 +381,11 @@ HOOK_STATE_DIR = muse_home() / "hooks" / "state" / "wecom-bot"
 CLI_WRAPPER = BASE / "wecom"
 CHAN_LABEL = "企业微信"
 
-SLASH_COMMANDS = {"ping", "status", "stop", "new", "check", "queue", "help", "subagent", "approvals", "approve", "deny"}
+SLASH_COMMANDS = {"ping", "status", "stop", "new", "check", "queue", "help", "subagent", "approvals", "approve", "deny", "a", "b", "c"}
 SLASH_ALIASES = {"自检": "check", "命令": "help", "副助手": "subagent", "新会话": "new", "审批": "approvals", "批": "approve", "批准": "approve", "拒": "deny", "拒绝": "deny"}
+# One-letter approval decisions. Not aliases of approve/deny: /b N is
+# allow_always with no second word, so b must not take the approve + 永 path.
+APPROVAL_LETTER_DECISIONS = {"a": "allow_once", "b": "allow_always", "c": "deny"}
 
 # User-facing times in acks are rendered in the user's timezone; the VM
 # itself runs UTC, so plain localtime would show times 8h off.
@@ -418,7 +421,13 @@ def parse_slash_command(text):
     parts = t[1:].split(None, 1)
     if not parts:
         return None
-    name = SLASH_ALIASES.get(parts[0].lower(), parts[0].lower())
+    raw = parts[0].lower()
+    # a/b/c name the decision themselves. Aliasing them onto approve/deny
+    # would leave /b N as allow_once until a trailing 永 word.
+    if raw in APPROVAL_LETTER_DECISIONS:
+        name = raw
+    else:
+        name = SLASH_ALIASES.get(raw, raw)
     if name not in SLASH_COMMANDS:
         return None
     return name, (parts[1].strip() if len(parts) > 1 else "")
@@ -781,14 +790,23 @@ SLASH_HELP_TEXT = """【命令表】在聊天里直接发，网关秒回、不�
 /check 一次性自检，跑完即结束（别名 /自检）
 /help 本命令表（别名 /命令）
 /审批 待审批列表（网络/浏览器类审批，出现时也会主动通知）
-/批 N 批准第 N 条（仅这次）；/批 N 永 永久批准同类；/拒 N 拒绝（别名 /批准、/拒绝；永也可写永久）
+{approval_legend}
+{approval_reply}
+仍可用 /批 N（仅这次）、/批 N 永、/拒 N，以及 /批准、/拒绝（永也可写永久）
 注：只有以上是命令；其他以 / 开头的话会当普通消息处理。"""
 
 
 def slash_help_text():
     """The /help reply: the full command table as one fixed text,
-    identical on both channels and free of any channel name."""
-    return SLASH_HELP_TEXT
+    identical on both channels and free of any channel name.
+
+    The approval block is the shared legend line, then the short
+    reply line, so /help stays aligned with the list footer.
+    """
+    return SLASH_HELP_TEXT.format(
+        approval_legend=APPROVAL_LEGEND,
+        approval_reply=APPROVAL_REPLY_LINE,
+    )
 
 
 def slash_ping_text(chan_label, state_dir, hook_state_dir=None):
@@ -1119,14 +1137,16 @@ def slash_subagent_stop_ack(hook_state_dir, job_id):
 
 
 
-# ---------- /审批 /批 /拒 (aliases /批准 /拒绝): egress approval relay ----------
+# ---------- /审批 /a /b /c (also /批 /拒 /批准 /拒绝): egress approval relay ----------
 # The relay (~/workspace/approval-relay/) polls egress.approvals and
 # owns state.json (number -> approval); the gateways only read that
 # state to render/validate and append the user's decision to
 # decisions.jsonl, which the relay submits via egress.approval.decide.
-# The proactive chat notice ("【待审批 #N】…回 /批准 N") is composed by
-# that relay, which is not in this repo. Prompts this gateway itself
-# sends (help, the /审批 list footer, the usage line) use /批 and /拒.
+# The proactive chat notice is composed by hatch approval_relay.py
+# (approval_notice_text), which is not in this repo. Prompts this
+# gateway itself sends (help, the /审批 list footer, the usage line,
+# and the card-click failure hint) lead with the a/b/c legend and
+# then the short reply line.
 APPROVAL_RELAY_DIR = Path("/home/hatch/workspace/approval-relay")
 
 
@@ -1136,25 +1156,34 @@ def _approval_items():
     return {n: it for n, it in items.items() if isinstance(it, dict)}
 
 
-# Short spoken forms. 「永」 and the older 「永久」 both mean allow_always.
+# Short spoken forms. 「永」 and the older 「永久」 both mean allow_always
+# on /批, /批准 and /approve. They do not apply to /a /b /c.
 APPROVAL_ALWAYS_WORDS = ("永", "永久")
-APPROVAL_USAGE = "用法：/批 N（仅这次）、/批 N 永、/拒 N；N 发 /审批 查看。"
-APPROVAL_LIST_FOOTER = "回 /批 N（仅这次）｜/批 N 永｜/拒 N"
+# Legend first, then the reply line. Shared with /help and the card hint.
+APPROVAL_LEGEND = "a=仅这次  b=永久  c=拒绝"
+APPROVAL_REPLY_LINE = "回 /a N｜/b N｜/c N"
+APPROVAL_USAGE = APPROVAL_LEGEND + "\n" + APPROVAL_REPLY_LINE
+APPROVAL_LIST_FOOTER = APPROVAL_USAGE
 
 
 def parse_approval_slash(name, arg):
-    """Map an approve/deny slash argument to ``(num, decision)``.
+    """Map an approval slash argument to ``(num, decision)``.
 
-    ``name`` is already canonical (``approve`` or ``deny``). Returns
-    None when N is missing or not an unsigned integer token; the
-    caller answers with APPROVAL_USAGE. ``永`` and ``永久`` both select
-    allow_always. Any other trailing word stays allow_once. A deny
-    command ignores trailing words.
+    ``name`` is ``approve``, ``deny``, or a one-letter decision
+    (``a`` allow_once, ``b`` allow_always, ``c`` deny). Returns None
+    when N is missing or not an unsigned integer token; the caller
+    answers with APPROVAL_USAGE and writes nothing. For ``approve``,
+    ``永`` and ``永久`` select allow_always and any other trailing
+    word stays allow_once. ``deny`` and ``a``/``b``/``c`` ignore
+    trailing words: the letter itself is the decision, so ``/b N``
+    is allow_always with no second word.
     """
     toks = (arg or "").split()
     num = toks[0] if toks else ""
     if not num.isdigit():
         return None
+    if name in APPROVAL_LETTER_DECISIONS:
+        return (num, APPROVAL_LETTER_DECISIONS[name])
     if name == "deny":
         return (num, "deny")
     if len(toks) > 1 and toks[1] in APPROVAL_ALWAYS_WORDS:
@@ -1245,9 +1274,14 @@ APPROVAL_CARD_KEYS = {"appr_once": "allow_once",
 APPROVAL_CARD_LABELS = {"allow_once": "已批准·仅这次 ✅",
                         "allow_always": "已批准·永久 ✅",
                         "deny": "已拒绝 ❌"}
-# Shown when a card click cannot be written. Text fallback uses the
-# short slash; the long /批准 form still works if the user types it.
-APPROVAL_CARD_TEXT_FALLBACK = "请改用文字 /批 或在 Muse 应用里处理。"
+# Shown when a card click cannot be written. Legend line, then the
+# short reply. /批 /拒 /批准 /拒绝 still work if typed. This string
+# does not change the card key protocol.
+APPROVAL_CARD_TEXT_FALLBACK = (
+    APPROVAL_LEGEND + "\n"
+    + APPROVAL_REPLY_LINE + "\n"
+    + "或在 Muse 应用里处理。"
+)
 
 
 def approval_card_decide(task_id, event_key):
@@ -1947,7 +1981,7 @@ class Gateway:
                         ack = "派发失败：暂时无法登记副助手任务，请稍后再试。"
             elif name == "approvals":
                 ack = slash_approvals_text()
-            elif name in ("approve", "deny"):
+            elif name in ("approve", "deny") or name in APPROVAL_LETTER_DECISIONS:
                 decided = parse_approval_slash(name, arg)
                 if decided is None:
                     ack = APPROVAL_USAGE
@@ -2493,7 +2527,7 @@ class Gateway:
                     update_title = appr_result[0]
                     update_sub = (f"「{title}」— 决定已提交，执行结果随后以文字通知。"
                                   if appr_result[1] else
-                                  f"「{title}」— 提交失败，{APPROVAL_CARD_TEXT_FALLBACK}")
+                                  f"「{title}」— 提交失败。\n{APPROVAL_CARD_TEXT_FALLBACK}")
                 elif sel_text:
                     update_title = "已确认 ✅" if event_key == "btn_confirm" else "已取消 ❌" if event_key == "btn_cancel" else "已提交 ✅" if is_submit else "已收到 ✅"
                     update_sub = f"「{title}」— 你选了：{sel_text}"
