@@ -18,7 +18,7 @@ MERGE_CHANNELS. A merged msgid must be closed out gateway-side:
   bridge must send the bound pointer reply directly.
 
 The real bridge module is imported with every channel's bot_state
-redirected into a sandbox, so no production state is touched.
+and BASE redirected into a sandbox, so no production state is touched.
 Run: ~/muse-test-venv/bin/python tests/test_bridge_merge_wecom_20261008.py
 (the bridge venv — the module imports gw2/muse_cli, which need
 curl_cffi from that venv).
@@ -51,6 +51,22 @@ spec.loader.exec_module(nb)
 nb.CFG = copy.deepcopy(nb.CFG)
 nb.CFG["channels"]["weixin"]["bot_state"] = str(WX)
 nb.CFG["channels"]["wecom"]["bot_state"] = str(WC)
+# BASE must be sandboxed too (same hole the audit suite hit on
+# 2026-10-09, closed the way the progress suite did in 13816b4).
+# live_mode() reads enabled-<channel> under BASE. With the flag
+# absent, deliver_reply writes BASE/shadow/<channel>-outbox.jsonl
+# instead of the channel bot_state outbox. This suite only redirected
+# bot_state, so pointer replies never landed in the sandbox outbox:
+# 10/13, the three delivery assertions failed. A tree with no
+# shadow/ dir raises FileNotFoundError on that write instead. Point
+# BASE at the sandbox, mirror the flags the pointer path needs
+# (enabled-<channel> present so addressing is live), and provide a
+# shadow/ dir. Assertions still read the sandbox bot_state outbox
+# and feedback_clear files; live delivery is the behaviour under test.
+nb.BASE = str(SBX)
+(SBX / "shadow").mkdir(parents=True, exist_ok=True)
+for _flag in ("enabled-weixin", "enabled-wecom"):
+    (SBX / _flag).touch()
 
 RESULTS = []
 
