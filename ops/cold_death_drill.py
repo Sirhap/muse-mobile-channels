@@ -97,6 +97,15 @@ def rewrite_hook(src: str, spec: dict[str, str], bot_state: Path, cli: Path) -> 
     """Point one copied hook at the sandbox. Fail if a hatch path remains."""
     rewritten = src.replace(spec["hatch_state"], str(bot_state))
     rewritten = rewritten.replace(spec["hatch_cli"], str(cli))
+    bridge_state = bot_state.parent.parent / "native-bridge" / "state.json"
+    rewritten = rewritten.replace(
+        "/home/hatch/workspace/death_watch_activity.py",
+        str(REPO_ROOT / "death_watch_activity.py"),
+    )
+    rewritten = rewritten.replace(
+        "/home/hatch/workspace/native-bridge/state.json",
+        str(bridge_state),
+    )
     if "/home/hatch" in rewritten:
         raise RuntimeError("rewrite left a /home/hatch path in the hook copy")
     if "DEATH_WATCH_SECS = 1800" not in rewritten:
@@ -176,6 +185,10 @@ class Case:
         extra_entries: list[dict[str, object]] | None = None,
         resume_attempt: bool = False,
         heartbeat: bool = False,
+        bridge: dict[str, object] | None = None,
+        bridge_text: str | None = None,
+        worker_activity: dict[str, object] | None = None,
+        detached: bool = False,
     ) -> None:
         """Seed a silent-looking batch. Msgids are marked seen and carried."""
         now = time.time()
@@ -195,11 +208,26 @@ class Case:
             "".join(mid + "\n" for mid in ids), encoding="utf-8")
         (self.hookst / "carried_msgids.txt").write_text(
             "".join(mid + "\n" for mid in ids), encoding="utf-8")
-        write_json(self.hookst / "active_batch.json", {
-            "msgids": [msgid],
-            "since": since,
-            "detached": [],
-        })
+        if detached:
+            write_json(self.hookst / "active_batch.json", {
+                "msgids": [],
+                "since": since,
+                "detached": [{"msgids": [msgid], "since": since}],
+            })
+        else:
+            write_json(self.hookst / "active_batch.json", {
+                "msgids": [msgid],
+                "since": since,
+                "detached": [],
+            })
+        if bridge_text is not None:
+            path = self.bridge_state_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(bridge_text, encoding="utf-8")
+        elif bridge is not None:
+            write_json(self.bridge_state_path(), bridge)
+        if worker_activity is not None:
+            write_json(self.bot / "worker_activity.json", worker_activity)
         if resume_attempt:
             write_json(self.hookst / "resume_attempts.json", {msgid: now - 60})
         if heartbeat:
@@ -230,6 +258,30 @@ class Case:
 
     def batch(self) -> dict[str, object]:
         path = self.hookst / "active_batch.json"
+        if not path.exists():
+            return {}
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+        return loaded if isinstance(loaded, dict) else {}
+
+    def bridge_state_path(self) -> Path:
+        return self.sandbox / "native-bridge" / "state.json"
+
+    def holds(self) -> dict[str, object]:
+        path = self.hookst / "activity_holds.json"
+        if not path.exists():
+            return {}
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+        return loaded if isinstance(loaded, dict) else {}
+
+    def probe_note(self) -> dict[str, object]:
+        path = self.hookst / "activity_probe.json"
+        if not path.exists():
+            return {}
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+        return loaded if isinstance(loaded, dict) else {}
+
+    def attempts(self) -> dict[str, object]:
+        path = self.hookst / "resume_attempts.json"
         if not path.exists():
             return {}
         loaded = json.loads(path.read_text(encoding="utf-8"))
@@ -285,8 +337,46 @@ def assert_quiet(results: list[tuple[str, bool]], case: Case, name: str) -> None
     check(results, f"{name} no stall notice", "⏳ 提醒" not in log, log)
 
 
+def bridge_state(channel: str, turn: dict[str, object]) -> dict[str, object]:
+    """One native-bridge state.json document containing a single turn."""
+    return {"channels": {channel: {"turns": [turn]}}}
+
+
+def assert_held(results: list[tuple[str, bool]], case: Case, name: str,
+                msgid: str, source: str, detached: bool = False) -> None:
+    """Silence past the watch, but real activity kept the batch in place."""
+    log = case.calls()
+    check(results, f"{name} hook exit 0", case.returncode == 0, case.stderr)
+    check(results, f"{name} no cancel", "CALL: cancel" not in log, log)
+    check(results, f"{name} no resume notice", "自动续跑一次" not in log, log)
+    check(results, f"{name} no stop notice", "任务已停止" not in log, log)
+    check(results, f"{name} no legacy failure wording", "任务执行失败" not in log, log)
+    check(results, f"{name} no stall notice", "⏳ 提醒" not in log, log)
+    check(results, f"{name} no wake", "DECISION wake" not in case.stdout, case.stdout)
+    batch = case.batch()
+    if detached:
+        rows = batch.get("detached") if isinstance(batch.get("detached"), list) else []
+        watching = any(
+            isinstance(row, dict) and msgid in (row.get("msgids") or [])
+            for row in rows)
+        check(results, f"{name} detached still watched",
+              bool(watching) and not batch.get("msgids"),
+              json.dumps(batch, ensure_ascii=False))
+    else:
+        check(results, f"{name} still active",
+              batch.get("msgids") == [msgid],
+              json.dumps(batch, ensure_ascii=False))
+    hold = case.holds().get(msgid)
+    recorded = hold.get("source") if isinstance(hold, dict) else None
+    check(results, f"{name} hold source {source}", recorded == source,
+          json.dumps(case.holds(), ensure_ascii=False))
+    check(results, f"{name} resume not consumed",
+          msgid not in case.attempts(),
+          json.dumps(case.attempts(), ensure_ascii=False))
+
+
 def run_channel(sandbox: Path, channel: str, results: list[tuple[str, bool]]) -> None:
-    """Seven plants per channel. See the runbook scenario table."""
+    """Original silence scenarios plus the real-activity gate. See the runbook."""
     prepare_sandbox(sandbox, channel)
     case = Case(sandbox, channel)
     now = time.time()
@@ -425,6 +515,94 @@ def run_channel(sandbox: Path, channel: str, results: list[tuple[str, bool]]) ->
         case.stdout,
     )
 
+    fresh = now - 30
+    case.reset()
+    case.plant(
+        "drill-deathwatch-alive-act",
+        DEATH_WATCH_SECS + 100,
+        "【DRILL 冷判死】alive-activity",
+        outbox=[{
+            "id": "OLD1",
+            "mode": "update",
+            "msgid": "drill-deathwatch-alive-act",
+            "queued_at": now - (DEATH_WATCH_SECS + 80),
+            "content": "last outbox push is already stale",
+        }],
+        bridge=bridge_state(channel, {
+            "msgid": "drill-deathwatch-alive-act",
+            "ids": ["drill-deathwatch-alive-act"],
+            "sess_status": "running",
+            "activities": [{"ts": fresh, "text": "更新了文件 /tmp/drill.txt"}],
+            "last_activity_poll": fresh,
+        }),
+    )
+    case.run()
+    assert_held(results, case, f"{prefix} alive-despite-outbox-silence",
+                "drill-deathwatch-alive-act", "bridge-activity")
+
+    case.reset()
+    case.plant(
+        "drill-deathwatch-alive-run",
+        DEATH_WATCH_SECS + 100,
+        "【DRILL 冷判死】alive-running",
+        bridge=bridge_state(channel, {
+            "msgid": "drill-deathwatch-alive-run",
+            "ids": ["drill-deathwatch-alive-run"],
+            "sess_status": "running",
+            "activities": [],
+            "last_activity_poll": fresh,
+        }),
+    )
+    case.run()
+    assert_held(results, case, f"{prefix} alive-muse-running",
+                "drill-deathwatch-alive-run", "bridge-running")
+
+    case.reset()
+    case.plant(
+        "drill-deathwatch-alive-worker",
+        DEATH_WATCH_SECS + 100,
+        "【DRILL 冷判死】alive-worker",
+        worker_activity={
+            "drill-deathwatch-alive-worker": {"ts": fresh, "source": "worker"},
+        },
+    )
+    case.run()
+    assert_held(results, case, f"{prefix} alive-worker-over-silence",
+                "drill-deathwatch-alive-worker", "worker-activity")
+
+    case.reset()
+    case.plant(
+        "drill-deathwatch-alive-merged",
+        DEATH_WATCH_SECS + 100,
+        "【DRILL 冷判死】alive-merged",
+        bridge=bridge_state(channel, {
+            "msgid": "drill-deathwatch-other",
+            "ids": ["drill-deathwatch-other", "drill-deathwatch-alive-merged"],
+            "activities": [{"ts": "2020-01-01T00:00:00Z", "text": "ignored-stale"}],
+            "last_reply_at": fresh,
+            "sess_status": "completed",
+        }),
+    )
+    case.run()
+    assert_held(results, case, f"{prefix} alive-merged-binding",
+                "drill-deathwatch-alive-merged", "bridge-reply")
+
+    case.reset()
+    case.plant(
+        "drill-deathwatch-alive-det",
+        DEATH_WATCH_SECS + 100,
+        "【DRILL 冷判死】alive-detached",
+        detached=True,
+        bridge=bridge_state(channel, {
+            "msgid": "drill-deathwatch-alive-det",
+            "ids": ["drill-deathwatch-alive-det"],
+            "activities": [{"ts": fresh, "text": "子助手运行中"}],
+        }),
+    )
+    case.run()
+    assert_held(results, case, f"{prefix} alive-detached",
+                "drill-deathwatch-alive-det", "bridge-activity", detached=True)
+
     case.reset()
     case.plant(
         "drill-deathwatch-first",
@@ -491,6 +669,92 @@ def run_channel(sandbox: Path, channel: str, results: list[tuple[str, bool]]) ->
         notices == [],
         json.dumps(notices, ensure_ascii=False),
     )
+
+    stale = now - (DEATH_WATCH_SECS + 50)
+    case.reset()
+    case.plant(
+        "drill-deathwatch-stale",
+        DEATH_WATCH_SECS + 100,
+        "【DRILL 冷判死】stale-bridge",
+        bridge=bridge_state(channel, {
+            "msgid": "drill-deathwatch-stale",
+            "ids": ["drill-deathwatch-stale"],
+            "sess_status": "completed",
+            "activities": [{"ts": stale, "text": "旧动态"}],
+            "last_reply_at": stale,
+            "last_activity_poll": stale,
+        }),
+    )
+    case.run()
+    log = case.calls()
+    check(results, f"{prefix} stale-activity resumes",
+          "自动续跑一次" in log and "CALL: cancel" not in log, log)
+    check(results, f"{prefix} stale-activity rearmed",
+          case.batch().get("msgids") == ["drill-deathwatch-stale"],
+          json.dumps(case.batch(), ensure_ascii=False))
+    check(results, f"{prefix} stale-activity not held",
+          "drill-deathwatch-stale" not in case.holds(),
+          json.dumps(case.holds(), ensure_ascii=False))
+
+    case.reset()
+    case.plant(
+        "drill-deathwatch-frozen",
+        DEATH_WATCH_SECS + 100,
+        "【DRILL 冷判死】frozen-running",
+        bridge=bridge_state(channel, {
+            "msgid": "drill-deathwatch-frozen",
+            "ids": ["drill-deathwatch-frozen"],
+            "sess_status": "running",
+            "activities": [],
+            "last_activity_poll": stale,
+        }),
+    )
+    case.run()
+    log = case.calls()
+    check(results, f"{prefix} frozen-running resumes",
+          "自动续跑一次" in log and "CALL: cancel" not in log, log)
+    check(results, f"{prefix} frozen-running not held",
+          "drill-deathwatch-frozen" not in case.holds(),
+          json.dumps(case.holds(), ensure_ascii=False))
+
+    case.reset()
+    case.plant(
+        "drill-deathwatch-corrupt",
+        DEATH_WATCH_SECS + 100,
+        "【DRILL 冷判死】corrupt-bridge",
+        bridge_text="{not-json",
+    )
+    case.run()
+    log = case.calls()
+    check(results, f"{prefix} corrupt-bridge resumes",
+          "自动续跑一次" in log and "CALL: cancel" not in log, log)
+    note = json.dumps(case.probe_note(), ensure_ascii=False)
+    check(results, f"{prefix} corrupt-bridge degraded",
+          "unreadable:state.json" in note, note)
+
+    case.reset()
+    case.plant(
+        "drill-deathwatch-second-stale",
+        DEATH_WATCH_SECS + 100,
+        "【DRILL 冷判死】second-stale",
+        resume_attempt=True,
+        bridge=bridge_state(channel, {
+            "msgid": "drill-deathwatch-second-stale",
+            "ids": ["drill-deathwatch-second-stale"],
+            "sess_status": "completed",
+            "activities": [{"ts": stale, "text": "旧动态"}],
+            "last_reply_at": stale,
+        }),
+    )
+    case.run()
+    log = case.calls()
+    check(results, f"{prefix} second-stale cancel",
+          "CALL: cancel --msgid drill-deathwatch-second-stale" in log, log)
+    check(results, f"{prefix} second-stale stop notice",
+          "任务已停止" in log and "自动续跑一次" not in log, log)
+    check(results, f"{prefix} second-stale batch cleared",
+          not case.batch().get("msgids"),
+          json.dumps(case.batch(), ensure_ascii=False))
 
 
 def channels_of(selector: str) -> list[str]:
