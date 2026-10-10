@@ -20,7 +20,9 @@ The real gateway module is imported with every state path it uses
 redirected into a sandbox (HOME is redirected before import, the
 module-level state constants are rebound per scenario, and the one
 hardcoded native-bridge spool write in the inbound handler is
-intercepted), so no production state is touched.
+intercepted). Scenario a creates the divert-wecom flag for the
+callback and deletes it again when this machine did not already
+have it, so no production state is left behind.
 Run: ~/muse-test-venv/bin/python tests/test_wecom_align_20261009.py
 """
 import asyncio
@@ -134,6 +136,15 @@ async def scenario_a():
         SPOOL_SBX.unlink()
     g = make_gateway()
 
+    # Divert only runs when this hardcoded flag file exists. The
+    # spool write below is redirected into the sandbox; the flag
+    # itself is not. Create it for the scenario and remove it
+    # afterwards when this machine did not already have one.
+    divert_flag = Path("/home/hatch/workspace/native-bridge/divert-wecom")
+    divert_flag_was_present = divert_flag.exists()
+    divert_flag.parent.mkdir(parents=True, exist_ok=True)
+    divert_flag.touch()
+
     def recorder(path, obj):
         # The divert write targets a hardcoded production spool
         # path; reroute it to the sandbox. Everything else uses
@@ -157,28 +168,32 @@ async def scenario_a():
                          "from": {"userid": "sirhao"},
                          "text": {"content": text}}}
 
-    # Bridge busy with another turn: still NO arrival ack row.
-    FAKE["active"] = [{"msgid": "OTHER", "lane": "main", "secs": 5}]
-    FAKE["queued"] = []
-    await g.handle_message_callback(frame("M-NEW", "req-a1", "新问题来了"))
-    check("a: diverted row reached the (sandbox) spool",
-          [r.get("msgid") for r in read_jsonl(SPOOL_SBX)] == ["M-NEW"])
-    check("a: no outbox rows at all while bridge busy",
-          read_jsonl(d / "outbox.jsonl") == [])
-    check("a: diverted message not written to cold inbox",
-          read_jsonl(d / "inbox.jsonl") == [])
-    rec = g.feedback_track.get("M-NEW") or {}
-    check("a: registered as queued bridge feedback",
-          rec.get("queued") is True and rec.get("via_bridge") is True)
+    try:
+        # Bridge busy with another turn: still NO arrival ack row.
+        FAKE["active"] = [{"msgid": "OTHER", "lane": "main", "secs": 5}]
+        FAKE["queued"] = []
+        await g.handle_message_callback(frame("M-NEW", "req-a1", "新问题来了"))
+        check("a: diverted row reached the (sandbox) spool",
+              [r.get("msgid") for r in read_jsonl(SPOOL_SBX)] == ["M-NEW"])
+        check("a: no outbox rows at all while bridge busy",
+              read_jsonl(d / "outbox.jsonl") == [])
+        check("a: diverted message not written to cold inbox",
+              read_jsonl(d / "inbox.jsonl") == [])
+        rec = g.feedback_track.get("M-NEW") or {}
+        check("a: registered as queued bridge feedback",
+              rec.get("queued") is True and rec.get("via_bridge") is True)
 
-    # Bridge idle: also no ack, and the record is not queued.
-    FAKE["active"] = []
-    FAKE["queued"] = []
-    await g.handle_message_callback(frame("M-IDLE", "req-a2", "空闲时的问题"))
-    check("a: no outbox rows while bridge idle",
-          read_jsonl(d / "outbox.jsonl") == [])
-    check("a: idle-bridge record not marked queued",
-          (g.feedback_track.get("M-IDLE") or {}).get("queued") is False)
+        # Bridge idle: also no ack, and the record is not queued.
+        FAKE["active"] = []
+        FAKE["queued"] = []
+        await g.handle_message_callback(frame("M-IDLE", "req-a2", "空闲时的问题"))
+        check("a: no outbox rows while bridge idle",
+              read_jsonl(d / "outbox.jsonl") == [])
+        check("a: idle-bridge record not marked queued",
+              (g.feedback_track.get("M-IDLE") or {}).get("queued") is False)
+    finally:
+        if not divert_flag_was_present:
+            divert_flag.unlink(missing_ok=True)
 
 
 def scenario_bcd():
