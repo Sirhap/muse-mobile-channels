@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
-"""Short approval slash aliases for the Weixin and WeCom gateways.
+"""Short approval slash commands for the Weixin and WeCom gateways.
 
-The typed commands must be short enough for personal WeChat, which
-has no button card:
+Personal WeChat has no button card, so the typed reply is three
+one-letter decisions. The letter is the decision; there is no second
+word, and ``/b`` does not go through approve + 永:
 
-- ``/批 N`` approves once (allow_once)
-- ``/批 N 永`` approves always (allow_always); ``永久`` still counts
-- ``/拒 N`` denies
+- ``/a N`` approves once (allow_once)
+- ``/b N`` approves always (allow_always)
+- ``/c N`` denies
 
-``/批准``, ``/拒绝``, ``/审批`` and the English approve/deny/approvals
-commands stay valid. A missing or non-numeric N gets the short usage
-line and writes no decision. This file never opens a socket and never
-reads the hatch relay; both gateways are pointed at a temp directory.
+Help, the usage line, and the /审批 footer lead with
+``a=仅这次  b=永久  c=拒绝`` and then ``回 /a N｜/b N｜/c N``.
+
+``/批``, ``/批 N 永``, ``/拒``, ``/批准``, ``/拒绝``, ``/审批`` and the
+English approve/deny/approvals commands stay valid. A missing or
+non-numeric N gets the usage line and writes no decision. This file
+never opens a socket and never reads the hatch relay; both gateways
+are pointed at a temp directory.
 
 Run: python3 tests/test_approval_slash_aliases_20261010.py
 """
@@ -60,12 +65,12 @@ wc = load_gateway("wcgw_alias", "wecom-bot/gateway.py")
 
 
 def seed_relay(gateway, relay_dir):
-    """Point one gateway at a temp relay with pending items 15-40."""
+    """Point one gateway at a temp relay with pending items 15-44."""
     relay_dir.mkdir(parents=True, exist_ok=True)
     items = {
         str(n): {"approval_id": f"aid-{n}", "who": "Shell command",
                  "what": "命令：echo hi", "status": "pending"}
-        for n in range(15, 41)
+        for n in range(15, 45)
     }
     (relay_dir / "state.json").write_text(
         json.dumps({"next_num": 41, "items": items}), encoding="utf-8")
@@ -135,6 +140,19 @@ OK_CASES = [
     ("／拒 31", "31", "deny", "已提交拒绝"),
     # 「永」 is exact. A longer word must not silently become always.
     ("/批 32 永远", "32", "allow_once", "已提交批准（仅这次）"),
+    ("/a 33", "33", "allow_once", "已提交批准（仅这次）"),
+    ("/b 34", "34", "allow_always", "已提交批准（永久）"),
+    ("/c 35", "35", "deny", "已提交拒绝"),
+    ("/A 36", "36", "allow_once", "已提交批准（仅这次）"),
+    ("/B 37", "37", "allow_always", "已提交批准（永久）"),
+    ("/C 38", "38", "deny", "已提交拒绝"),
+    ("／a 39", "39", "allow_once", "已提交批准（仅这次）"),
+    ("／b 40", "40", "allow_always", "已提交批准（永久）"),
+    ("／c 41", "41", "deny", "已提交拒绝"),
+    # The letter is the decision. A trailing 永 must not retarget /a or /b.
+    ("/a 42 永", "42", "allow_once", "已提交批准（仅这次）"),
+    ("/b 43 永", "43", "allow_always", "已提交批准（永久）"),
+    ("/c 44 永久", "44", "deny", "已提交拒绝"),
     ("/审批", None, None, None),
     ("/approvals", None, None, None),
 ]
@@ -154,9 +172,25 @@ USAGE_CASES = [
     "/拒绝 -3",
     "/批 15永",
     "/批准 15永久",
+    "/a",
+    "/b",
+    "/c",
+    "/A",
+    "/B",
+    "/C",
+    "/a abc",
+    "/b -1",
+    "/c 1.5",
+    "/a 15a",
+    "/b 15永",
+    "/c xyz",
+    "/a 永 15",
+    "/b 永",
+    "/c -3",
 ]
 
-NOT_COMMANDS = ["/批15", "/批准15", "/拒15", "/foo", "批 15", "/批次 1"]
+NOT_COMMANDS = ["/批15", "/批准15", "/拒15", "/a15", "/b15", "/c15",
+                "/foo", "批 15", "/批次 1"]
 
 
 async def check_channel(label, gateway, relay_dir, dispatch, channel):
@@ -202,23 +236,48 @@ async def check_channel(label, gateway, relay_dir, dispatch, channel):
 
 
 def check_prompts():
-    """User-visible help and usage lines lead with the short commands."""
+    """User-visible help, usage, and footer lead with legend then reply."""
     help_wx = wx.slash_help_text()
     help_wc = wc.slash_help_text()
+    legend = "a=仅这次  b=永久  c=拒绝"
+    reply = "回 /a N｜/b N｜/c N"
+    approval_block = help_wx[help_wx.index("/审批"):]
     check("help text identical on both channels", help_wx == help_wc)
-    check("help shows /批 N", "/批 N 批准第 N 条（仅这次）" in help_wx)
-    check("help shows /批 N 永", "/批 N 永 永久批准同类" in help_wx)
-    check("help shows /拒 N", "/拒 N 拒绝" in help_wx)
-    check("help keeps long forms as aliases",
-          "别名 /批准、/拒绝" in help_wx and "永也可写永久" in help_wx)
+    check("legend and reply constants match on both channels",
+          wx.APPROVAL_LEGEND == wc.APPROVAL_LEGEND == legend
+          and wx.APPROVAL_REPLY_LINE == wc.APPROVAL_REPLY_LINE == reply)
+    check("help approval block is legend then reply",
+          approval_block.index(legend) < approval_block.index(reply)
+          and legend in help_wx and reply in help_wx)
+    check("help keeps old approval commands",
+          "/批 N（仅这次）" in help_wx
+          and "/批 N 永" in help_wx
+          and "/拒 N" in help_wx
+          and "/批准" in help_wx
+          and "/拒绝" in help_wx
+          and "永也可写永久" in help_wx)
     check("help no longer leads with the long command",
           "/批准 N 批准第 N 条" not in help_wx)
-    check("usage line is the short form and matches",
-          wx.APPROVAL_USAGE == wc.APPROVAL_USAGE
-          == "用法：/批 N（仅这次）、/批 N 永、/拒 N；N 发 /审批 查看。")
-    check("list footer is the short form and matches",
-          wx.APPROVAL_LIST_FOOTER == wc.APPROVAL_LIST_FOOTER
-          == "回 /批 N（仅这次）｜/批 N 永｜/拒 N")
+    check("usage and footer are legend then reply",
+          wx.APPROVAL_USAGE.splitlines() == [legend, reply]
+          and wx.APPROVAL_USAGE == wc.APPROVAL_USAGE
+          and wx.APPROVAL_LIST_FOOTER == wc.APPROVAL_LIST_FOOTER
+          == wx.APPROVAL_USAGE)
+    check("letter decisions are not approve aliases",
+          wx.APPROVAL_LETTER_DECISIONS == wc.APPROVAL_LETTER_DECISIONS
+          == {"a": "allow_once", "b": "allow_always", "c": "deny"}
+          and "a" not in wx.SLASH_ALIASES and "b" not in wx.SLASH_ALIASES
+          and "c" not in wx.SLASH_ALIASES
+          and "b" not in wc.SLASH_ALIASES
+          and wx.SLASH_ALIASES.get("b") != "approve")
+    check("parse /b is allow_always without 永",
+          wx.parse_approval_slash("b", "7") == ("7", "allow_always")
+          and wc.parse_approval_slash("b", "7") == ("7", "allow_always")
+          and wx.parse_approval_slash("a", "7 永") == ("7", "allow_once")
+          and wx.parse_approval_slash("c", "7") == ("7", "deny")
+          and wx.parse_approval_slash("approve", "7 永") == ("7", "allow_always")
+          and wx.parse_approval_slash("a", "") is None
+          and wx.parse_approval_slash("b", "x") is None)
     check("aliases map short and long forms",
           wx.SLASH_ALIASES["批"] == wc.SLASH_ALIASES["批"] == "approve"
           and wx.SLASH_ALIASES["批准"] == "approve"
@@ -231,9 +290,10 @@ def check_prompts():
               "appr_always": "allow_always",
               "appr_deny": "deny",
           })
-    check("wecom card failure hint uses /批",
-          wc.APPROVAL_CARD_TEXT_FALLBACK
-          == "请改用文字 /批 或在 Muse 应用里处理。"
+    check("wecom card failure hint is legend then reply",
+          wc.APPROVAL_CARD_TEXT_FALLBACK == legend + "\n" + reply + "\n"
+          + "或在 Muse 应用里处理。"
+          and "/批" not in wc.APPROVAL_CARD_TEXT_FALLBACK
           and "/批准" not in wc.APPROVAL_CARD_TEXT_FALLBACK)
 
 
