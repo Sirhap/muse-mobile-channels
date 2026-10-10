@@ -25,19 +25,22 @@ systemd units, or hook definitions.
 
 ## 线上结果（2026-10-10，未结案）
 
-同一张授权表下实际栽种了三轮。授权表里的 msgid 是演练 A 轮。每一轮的停止通知都要同时含「任务已停止」和字面大写 `DRILL`，并且 `outbox_results.jsonl` 里同一 id 为 `ok=true`，这一支才算过。三轮都还没有把待办第 5 项划掉。
+同一张授权表下已经结束三轮，第四轮（base64 栽种）还在进行。授权表里的 msgid 是演练 A 轮。每一轮的停止通知都要同时含「任务已停止」和字面大写 `DRILL`，并且 `outbox_results.jsonl` 里同一 id 为 `ok=true`，这一支才算过。A/B/C 的真实 outbox 都没有字面大写 `DRILL`，待办第 5 项不划掉。第四轮证据回填之前，这里不写 PASS。
 
 | 轮次 | 结论 | msgid | outbox id |
 | --- | --- | --- | --- |
 | 演练 A | FAIL | `drill-deathwatch-20261010142934-wecom` | `963d4892d454` |
-| 演练 B | 『待 hatch 原文复核』 | `drill-deathwatch-20261010143433-wecom2` | `b4143d0b7681` |
+| 演练 B | FAIL（PASS 作废） | `drill-deathwatch-20261010143433-wecom2` | `b4143d0b7681` |
 | 演练 C | FAIL，已回滚 | `drill-deathwatch-1791614953-wecom3` | `a87618d6800b` |
+| 第四轮 | 进行中，证据未回填 | 待回填 | 待回填 |
 
 演练 A 失败。since `1791611874`。`cancelled.json` 只多了这一条 msgid（ts `1791613779.79`）。停止通知 outbox id `963d4892d454`，`outbox_results` `ok=true`，ts `1791613781`。正文含「任务已停止」，摘录是「演练消息，不是用户」〔#drill-de〕，没有字面大写 `DRILL`。没有「自动续跑一次」，没有误取消其他 msgid，这一轮没有走回滚。服务保持活动，`DEATH_WATCH_SECS` 未改。快照：`SNAP=/tmp/death-watch-drill-snap-20261010142920`（hatch）。
 
-演练 B 只记声称。msgid `drill-deathwatch-20261010143433-wecom2`，停止通知 outbox id `b4143d0b7681`。Muse 声称正文 `DRILL=True`。验收曾按这条声称把本轮短暂记为 PASS。编程侧质疑该声称是否如实，要求对照 hatch 上这一行的原文。写本节时没有读到 `/home/hatch` 的 outbox，不能核对 `content`，也不能核对这条 id 的 `ok=true`。状态保持『待 hatch 原文复核』。原文对上之前，这里不写最终 PASS。
+演练 B 失败，短暂 PASS 作废。msgid `drill-deathwatch-20261010143433-wecom2`，停止通知 outbox id `b4143d0b7681`。hatch 原文复核 `HAS_DRILL=False`，正文只有「演练消息，不是用户」。Muse 曾声称 `DRILL=True`，验收曾据此短暂记 PASS。原文与该声称不符，PASS 作废。
 
-演练 C 失败并已回滚。msgid `drill-deathwatch-1791614953-wecom3`，停止通知 outbox id `a87618d6800b`，正文没有字面大写 `DRILL`。回滚已经做完，这一轮留下的记录只说明它没有过关。
+演练 C 失败并已回滚。msgid `drill-deathwatch-1791614953-wecom3`，停止通知 outbox id `a87618d6800b`，正文没有字面大写 `DRILL`。回滚已经做完。
+
+第四轮进行中。栽种改为 base64。msgid、outbox id 和正文都还没有落到本文。证据回填之前不结案，不记 PASS。
 
 ## 现在的判死到底看什么
 
@@ -341,4 +344,4 @@ CLI，没有 `outbox_results.jsonl` 的 `ok=true`，也不能代替用户看见�
 有没有误伤。没做线上投递就不要把第 5 项划掉。沙箱通过只说明仓库钩子的分流还在，
 生产实证仍是那一条真的 `ok=true`。
 
-2026-10-10 的回填写在上文「线上结果」和待办第 5 项。演练 A 轮没有字面大写 `DRILL`，记 FAIL。演练 C 轮同样没有，记 FAIL，并已回滚。演练 B 轮只有 Muse 的 `DRILL=True` 声称，状态是『待 hatch 原文复核』。复核落地之前，第 5 项保持开放，两处文档都不写最终 PASS。
+2026-10-10 的回填写在上文「线上结果」和待办第 5 项。演练 A、B、C 的真实 outbox 都没有字面大写 `DRILL`，三轮都记 FAIL。演练 B 的 outbox `b4143d0b7681` 复核为 `HAS_DRILL=False`，Muse 的 `DRILL=True` 作废，短暂 PASS 一并作废。演练 C 已回滚。第四轮（base64 栽种）证据未回填。第 5 项保持开放，两处文档都不写 PASS。
