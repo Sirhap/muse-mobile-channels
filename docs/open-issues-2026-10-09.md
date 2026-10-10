@@ -31,20 +31,15 @@
 - 完成标准：一条真实企微长任务中三点各留一条送达证据。
 
 ### 5. 冷通道判死（DEATH_WATCH_SECS=1800）无生产实证
-- 现状：2026-10-09 已部署，沙箱四场景 + 企微 A/B 共 31/31；部署后尚无真实冷通道 worker 静默死亡事件触发过它（无事件本身是好事，但机制未经生产检验）。2026-10-10 做了一次授权后的线上第二判，证据见本项末条；验收未裁，本项不划掉。
+- 现状：2026-10-09 已部署，沙箱四场景 + 企微 A/B 共 31/31；部署后尚无真实冷通道 worker 静默死亡事件触发过它（无事件本身是好事，但机制未经生产检验）。2026-10-10 同一授权下做了三轮线上第二判，证据见本项末条。演练 A 轮 FAIL，演练 C 轮 FAIL 并已回滚，两轮停止通知都没有字面大写 `DRILL`。演练 B 轮 Muse 声称 `DRILL=True`，验收曾据此短暂记为 PASS；编程侧质疑该声称，状态记为『待 hatch 原文复核』。复核落地之前本项不划掉，也不记最终 PASS。
 - 完成标准：首次真实触发时复盘其取消 + 失败通知是否如实送达，并把结论回填本项。演练计划的通过条件还要求停止通知正文同时含「任务已停止」和字面大写 `DRILL`。
 - 演练计划：`docs/cold-death-drill-2026-10-09.md`（授权表 2026-10-10 已填）。配套脚本 `ops/cold_death_drill.py` 默认关闭，只重写一份钩子到 `/tmp`，没有线上模式。不得改 `DEATH_WATCH_SECS` 或钩子轮询。
 - 2026-10-10：续跑和取消之前增加了桥 / worker 真实活动探测（`death_watch_activity.py`）。沙箱场景覆盖「还活着则不续不杀」「真死才续跑」「第二次真死才取消」。同日线上第二判证据见下条。
-- 2026-10-10 线上第二判（保持开放，等验收 PASS/FAIL；不划掉）：
-  - 授权：tom Jack / 2026-10-10 14:25 Asia/Shanghai / wecom / 范围=沙箱+线上第二判。
-  - msgid：`drill-deathwatch-20261010142934-wecom`。
-  - 会话：`chatid=wrzLPjBgAAU5nM4RBfC6pUN5TegxRbOA` `chattype=group`。
-  - since：`1791611874`。
-  - 取消：`cancelled.json` 只多了这一条 msgid（ts `1791613779.79`）。
-  - 停止通知：outbox id `963d4892d454`，`outbox_results` `ok=true`，ts `1791613781`。
-  - 正文含「任务已停止」。栽种文案漏了「【DRILL 冷判死】」前缀，通知摘录是「演练消息，不是用户」〔#drill-de〕，没有字面大写 `DRILL`。这是验收关闸项，待裁。若验收要求字面 `DRILL`，本项标为待重演，仍不划掉。
-  - 没有「自动续跑一次」；没有误取消其他 msgid；没有走回滚；服务保持活动；`DEATH_WATCH_SECS` 未改。
-  - 快照：`SNAP=/tmp/death-watch-drill-snap-20261010142920`（hatch）。
+- 2026-10-10 线上第二判（三轮分记；演练 B 未复核，本项保持开放）：
+  - 授权：tom Jack / 2026-10-10 14:25 Asia/Shanghai / wecom / 范围=沙箱+线上第二判。会话 `chatid=wrzLPjBgAAU5nM4RBfC6pUN5TegxRbOA` `chattype=group`。三轮共用这次授权，msgid 各不相同。通过条件仍是停止通知同时含「任务已停止」和字面大写 `DRILL`。
+  - 演练 A，FAIL。msgid `drill-deathwatch-20261010142934-wecom`。since `1791611874`。`cancelled.json` 只多了这一条 msgid（ts `1791613779.79`）。停止通知 outbox id `963d4892d454`，`outbox_results` `ok=true`，ts `1791613781`。正文含「任务已停止」。栽种文案漏了「【DRILL 冷判死】」前缀，通知摘录是「演练消息，不是用户」〔#drill-de〕，没有字面大写 `DRILL`。没有「自动续跑一次」；没有误取消其他 msgid；这一轮没有走回滚；服务保持活动；`DEATH_WATCH_SECS` 未改。快照：`SNAP=/tmp/death-watch-drill-snap-20261010142920`（hatch）。
+  - 演练 B，『待 hatch 原文复核』。msgid `drill-deathwatch-20261010143433-wecom2`。停止通知 outbox id `b4143d0b7681`。Muse 声称该通知 `DRILL=True`。验收曾按这条声称把本轮短暂记为 PASS。编程侧质疑该声称是否如实，要求对照 hatch 上这一行的原文。写本条时没有读到 `/home/hatch` 的 outbox，不能核对 `content` 里是否真有字面大写 `DRILL`，也不能核对这条 id 的 `ok=true`。复核完成前只记声称，不记通过。
+  - 演练 C，FAIL，已回滚。msgid `drill-deathwatch-1791614953-wecom3`。停止通知 outbox id `a87618d6800b`。正文没有字面大写 `DRILL`。这一轮已按回滚收场，留下的记录只说明它没有过关。
 
 ## P2 与 muse-cli 收尾循环的已知差距
 
