@@ -56,12 +56,12 @@ def live_env() -> dict[str, str]:
     return env
 
 
-def scaffold(tmp: Path, chatid: str = "chat-auth", chattype: str = "single") -> tuple[Path, Path, Path]:
+def scaffold(tmp_path: Path, chatid: str = "chat-auth", chattype: str = "single") -> tuple[Path, Path, Path]:
     """Minimal wecom hook + bot state with one real inbox row."""
-    tmp.mkdir(parents=True, exist_ok=True)
-    hook = tmp / "hook"
-    bot = tmp / "bot"
-    bridge = tmp / "native-bridge" / "state.json"
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    hook = tmp_path / "hook"
+    bot = tmp_path / "bot"
+    bridge = tmp_path / "native-bridge" / "state.json"
     hook.mkdir()
     bot.mkdir()
     bridge.parent.mkdir()
@@ -131,16 +131,16 @@ def test_gate_default_off() -> None:
     assert "DEATH_WATCH_DRILL_LIVE" in drilled.stderr
 
 
-def test_cli_does_not_accept_hatch_override(tmp: Path) -> None:
+def test_cli_does_not_accept_hatch_override(tmp_path: Path) -> None:
     """A path argument is not a way to retarget the plant."""
-    refused = run_cli([str(tmp)], live_env())
+    refused = run_cli([str(tmp_path)], live_env())
     assert refused.returncode == 2
-    assert not (tmp / "active_batch.json").exists()
+    assert not (tmp_path / "active_batch.json").exists()
 
 
-def test_non_hatch_paths_refused(tmp: Path) -> None:
+def test_non_hatch_paths_refused(tmp_path: Path) -> None:
     """The default plant entry refuses a temp tree even when the gates are open."""
-    hook, bot, bridge = scaffold(tmp)
+    hook, bot, bridge = scaffold(tmp_path)
     saved = {
         key: os.environ.get(key)
         for key in ("DEATH_WATCH_LIVE_PLANT", "DEATH_WATCH_LIVE_CONFIRM", "DEATH_WATCH_DRILL_LIVE")
@@ -150,7 +150,7 @@ def test_non_hatch_paths_refused(tmp: Path) -> None:
     os.environ.pop("DEATH_WATCH_DRILL_LIVE", None)
     try:
         try:
-            plant.plant_wecom_second_judgment(hook, bot, bridge, tmp / "snaps")
+            plant.plant_wecom_second_judgment(hook, bot, bridge, tmp_path / "snaps")
         except plant.PlantAbort as exc:
             assert exc.code == 2
             assert "/home/hatch" in str(exc)
@@ -168,26 +168,26 @@ def test_non_hatch_paths_refused(tmp: Path) -> None:
     }
 
 
-def test_closed_gate_refuses_before_paths(tmp: Path) -> None:
+def test_closed_gate_refuses_before_paths(tmp_path: Path) -> None:
     """Without the env gates, plant() exits before creating a snapshot."""
-    hook, bot, bridge = scaffold(tmp)
+    hook, bot, bridge = scaffold(tmp_path)
     try:
-        plant.plant_wecom_second_judgment(hook, bot, bridge, tmp / "snaps")
+        plant.plant_wecom_second_judgment(hook, bot, bridge, tmp_path / "snaps")
     except SystemExit as exc:
         assert exc.code == 2
     else:
         raise AssertionError("closed gate should exit 2")
     assert not (hook / "active_batch.json").exists()
-    assert list((tmp / "snaps").glob("*")) == [] if (tmp / "snaps").exists() else True
+    assert list((tmp_path / "snaps").glob("*")) == [] if (tmp_path / "snaps").exists() else True
 
 
-def test_happy_path_order(tmp: Path) -> None:
+def test_happy_path_order(tmp_path: Path) -> None:
     """Readonly, snapshot, merge, seen/carried, inbox, assert, batch last."""
-    hook, bot, bridge = scaffold(tmp, chatid="room-9", chattype="group")
+    hook, bot, bridge = scaffold(tmp_path, chatid="room-9", chattype="group")
     outbox_before = (bot / "outbox.jsonl").read_text(encoding="utf-8")
     now = 1_800_000_000.0
     result = plant.plant_wecom_second_judgment(
-        hook, bot, bridge, tmp / "snaps", allow_non_hatch=True, now=now,
+        hook, bot, bridge, tmp_path / "snaps", allow_non_hatch=True, now=now,
     )
     assert result["steps"] == [
         "readonly",
@@ -236,9 +236,9 @@ def test_happy_path_order(tmp: Path) -> None:
     assert json.loads((hook / "pending.json").read_text(encoding="utf-8")) == {}
 
 
-def test_bad_tail_does_not_write_batch(tmp: Path) -> None:
+def test_bad_tail_does_not_write_batch(tmp_path: Path) -> None:
     """A tail that fails the drill assert leaves active_batch.json unwritten."""
-    hook, bot, bridge = scaffold(tmp)
+    hook, bot, bridge = scaffold(tmp_path)
     original = plant.append_bytes
 
     def bad_append(path: Path, payload: bytes) -> None:
@@ -248,7 +248,7 @@ def test_bad_tail_does_not_write_batch(tmp: Path) -> None:
     try:
         try:
             plant.plant_wecom_second_judgment(
-                hook, bot, bridge, tmp / "snaps", allow_non_hatch=True, now=1_800_000_000.0,
+                hook, bot, bridge, tmp_path / "snaps", allow_non_hatch=True, now=1_800_000_000.0,
             )
         except plant.PlantAbort as exc:
             assert exc.code == 1
@@ -262,11 +262,11 @@ def test_bad_tail_does_not_write_batch(tmp: Path) -> None:
     assert "keep-me" in attempts
 
 
-def test_assert_helper_blocks_batch_write(tmp: Path) -> None:
+def test_assert_helper_blocks_batch_write(tmp_path: Path) -> None:
     """write_active_batch_last itself refuses a non-drill tail."""
-    tmp.mkdir(parents=True, exist_ok=True)
-    inbox = tmp / "inbox.jsonl"
-    batch = tmp / "active_batch.json"
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    inbox = tmp_path / "inbox.jsonl"
+    batch = tmp_path / "active_batch.json"
     msgid = "drill-deathwatch-9"
     inbox.write_text(
         json.dumps({"msgid": msgid, "text": "【DRILL 别的句子"}) + "\n",
@@ -288,16 +288,16 @@ def test_assert_helper_blocks_batch_write(tmp: Path) -> None:
     assert written["detached"] == []
 
 
-def test_occupied_batch_and_cover_stop_early(tmp: Path) -> None:
+def test_occupied_batch_and_cover_stop_early(tmp_path: Path) -> None:
     """A busy queue or a covering reply does not merge resume_attempts."""
-    hook, bot, bridge = scaffold(tmp)
+    hook, bot, bridge = scaffold(tmp_path)
     (hook / "active_batch.json").write_text(
         json.dumps({"msgids": ["real-1"], "since": 1, "detached": []}),
         encoding="utf-8",
     )
     try:
         plant.plant_wecom_second_judgment(
-            hook, bot, bridge, tmp / "snaps", allow_non_hatch=True, now=1_800_000_000.0,
+            hook, bot, bridge, tmp_path / "snaps", allow_non_hatch=True, now=1_800_000_000.0,
         )
     except plant.PlantAbort as exc:
         assert exc.code == 2
@@ -306,9 +306,9 @@ def test_occupied_batch_and_cover_stop_early(tmp: Path) -> None:
     assert json.loads((hook / "resume_attempts.json").read_text(encoding="utf-8")) == {
         "keep-me": 1_799_999_000
     }
-    assert not list((tmp / "snaps").glob("death-watch-drill-snap-*"))
+    assert not list((tmp_path / "snaps").glob("death-watch-drill-snap-*"))
 
-    hook2, bot2, bridge2 = scaffold(tmp / "cover", chatid="chat-auth")
+    hook2, bot2, bridge2 = scaffold(tmp_path / "cover", chatid="chat-auth")
     now = 1_800_000_000.0
     since = now - 1900
     follow = {
@@ -333,7 +333,7 @@ def test_occupied_batch_and_cover_stop_early(tmp: Path) -> None:
     )
     try:
         plant.plant_wecom_second_judgment(
-            hook2, bot2, bridge2, tmp / "snaps2", allow_non_hatch=True, now=now,
+            hook2, bot2, bridge2, tmp_path / "snaps2", allow_non_hatch=True, now=now,
         )
     except plant.PlantAbort as exc:
         assert "delivered formal reply" in str(exc)
@@ -342,13 +342,13 @@ def test_occupied_batch_and_cover_stop_early(tmp: Path) -> None:
     assert not (hook2 / "active_batch.json").exists()
 
 
-def test_degraded_probe_aborts(tmp: Path) -> None:
+def test_degraded_probe_aborts(tmp_path: Path) -> None:
     """An unreadable bridge is not treated as a pass."""
-    hook, bot, bridge = scaffold(tmp)
+    hook, bot, bridge = scaffold(tmp_path)
     bridge.write_text("{", encoding="utf-8")
     try:
         plant.plant_wecom_second_judgment(
-            hook, bot, bridge, tmp / "snaps", allow_non_hatch=True, now=1_800_000_000.0,
+            hook, bot, bridge, tmp_path / "snaps", allow_non_hatch=True, now=1_800_000_000.0,
         )
     except plant.PlantAbort as exc:
         assert "degraded" in str(exc)
@@ -357,10 +357,10 @@ def test_degraded_probe_aborts(tmp: Path) -> None:
     assert not (hook / "active_batch.json").exists()
 
 
-def test_outbox_report(tmp: Path) -> None:
+def test_outbox_report(tmp_path: Path) -> None:
     """After the poll window the script prints a notice or operator instructions."""
-    tmp.mkdir(parents=True, exist_ok=True)
-    bot = tmp / "bot"
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    bot = tmp_path / "bot"
     bot.mkdir()
     msgid = "drill-deathwatch-77-1"
     old = '{"mode":"send","content":"older"}\n'
@@ -385,7 +385,7 @@ def test_outbox_report(tmp: Path) -> None:
     assert "DRILL" in printed
     assert '"ok": true' in printed
 
-    empty = tmp / "empty"
+    empty = tmp_path / "empty"
     empty.mkdir()
     (empty / "outbox.jsonl").write_text(old, encoding="utf-8")
     buf = StringIO()
