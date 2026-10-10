@@ -3,9 +3,11 @@
 **STOP. Do not run this drill until the boss authorizes it in writing.**
 Do not run it against the live hatch while preparing, reviewing, or merging
 this plan. This file is the plan. `ops/cold_death_drill.py` defaults off,
-talks only to a `/tmp` copy of the hook, and has no live mode. Nothing in
-this plan changes production config, `DEATH_WATCH_SECS`, poll interval,
-systemd units, or hook definitions.
+talks only to a `/tmp` copy of the hook, and has no live mode. The WeCom
+online plant is a separate file, `ops/cold_death_live_second_judgment.py`,
+and it also defaults off (see「操作脚本」). Nothing in this plan changes
+production config, `DEATH_WATCH_SECS`, poll interval, systemd units, or
+hook definitions.
 
 授权记录（未填则视为未授权，步骤全部不做）：
 
@@ -105,9 +107,9 @@ mtime 不再算数。正式回复只要还在 `outbox_parked.json` 里，文件 
 `update` 的真 worker，伤的是用户的任务，不是演练。心跳文件现在根本不计入
 存活，停它也不会让判死开火。
 
-## 沙箱：唯一可以脚本化的一档
+## 沙箱
 
-脚本：`ops/cold_death_drill.py`。
+脚本：`ops/cold_death_drill.py`。这一档没有线上模式。线上企微第二判用下一节的操作脚本，不要把 `--live` 加进沙箱脚本。
 
 默认什么都不做，直接退出。要跑必须同时带上：
 
@@ -166,6 +168,27 @@ python3 ops/cold_death_drill.py
 `DEATH_WATCH_DRILL_KEEP=1`。
 
 ## 线上第二判：授权之后的人工步骤
+
+### 操作脚本（operator script）
+
+栽种可以交给 `ops/cold_death_live_second_judgment.py`。`ops/cold_death_drill.py` 仍然只有沙箱。脚本默认退出，不接受参数。要跑必须同时带上：
+
+```sh
+DEATH_WATCH_LIVE_PLANT=1 \
+DEATH_WATCH_LIVE_CONFIRM=wecom-second-judgment \
+python3 ops/cold_death_live_second_judgment.py
+```
+
+`--live`、`--production`、`--hatch` 以及环境变量 `DEATH_WATCH_DRILL_LIVE` 都是拒绝项，不能代替上面两个变量。确认词必须正好是 `wecom-second-judgment`。授权表没写明企微线上第二判之前，不要导出它们。
+
+脚本只动这两个目录（快照仍在 `/tmp`，和下面的人工步骤一样）：
+
+- `/home/hatch/hooks/state/wecom-bot/`
+- `/home/hatch/workspace/wecom-bot/state/`
+
+顺序是只读确认、快照、合并 `resume_attempts.json`、追加 seen/carried、追加 inbox，然后读回最后一行。`json.loads` 得到的 `text` 必须以 `【DRILL` 开头，否则不写 `active_batch.json`。`active_batch.json` 最后写。文案写死为 `【DRILL 冷判死】演练消息，不是用户任务。`。`chatid`、`chattype`、`from_userid` 从 inbox 最后一条真实消息抄，不新编会话。
+
+脚本不改 `DEATH_WATCH_SECS`，不停钩子、网关或桥。跑完打印 msgid 和快照路径；等一轮轮询后，若 outbox 里已经有停止通知就打出该行，否则让操作者自己对证据清单。不要为了没看到通知再跑一遍。
 
 只做「取消 + 停止通知」这一支。做法是预先写入 `resume_attempts.json`，
 让下一轮轮询直接走 `_route_death` 的 fail 分支。这和真的第二次静默是同一个
