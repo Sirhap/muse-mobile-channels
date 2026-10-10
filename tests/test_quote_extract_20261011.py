@@ -205,6 +205,123 @@ _fb_i = _src.index("if not diverted:", _spool_i)
 check("wx: diverted_raw written inside divert branch after spool",
       _spool_i < _raw_i < _fb_i)
 
+# ---- 2026-10-11 final fix: refs carry only an id; resolve locally ----
+# Live capture (diverted_raw.jsonl): iLink ref_msg for a quote is
+# {"message_item": {"type": 0, "msg_id": "<quoted platform id>", ...}}
+# — no content at all. _find_ref_qid extracts the id; _resolve_quote
+# recovers the content from the spool / INBOX / sent index.
+
+SAMPLE_REF = {"message_item": {"type": 0,
+              "create_time_ms": 1791650680000,
+              "update_time_ms": 1791650680000,
+              "is_completed": True,
+              "msg_id": "7514727623184878344",
+              "button_item_list": [], "at_bot_username_list": []}}
+
+
+def sample_msg(text="测试"):
+    return {"item_list": [{"type": 1, "text_item": {"text": text},
+                           "ref_msg": SAMPLE_REF}]}
+
+
+# 25. qid extraction from the real captured structure
+check("wx: qid from captured ref shape",
+      wx.Gateway._find_ref_qid(sample_msg()) == "7514727623184878344")
+
+# 26. qid from a message-level ref
+msg = {"item_list": [{"type": 1, "text_item": {"text": "测试"}}],
+       "ref_msg": {"message_item": {"msg_id": "7514000000000000001"}}}
+check("wx: qid from message-level ref",
+      wx.Gateway._find_ref_qid(msg) == "7514000000000000001")
+
+# 27. no ref / ref without any id key -> ""
+check("wx: qid empty without ref",
+      wx.Gateway._find_ref_qid(item_text("普通")) == "")
+check("wx: qid empty when ref carries no id",
+      wx.Gateway._find_ref_qid(item_text("这个", ref_item(2, image_item={}))) == "")
+
+# Fixtures for _resolve_quote / _index_sent in a temp state dir.
+QD = SBX / "quote-resolve"
+QD.mkdir(parents=True, exist_ok=True)
+Q_SPOOL = QD / "spool.jsonl"
+Q_INBOX = QD / "inbox.jsonl"
+Q_SENT = QD / "sent_index.jsonl"
+
+
+def write_jsonl(p, rows):
+    p.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n"
+                         for r in rows), encoding="utf-8")
+
+
+write_jsonl(Q_SPOOL, [
+    {"msgid": "Q-OLD", "text": "旧的一条"},
+    {"msgid": "Q-SPOOL", "text": "被引用的原文"},
+    {"msgid": "Q-LONG", "text": "长" * 250},
+])
+write_jsonl(Q_INBOX, [{"msgid": "Q-INBOX", "text": "冷通道原文"}])
+write_jsonl(Q_SENT, [
+    {"mid": "Q-BOT", "kind": "text", "content": "机器人回复内容", "ts": 1},
+    {"mid": "Q-FILE", "kind": "file", "content": "成片.mp4", "ts": 1},
+])
+_saved_globals = (wx.QUOTE_SPOOL, wx.INBOX, wx.SENT_INDEX)
+wx.QUOTE_SPOOL, wx.INBOX, wx.SENT_INDEX = Q_SPOOL, Q_INBOX, Q_SENT
+_g = wx.Gateway.__new__(wx.Gateway)
+
+# 28. resolve hits each source; unknown id -> None
+check("wx: resolve via spool", _g._resolve_quote("Q-SPOOL") == "（引用：被引用的原文）")
+check("wx: resolve via inbox", _g._resolve_quote("Q-INBOX") == "（引用：冷通道原文）")
+check("wx: resolve via sent index (text)",
+      _g._resolve_quote("Q-BOT") == "（引用：机器人回复内容）")
+check("wx: resolve via sent index (file)",
+      _g._resolve_quote("Q-FILE") == "（引用：[文件 成片.mp4]）")
+check("wx: resolve unknown id -> None", _g._resolve_quote("Q-NOPE") is None)
+check("wx: resolve truncates at 200 chars",
+      _g._resolve_quote("Q-LONG") == "（引用：" + "长" * 200 + "…）")
+
+# 29. _index_sent probes resp id keys (top level, then data)
+Q_SENT2 = QD / "sent_index2.jsonl"
+wx.SENT_INDEX = Q_SENT2
+_g._index_sent({"ret": 0, "message_id": "M-TOP"}, "text", "顶层文本")
+_g._index_sent({"ret": 0, "data": {"msg_id": "M-DATA"}}, "file", "数据.mp4")
+_g._index_sent({"ret": 0}, "text", "无ID不写")
+_g._index_sent(None, "text", "非dict不写")
+_rows = [json.loads(l)
+         for l in Q_SENT2.read_text(encoding="utf-8").splitlines()
+         if l.strip()]
+check("wx: _index_sent writes top-level message_id",
+      any(r.get("mid") == "M-TOP" and r.get("kind") == "text"
+          and r.get("content") == "顶层文本" for r in _rows))
+check("wx: _index_sent writes data.msg_id",
+      any(r.get("mid") == "M-DATA" and r.get("kind") == "file"
+          for r in _rows))
+check("wx: _index_sent skips resp without id", len(_rows) == 2)
+wx.SENT_INDEX = Q_SENT
+
+# 30. extract -> generic marker -> resolve -> replace (the exact
+# composition handle_inbound performs), plus the unresolvable case.
+write_jsonl(Q_SPOOL, [{"msgid": "7514727623184878344", "text": "继续修复"}])
+_t, _m = wx.Gateway._extract_text(sample_msg())
+check("wx: captured shape alone still generic marker",
+      "（引用：[消息]）" in _t)
+_res = _g._resolve_quote(wx.Gateway._find_ref_qid(sample_msg()))
+if _res:
+    _t = _t.replace("（引用：[消息]）", _res)
+check("wx: composition resolves quote content", "（引用：继续修复）" in _t)
+_t2, _m2 = wx.Gateway._extract_text(sample_msg("测试2"))
+_res2 = _g._resolve_quote("7514999999999999999")
+check("wx: unresolvable quote keeps generic marker",
+      _res2 is None and "（引用：[消息]）" in _t2)
+
+wx.QUOTE_SPOOL, wx.INBOX, wx.SENT_INDEX = _saved_globals
+
+# 31. the resolve hook sits in handle_inbound between extraction
+# and entry construction (source-level, like check 24).
+_ext_i = _src.index("text, media = self._extract_text(msg)")
+_res_i = _src.index("self._resolve_quote(self._find_ref_qid(msg))")
+_ent_i = _src.index("entry = {", _ext_i)
+check("wx: resolve hook between extract and entry build",
+      _ext_i < _res_i < _ent_i)
+
 # ================= WeCom handle_message_callback =================
 
 SPOOL_SBX = SBX / "spool-wecom.jsonl"

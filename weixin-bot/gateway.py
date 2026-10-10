@@ -64,6 +64,15 @@ INBOX = STATE / "inbox.jsonl"
 # was lost. Same entry shape as INBOX; NOT consumed by the cold
 # lane, so no double processing.
 DIVERTED_RAW = STATE / "diverted_raw.jsonl"
+# Sent-bubble index (2026-10-11): platform ids of this bot's own
+# successfully sent messages, so a user quote of a bot bubble can be
+# resolved by id (see _resolve_quote). Written by _index_sent only
+# when the send response actually carries an id.
+SENT_INDEX = STATE / "sent_index.jsonl"
+# Bridge spool for this channel — the same file handle_inbound
+# diverts to (assembled from parts; tests rebind this constant).
+QUOTE_SPOOL = (Path("/home/hatch/workspace/native-bridge")
+               / "spool" / "weixin.jsonl")
 OUTBOX = STATE / "outbox.jsonl"
 OUTBOX_RESULTS = STATE / "outbox_results.jsonl"
 OUTBOX_OFFSET = STATE / "outbox.offset"
@@ -1668,6 +1677,63 @@ class Gateway:
         return None
 
     @staticmethod
+    def _ref_qid_from(ref: dict) -> str:
+        """Quoted message's platform id inside one ref dict, or "".
+
+        Container order mirrors _ref_annotation (message_item /
+        item / item_list[0] / the ref itself); the id key is
+        msg_id / message_id / id, whichever a shape carries.
+        """
+        cands = []
+        for cand in (ref.get("message_item"), ref.get("item")):
+            if isinstance(cand, dict) and cand:
+                cands.append(cand)
+        il = ref.get("item_list")
+        if (isinstance(il, list) and il
+                and isinstance(il[0], dict) and il[0]):
+            cands.append(il[0])
+        cands.append(ref)
+        for c in cands:
+            for key in ("msg_id", "message_id", "id"):
+                v = c.get(key)
+                if v:
+                    return str(v)
+        return ""
+
+    @staticmethod
+    def _find_ref_qid(msg: dict) -> str:
+        """Platform id of the message this one quotes, or "".
+
+        Live-captured iLink shape (2026-10-11, diverted_raw.jsonl):
+        ref_msg = {"message_item": {"type": 0, "msg_id": "<id>",
+        ...}} — the ref carries ONLY the quoted message's id, never
+        its content, so _ref_annotation can only emit the generic
+        marker and the content has to be recovered by id (see
+        _resolve_quote). Lookup order mirrors _extract_text:
+        item-level refs first, then the message-level ref.
+        Fail-silent.
+        """
+        try:
+            if not isinstance(msg, dict):
+                return ""
+            refs = []
+            for item in msg.get("item_list") or []:
+                if isinstance(item, dict):
+                    r = item.get("ref_msg")
+                    if isinstance(r, dict) and r:
+                        refs.append(r)
+            r = msg.get("ref_msg")
+            if isinstance(r, dict) and r:
+                refs.append(r)
+            for ref in refs:
+                qid = Gateway._ref_qid_from(ref)
+                if qid:
+                    return qid
+        except Exception:
+            return ""
+        return ""
+
+    @staticmethod
     def _extract_text(msg: dict) -> tuple[str, list[dict]]:
         parts: list[str] = []
         media: list[dict] = []
@@ -1712,6 +1778,108 @@ class Gateway:
             if ann:
                 parts.append(ann)
         return "\n".join(parts), media
+
+    @staticmethod
+    def _tail_jsonl_rows(path: Path, max_rows: int = 400) -> list[dict]:
+        """Last max_rows parsed rows of a jsonl file, newest first.
+
+        Only a bounded tail window is read, so long append-only
+        logs stay cheap. Fail-silent: any error yields [].
+        """
+        try:
+            if not path.exists():
+                return []
+            size = path.stat().st_size
+            window = 2_000_000
+            with path.open("rb") as f:
+                if size > window:
+                    f.seek(size - window)
+                data = f.read()
+            lines = data.decode("utf-8", errors="replace").splitlines()
+            if size > window and lines:
+                lines = lines[1:]  # first line may be cut mid-row
+            rows = []
+            for line in reversed(lines[-max_rows:]):
+                try:
+                    r = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(r, dict):
+                    rows.append(r)
+            return rows
+        except Exception:
+            return []
+
+    def _resolve_quote(self, qid: str) -> str | None:
+        """Recover a quoted message's content by platform id.
+
+        iLink refs carry only the quoted id (see _find_ref_qid), so
+        the content is looked up in records this machine already
+        keeps, newest first: the bridge spool and this gateway's
+        INBOX (the user's own messages), then the sent index (this
+        bot's own bubbles, see _index_sent). Returns the rendered
+        「（引用：…）」suffix, or None when the id is unknown
+        locally. Fail-silent.
+        """
+        try:
+            if not qid:
+                return None
+
+            def _trunc(s: str) -> str:
+                return s[:200] + "…" if len(s) > 200 else s
+
+            for path in (QUOTE_SPOOL, INBOX):
+                for row in Gateway._tail_jsonl_rows(path, 400):
+                    if str(row.get("msgid", "")) == qid:
+                        t = row.get("text")
+                        if isinstance(t, str) and t:
+                            return f"（引用：{_trunc(t)}）"
+            for row in Gateway._tail_jsonl_rows(SENT_INDEX, 400):
+                if str(row.get("mid", "")) == qid:
+                    c = row.get("content")
+                    c = c if isinstance(c, str) else ""
+                    if row.get("kind") == "file":
+                        if c:
+                            return f"（引用：[文件 {c}]）"
+                        return "（引用：[文件]）"
+                    if c:
+                        return f"（引用：{_trunc(c)}）"
+        except Exception:
+            return None
+        return None
+
+    def _index_sent(self, resp, kind: str, content: str) -> None:
+        """Record a successfully sent bubble in SENT_INDEX so a
+        later quote of it can be resolved by platform id (see
+        _resolve_quote). The sendmessage response is probed for
+        the new message id under message_id / msg_id, top level
+        first, then under data; when the response carries no id
+        nothing is written and quotes of that bubble keep the
+        generic marker. Fail-silent. Note: send_text returns only
+        the last chunk's response, so a chunked reply indexes its
+        final chunk only.
+        """
+        try:
+            if not isinstance(resp, dict):
+                return
+            mid = ""
+            for node in (resp, resp.get("data")):
+                if isinstance(node, dict):
+                    for key in ("message_id", "msg_id"):
+                        v = node.get(key)
+                        if v:
+                            mid = str(v)
+                            break
+                if mid:
+                    break
+            if not mid:
+                return
+            self.append_jsonl(SENT_INDEX, {
+                "mid": mid, "kind": kind,
+                "content": content or "", "ts": int(time.time()),
+            })
+        except Exception:
+            pass
 
     @staticmethod
     def _sanitize_raw(msg: dict) -> dict:
@@ -2300,6 +2468,15 @@ class Gateway:
             self._mark_seen(msgid)
             return
         text, media = self._extract_text(msg)
+        if "（引用：[消息]）" in text:
+            # iLink refs carry only the quoted id; when the
+            # extractor could not name the quote, recover its
+            # content from local records by id. A quote the
+            # extractor already named is never overwritten, and
+            # an unresolvable id keeps the generic marker.
+            resolved = self._resolve_quote(self._find_ref_qid(msg))
+            if resolved:
+                text = text.replace("（引用：[消息]）", resolved)
         if not media:
             # Slash commands: intercepted after allowlist + dedupe,
             # before the inbox write — they never wake a worker.
@@ -3178,6 +3355,7 @@ class Gateway:
                     info.get("client_id", ""), 2, item_id,
                 )
                 if resp.get("ret") in (None, 0):
+                    self._index_sent(resp, "text", content)
                     typing_after = (to, token_ctx, 2)
             elif mode == "update":
                 info = self._route_for(str(item.get("msgid", "")))
@@ -3240,14 +3418,18 @@ class Gateway:
                         log(f"outbox {mode} {item_id}: ok=False err={result.get('errmsg', '')}")
                         return False
                     self._mark_caption_sent(item_id)
+                    self._index_sent(cap_resp, "text", caption)
                 resp = await self._deliver_file(client, creds, to, fpath, token_ctx)
                 if resp.get("ret") in (None, 0):
+                    self._index_sent(resp, "file", Path(fpath).name)
                     typing_after = (to, token_ctx, 2)
             elif mode == "send":
                 resp = await self.send_text(
                     client, creds, item.get("to_user_id", ""), content,
                     "", "", 2, item_id,
                 )
+                if isinstance(resp, dict) and resp.get("ret") in (None, 0):
+                    self._index_sent(resp, "text", content)
             elif mode == "send_file":
                 to = item.get("to_user_id", "")
                 fpath = item.get("file_path", "")
@@ -3278,9 +3460,12 @@ class Gateway:
                         self.append_jsonl(OUTBOX_RESULTS, result)
                         return False
                     self._mark_caption_sent(item_id)
+                    self._index_sent(cap_resp, "text", content)
                 resp = await self._deliver_file(
                     client, creds, to, fpath
                 )
+                if isinstance(resp, dict) and resp.get("ret") in (None, 0):
+                    self._index_sent(resp, "file", Path(fpath).name)
             else:
                 result["errmsg"] = f"unknown mode {mode}"
                 self.append_jsonl(OUTBOX_RESULTS, result)
