@@ -2225,12 +2225,25 @@ class Gateway:
         quote = body.get("quote") or {}
         if quote:
             qtext = ""
-            if quote.get("msgtype") == "text":
+            qtype = quote.get("msgtype", "")
+            if qtype == "text":
                 qtext = (quote.get("text") or {}).get("content", "")
-            elif quote.get("msgtype") == "voice":
+            elif qtype == "voice":
                 qtext = (quote.get("voice") or {}).get("content", "")
             if qtext:
                 text_parts.append(f"（引用：{qtext}）")
+            elif qtype == "image":
+                # Non-text quotes used to surface only as collected
+                # media, indistinguishable from a fresh attachment;
+                # name the quote explicitly (2026-10-11, aligned with
+                # the Weixin _ref_annotation markers).
+                text_parts.append("（引用：[图片]）")
+            elif qtype == "file":
+                text_parts.append("（引用：[文件]）")
+            elif qtype == "video":
+                text_parts.append("（引用：[视频]）")
+            elif qtype:
+                text_parts.append("（引用：[消息]）")
             _collect_media("image", quote.get("image"))
             _collect_media("file", quote.get("file"))
         for m in media:
