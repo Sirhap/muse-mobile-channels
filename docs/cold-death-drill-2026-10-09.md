@@ -15,24 +15,25 @@ systemd units, or hook definitions.
 | 时间 | 2026-10-10 14:25 Asia/Shanghai |
 | 渠道 | `wecom` |
 | 会收到演练通知的会话 | `chatid=wrzLPjBgAAU5nM4RBfC6pUN5TegxRbOA` `chattype=group` |
-| 演练 msgid | 演练 A 轮 `drill-deathwatch-20261010142934-wecom`（授权当时填写的值）。演练 B、C 轮另有 msgid，见下一节 |
+| 演练 msgid | 授权当时填写演练 A 轮 `drill-deathwatch-20261010142934-wecom`。验收通过的是演练 4b `drill-deathwatch-1791616087-wecom4b`。A 至 4a 仍为 FAIL，见下一节 |
 | 范围 | 沙箱 + 线上第二判 |
 | 队列当时为空 | 是 |
 
 线上投递只在上一表填完、并且「范围」写明包含线上之后才做。沙箱脚本同样等这张表出现「仅沙箱」或更宽的范围再跑；写这份计划的人在开发机 `/tmp` 里验证过脚本本身，那一次不是演练，也没有连 hatch。
 
-授权表填完只说明当时允许做线上第二判。它不表示演练已经通过。
+授权表填完只说明当时允许做线上第二判。哪一轮通过，看下一节。
 
-## 线上结果（2026-10-10，未结案）
+## 线上结果（2026-10-10，演练 4b 验收 PASS）
 
-同一张授权表下已经结束三轮，第四轮（base64 栽种）还在进行。授权表里的 msgid 是演练 A 轮。每一轮的停止通知都要同时含「任务已停止」和字面大写 `DRILL`，并且 `outbox_results.jsonl` 里同一 id 为 `ok=true`，这一支才算过。A/B/C 的真实 outbox 都没有字面大写 `DRILL`，待办第 5 项不划掉。第四轮证据回填之前，这里不写 PASS。
+同一张授权表下，演练 4b 验收 PASS，待办第 5 项据此划掉。授权表里当初填写的 msgid 仍是演练 A 轮。通过条件是停止通知的 hatch 原文同时含「任务已停止」和字面大写 `DRILL`（演练句为「【DRILL 冷判死】」），并且 `outbox_results.jsonl` 里同一 id 为 `ok=true`。展示路径会吞掉「【DRILL】」。判定时用 hatch outbox 的 base64 或 repr，演练 4b 的通过依据是这段原文。演练 A 到演练 4a 仍记 FAIL。
 
 | 轮次 | 结论 | msgid | outbox id |
 | --- | --- | --- | --- |
 | 演练 A | FAIL | `drill-deathwatch-20261010142934-wecom` | `963d4892d454` |
 | 演练 B | FAIL（PASS 作废） | `drill-deathwatch-20261010143433-wecom2` | `b4143d0b7681` |
 | 演练 C | FAIL，已回滚 | `drill-deathwatch-1791614953-wecom3` | `a87618d6800b` |
-| 第四轮 | 进行中，证据未回填 | 待回填 | 待回填 |
+| 演练 4a | FAIL | 本次未附 | 本次未附 |
+| 演练 4b | PASS | `drill-deathwatch-1791616087-wecom4b` | `3a6457e42768` |
 
 演练 A 失败。since `1791611874`。`cancelled.json` 只多了这一条 msgid（ts `1791613779.79`）。停止通知 outbox id `963d4892d454`，`outbox_results` `ok=true`，ts `1791613781`。正文含「任务已停止」，摘录是「演练消息，不是用户」〔#drill-de〕，没有字面大写 `DRILL`。没有「自动续跑一次」，没有误取消其他 msgid，这一轮没有走回滚。服务保持活动，`DEATH_WATCH_SECS` 未改。快照：`SNAP=/tmp/death-watch-drill-snap-20261010142920`（hatch）。
 
@@ -40,7 +41,9 @@ systemd units, or hook definitions.
 
 演练 C 失败并已回滚。msgid `drill-deathwatch-1791614953-wecom3`，停止通知 outbox id `a87618d6800b`，正文没有字面大写 `DRILL`。回滚已经做完。
 
-第四轮进行中。栽种改为 base64。msgid、outbox id 和正文都还没有落到本文。证据回填之前不结案，不记 PASS。
+演练 4a 仍记 FAIL。这次结案没有附它的 msgid 和 outbox id。
+
+演练 4b 验收 PASS。msgid `drill-deathwatch-1791616087-wecom4b`。停止通知 outbox id `3a6457e42768`，`ok=true`。hatch base64 解出的正文同时含「任务已停止」和「【DRILL 冷判死】」。
 
 ## 现在的判死到底看什么
 
@@ -344,4 +347,4 @@ CLI，没有 `outbox_results.jsonl` 的 `ok=true`，也不能代替用户看见�
 有没有误伤。没做线上投递就不要把第 5 项划掉。沙箱通过只说明仓库钩子的分流还在，
 生产实证仍是那一条真的 `ok=true`。
 
-2026-10-10 的回填写在上文「线上结果」和待办第 5 项。演练 A、B、C 的真实 outbox 都没有字面大写 `DRILL`，三轮都记 FAIL。演练 B 的 outbox `b4143d0b7681` 复核为 `HAS_DRILL=False`，Muse 的 `DRILL=True` 作废，短暂 PASS 一并作废。演练 C 已回滚。第四轮（base64 栽种）证据未回填。第 5 项保持开放，两处文档都不写 PASS。
+2026-10-10 的回填写在上文「线上结果」和待办第 5 项。演练 4b（msgid `drill-deathwatch-1791616087-wecom4b`，outbox `3a6457e42768`，`ok=true`）验收 PASS：hatch base64 正文同时含「任务已停止」和「【DRILL 冷判死】」。第 5 项已划掉。演练 A 到演练 4a 仍记 FAIL。展示路径会吞掉「【DRILL】」，正文判定用 hatch outbox 的 base64 或 repr。
