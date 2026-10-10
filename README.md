@@ -80,10 +80,12 @@ twice in production, 2026-10-05). Change definitions only through the
 hooks API, never by editing the JSON in place.
 
 Cold-channel death watch (`DEATH_WATCH_SECS=1800` in the inbox hooks)
-has a written drill plan and a default-off sandbox script. Do not run
-either against the live hatch until that plan's authorization line is
-filled in: `docs/cold-death-drill-2026-10-09.md`,
-`ops/cold_death_drill.py`.
+checks bridge and worker real activity before it resumes or cancels a
+silent batch. A fresh signal holds the batch; a missing or unreadable
+probe is not treated as life. The drill plan and the default-off
+sandbox script are `docs/cold-death-drill-2026-10-09.md` and
+`ops/cold_death_drill.py`. Do not run either against the live hatch
+until that plan's authorization line is filled in.
 
 ## Tests
 
