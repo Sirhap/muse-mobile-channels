@@ -1544,9 +1544,58 @@ class Gateway:
     # ---------- inbound ----------
 
     @staticmethod
+    def _ref_annotation(ref: dict) -> str | None:
+        """Short suffix naming the quoted (referenced) message.
+
+        Text/title quotes keep their historical rendering (text now
+        truncated at 200 chars so a quoted wall of text cannot swamp
+        the inbound line); every other quote shape degrades to a
+        typed marker instead of being dropped silently — on
+        2026-10-10 a quoted non-text message reached the agent as a
+        bare word with no hint anything was quoted. Fail-silent: any
+        structural surprise yields the generic marker, never a raise.
+        """
+        try:
+            if not isinstance(ref, dict) or not ref:
+                return None
+            ref_item = ref.get("message_item") or {}
+            rtype = ref_item.get("type")
+            if rtype == 1:
+                rt = (ref_item.get("text_item") or {}).get("text", "")
+                if rt:
+                    if len(rt) > 200:
+                        rt = rt[:200] + "…"
+                    return f"（引用：{rt}）"
+            elif rtype == 2:
+                return "（引用：[图片]）"
+            elif rtype == 5:
+                return "（引用：[视频]）"
+            elif rtype == 4:
+                fname = (ref_item.get("file_item") or {}).get(
+                    "file_name", "")
+                if fname:
+                    return f"（引用：[文件 {fname}]）"
+                return "（引用：[文件]）"
+            elif rtype == 3:
+                vt = (ref_item.get("voice_item") or {}).get("text", "")
+                if vt:
+                    if len(vt) > 200:
+                        vt = vt[:200] + "…"
+                    return f"（引用：{vt}）"
+                return "（引用：[语音]）"
+            if ref.get("title"):
+                return f"（引用：{ref['title']}）"
+            if ref_item or ref.get("msgid") or ref.get("message_id"):
+                return "（引用：[消息]）"
+        except Exception:
+            return "（引用：[消息]）"
+        return None
+
+    @staticmethod
     def _extract_text(msg: dict) -> tuple[str, list[dict]]:
         parts: list[str] = []
         media: list[dict] = []
+        quoted = False
         for item in msg.get("item_list") or []:
             itype = item.get("type")
             if itype == 1:
@@ -1576,14 +1625,16 @@ class Gateway:
             elif itype == 5:
                 media.append({"kind": "video", "item": item.get("video_item") or {}})
                 parts.append("[视频]")
-            ref = item.get("ref_msg") or {}
-            ref_item = ref.get("message_item") or {}
-            if ref_item.get("type") == 1:
-                rt = (ref_item.get("text_item") or {}).get("text", "")
-                if rt:
-                    parts.append(f"（引用：{rt}）")
-            elif ref.get("title"):
-                parts.append(f"（引用：{ref['title']}）")
+            ann = Gateway._ref_annotation(item.get("ref_msg") or {})
+            if ann:
+                parts.append(ann)
+                quoted = True
+        if not quoted:
+            # iLink shape variant: the reference hangs off the
+            # message itself rather than an item.
+            ann = Gateway._ref_annotation(msg.get("ref_msg") or {})
+            if ann:
+                parts.append(ann)
         return "\n".join(parts), media
 
     @staticmethod
