@@ -59,8 +59,12 @@ IDLE_PUSH_EVERY_SECS = 20   # idle-session scan cadence (see idle_push_scan)
 # Quiet window (2026-10-09): aligned to chat.py's QUIET of 10s.
 # The previous 30s stretch had no recorded reason; it only held the
 # channel turn open longer after the platform had already finished.
-# Close still requires sessions.get status == "completed", so a tool
-# gap while the session is running is not cut off by these 10s.
+# Close still requires sessions.get status == "completed" on two
+# consecutive polls (trailing_quiet_seen), plus TRAILING_QUIET_SECS
+# of silence and no newer history row on the confirming poll. Status
+# can flip to completed before that reply is in chat.history; one
+# look would close early and drop it. A running status, or a failed
+# sessions.get, never closes on silence alone and clears the mark.
 # A segment that lands after close still rides idle_push_scan on the
 # same cursor.
 TRAILING_QUIET_SECS = 10
@@ -788,6 +792,7 @@ class ChannelWorker(threading.Thread):
                 "chattype": row.get("chattype", ""), "next_prog": 0,
                 "ids": [row["msgid"]], "reply_started": False,
                 "sess_status": None, "status_completed_seen": False,
+                "trailing_quiet_seen": False,
                 "activities": [], "activity_seen": [],
                 "last_activity_poll": 0, "last_activity": None,
                 # LT2 trailing-loop state (inert unless longtask_mode):
@@ -1105,6 +1110,10 @@ class ChannelWorker(threading.Thread):
                 self._turn_reply_marks.append((seq, mid))
                 turn["cursor_seq"] = seq
                 turn["last_reply_at"] = int(now_t)
+                # A new segment resets the quiet window, so a prior
+                # completed+quiet observation is no longer consecutive.
+                if turn.get("trailing_quiet_seen"):
+                    turn["trailing_quiet_seen"] = False
                 self._turns_dirty = True
                 self.log(f"trailing reply delivered "
                          f"msgid={turn['msgid']} seq={seq}")
@@ -1141,12 +1150,16 @@ class ChannelWorker(threading.Thread):
             # progress notice (still capped at one per
             # LT_EVENT_PROG_MIN_SECS). The only close is silence:
             # sessions.get says completed AND TRAILING_QUIET_SECS
-            # have passed since the last reply. There is no
-            # wall-clock cap. A running status never closes on
-            # silence alone. A failed status query also does not
-            # close the turn (no signal is not "completed").
-            # After close, later arrivals continue through
-            # idle_push_scan on the same unified cursor.
+            # have passed since the last reply, on two consecutive
+            # polls. There is no wall-clock cap. A running status
+            # never closes on silence alone. A failed status query
+            # also does not close the turn (no signal is not
+            # "completed"). After close, later arrivals continue
+            # through idle_push_scan on the same unified cursor.
+            # History for this poll was already read above. This
+            # block must not read history again and must not sleep:
+            # the confirming poll is the next step(), which re-reads
+            # history first and can still deliver a late segment.
             if self._poll_activity(turn):
                 turn["activity_dirty"] = True
                 self._turns_dirty = True
@@ -1156,12 +1169,26 @@ class ChannelWorker(threading.Thread):
                 turn["sess_status"] = status
                 self._turns_dirty = True
             now2 = time.time()
-            if status == "completed" and \
-                    now2 - (turn.get("last_reply_at") or now2) \
-                    >= TRAILING_QUIET_SECS:
+            quiet_full = (
+                now2 - (turn.get("last_reply_at") or now2)
+                >= TRAILING_QUIET_SECS)
+            # Two-beat close, same shape as status_completed_seen
+            # on the undelivered path below. The first
+            # completed+quiet observation only arms the mark.
+            if status == "completed" and quiet_full:
+                if not turn.get("trailing_quiet_seen"):
+                    turn["trailing_quiet_seen"] = True
+                    self._turns_dirty = True
+                    return "running"
                 self.log(f"trailing window closed msgid={turn['msgid']} "
                          f"outbox_ok={self._outbox_ok_label(turn)}")
                 return "done"
+            # running, sessions.get failure (None), or silence
+            # broken by a newer reply: the confirmation is not
+            # consecutive anymore.
+            if turn.get("trailing_quiet_seen"):
+                turn["trailing_quiet_seen"] = False
+                self._turns_dirty = True
             return "running"
         # No completed reply delivered (yet). Cross-check the
         # platform's own turn state (sessions.get, probe9) —
