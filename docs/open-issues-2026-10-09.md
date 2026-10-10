@@ -34,7 +34,7 @@
 - 结案：演练 4b / wecom4b 验收 PASS。msgid `drill-deathwatch-1791616087-wecom4b`。停止通知 outbox id `3a6457e42768`，`ok=true`，ts≈`1791616092`。since `1791614187`。快照 `SNAP=/tmp/death-watch-drill-snap4b-20261010070807`（hatch）。hatch base64 解出的正文同时含「任务已停止」和字面 `DRILL` / 「【DRILL 冷判死】」。`cancelled.json` 只多了这一条 msgid。没有误取消。没有「自动续跑一次」。`DEATH_WATCH_SECS` 未改。服务保持活动。演练 A 到演练 4a 仍记 FAIL，不因这一轮改写。
 - 取证：纯文本或展示链路会吞掉「【DRILL…】」前缀，导致误判。正文是否含字面 `DRILL`，以 hatch outbox 的 B64、repr，或 `"DRILL" in content` 为准。演练 4b 的通过依据是这段原文。
 - 完成标准：停止通知的 hatch 原文同时含「任务已停止」和字面大写 `DRILL`，且同一 outbox id 为 `ok=true`。演练 4b 满足这一条。
-- 演练计划：`docs/cold-death-drill-2026-10-09.md`（授权表 2026-10-10 已填）。配套脚本 `ops/cold_death_drill.py` 默认关闭，只重写一份钩子到 `/tmp`，没有线上模式。不得改 `DEATH_WATCH_SECS` 或钩子轮询。
+- 演练计划：`docs/cold-death-drill-2026-10-09.md`（授权表 2026-10-10 已填）。配套脚本 `ops/cold_death_drill.py` 默认关闭，只重写一份钩子到 `/tmp`，没有线上模式。企微线上第二判的栽种脚本是 `ops/cold_death_live_second_judgment.py`，同样默认关闭，要 `DEATH_WATCH_LIVE_PLANT=1` 和 `DEATH_WATCH_LIVE_CONFIRM=wecom-second-judgment` 同时成立才写 hatch。不得改 `DEATH_WATCH_SECS` 或钩子轮询。
 - 2026-10-10：续跑和取消之前增加了桥 / worker 真实活动探测（`death_watch_activity.py`）。沙箱场景覆盖「还活着则不续不杀」「真死才续跑」「第二次真死才取消」。同日线上第二判证据见下条。
 - 2026-10-10 线上第二判（演练 4b PASS；A 至 4a 仍为 FAIL）：
   - 授权：tom Jack / 2026-10-10 14:25 Asia/Shanghai / wecom / 范围=沙箱+线上第二判。会话 `chatid=wrzLPjBgAAU5nM4RBfC6pUN5TegxRbOA` `chattype=group`。各轮 msgid 不同。
