@@ -25,6 +25,7 @@
 !/docs/*.md
 !/ops/
 !/ops/cold_death_drill.py
+!/ops/cold_death_live_second_judgment.py
 !/native-probe/
 !/native-probe/gw2.py
 !/native-probe/README.md

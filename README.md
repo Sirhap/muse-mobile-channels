@@ -82,10 +82,14 @@ hooks API, never by editing the JSON in place.
 Cold-channel death watch (`DEATH_WATCH_SECS=1800` in the inbox hooks)
 checks bridge and worker real activity before it resumes or cancels a
 silent batch. A fresh signal holds the batch; a missing or unreadable
-probe is not treated as life. The drill plan and the default-off
-sandbox script are `docs/cold-death-drill-2026-10-09.md` and
-`ops/cold_death_drill.py`. Do not run either against the live hatch
-until that plan's authorization line is filled in.
+probe is not treated as life. The drill plan is
+`docs/cold-death-drill-2026-10-09.md`. `ops/cold_death_drill.py` is
+sandbox-only. The WeCom online second-judgment plant is
+`ops/cold_death_live_second_judgment.py`; it stays off unless
+`DEATH_WATCH_LIVE_PLANT=1` and
+`DEATH_WATCH_LIVE_CONFIRM=wecom-second-judgment` are both set.
+Do not run either against the live hatch until that plan's
+authorization line is filled in.
 
 ## Tests
 
