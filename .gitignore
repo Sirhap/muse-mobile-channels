@@ -21,6 +21,10 @@
 !/hooks/definitions/*.json
 !/tests/
 !/tests/*.py
+# Root `/*` ignores this directory. Both lines are required or
+# wecom_outbound_coalesce_v2.py never enters the index.
+!/acceptance-fix-2026-10-08/
+!/acceptance-fix-2026-10-08/*.py
 !/docs/
 !/docs/*.md
 !/ops/
