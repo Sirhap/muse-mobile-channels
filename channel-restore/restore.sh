@@ -10,12 +10,16 @@
 #   3. verifies the service is active and reports the gateway state
 # It also reinstalls its own service and timer. Those units are what
 # invoke this script; a replacement VM otherwise loses the schedule.
-# Safe to run any time (also on a 5-minute timer via
-# channel-restore.timer): when everything is healthy it changes nothing.
-# A VM replacement deletes the timer too, so this script does not run
-# again until a heartbeat check or an operator starts it. The read-only
-# detector for that gap is channel-restore/liveness-probe.sh (HEARTBEAT.md).
-# The probe does not call this script.
+# Safe to run any time: when everything is healthy it changes
+# nothing. Triggers, in order (2026-10-11, method 1): PRIMARY is the
+# wecom/weixin inbox hook poll (~5s, driven from outside systemd on
+# the surviving 100G volume) — hook-heal.sh in this directory checks
+# the unit files on every poll and calls this script when one is
+# missing or differs, so a VM replacement that deletes the timer is
+# healed within seconds-to-minutes. BACKUP is channel-restore.timer
+# every 5 minutes. The read-only detector remains
+# channel-restore/liveness-probe.sh (HEARTBEAT.md); the probe does
+# not call this script.
 set -uo pipefail
 
 # systemd system units set HOME=/root. The install home is /home/hatch

@@ -30,6 +30,19 @@
 set -euo pipefail
 source "$HATCH_HOOK_RUNTIME"
 
+# --- channel self-heal, method-1 primary trigger (2026-10-11) ---
+# Every poll first runs a cheap unit-file check via hook-heal.sh:
+# all six systemd units present and identical to their workspace
+# copies -> it exits immediately and changes nothing. A unit wiped
+# by a VM replacement triggers the existing restore.sh from here
+# (flock-serialised, throttled), because this poll is driven from
+# outside systemd and survives the wipe that also deletes
+# channel-restore.timer; the timer remains the backup trigger.
+# Fail-silent: healing must never disturb message polling.
+if [[ -x /home/hatch/workspace/channel-restore/hook-heal.sh ]]; then
+  /home/hatch/workspace/channel-restore/hook-heal.sh >/dev/null 2>&1 || true
+fi
+
 INBOX="/home/hatch/workspace/weixin-bot/state/inbox.jsonl"
 OUTBOX="/home/hatch/workspace/weixin-bot/state/outbox.jsonl"
 STATE_DIR="$HOME/hooks/state/weixin-bot"
