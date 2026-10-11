@@ -831,19 +831,13 @@ class ChannelWorker(threading.Thread):
             return
         excerpt = (turn.get("text") or "")[:24]
         mins = max(1, round(age / 60))
-        phase = "已开始生成" if turn.get("reply_started") else "思考中"
-        nq = len(self.queue)
-        qtxt = f"后面还排着 {nq} 条。" if nq else ""
         if age >= ESCALATE_SECS:
             # A bare "still working" repeated forever reads as a hang and
             # gives the user nothing to act on. Past the escalation age,
             # say it looks stuck and name the remedy.
-            text = (f"⚠️ 这条任务已跑约 {mins} 分钟还没结束（{phase}），"
-                    f"可能卡住了：「{excerpt}」〔#{turn['msgid'][:8]}〕\n"
-                    f"发 /stop 可以终止它，后面的消息会继续处理。{qtxt}")
+            text = f"⚠️ 处理约 {mins} 分钟，可能卡住：「{excerpt}」，/stop 终止"
         else:
-            text = (f"⏳ 还在处理中（已跑约 {mins} 分钟，{phase}）："
-                    f"「{excerpt}」〔#{turn['msgid'][:8]}〕{qtxt}")
+            text = f"⏳ 处理中（约 {mins} 分钟）：「{excerpt}」"
         # Fold the newest activity signals into THIS notice only —
         # never a separate bubble. Neutral wording: activity.list is
         # an account-wide stream, attribution is by time window only.

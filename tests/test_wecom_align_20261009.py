@@ -210,7 +210,7 @@ def scenario_bcd():
     rows = send_rows(d)
     check("b: one started notice queued",
           n1 == 1 and len(rows) == 1
-          and rows[0]["content"].startswith("▶️ 排到你了，开始处理")
+          and rows[0]["content"].startswith("▶️ 开始处理")
           and "排队的问题" in rows[0]["content"]
           and rows[0].get("mode") == "reply_notice"
           and rows[0].get("msgid") == "M-Q")
@@ -235,15 +235,15 @@ def scenario_bcd():
           n3 == 0 and len(send_rows(d)) == before)
     n4 = g._feedback_scan_once(now=queued_at + 180)
     rows = send_rows(d)
-    wait_rows = [r for r in rows if "还在排队" in r.get("content", "")]
+    wait_rows = [r for r in rows if "排队中" in r.get("content", "")]
     check("c: one wait reminder at 180s",
           n4 == 1 and len(wait_rows) == 1
-          and "原生通道第 1 位" in wait_rows[0]["content"]
+          and "第 1 位" in wait_rows[0]["content"]
           and "已等" in wait_rows[0]["content"])
     n5 = g._feedback_scan_once(now=queued_at + 600)
     check("c: wait reminder not repeated",
           n5 == 0 and len([r for r in send_rows(d)
-                           if "还在排队" in r.get("content", "")]) == 1)
+                           if "排队中" in r.get("content", "")]) == 1)
 
     # merged msgid: started notice suppressed for good.
     FAKE["active"] = [{"msgid": "OTHER", "lane": "main", "secs": 3}]

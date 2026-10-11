@@ -628,8 +628,8 @@ def _task_overview_text(channel, state_dir, hook_state_dir):
 # record that was actually queued. Merged turns never get the
 # started notice. (The old "queued at position N" arrival ack this
 # replaces was WeCom-only leftover behaviour and stays gone.)
-STARTED_NOTICE_TEMPLATE = "▶️ 排到你了，开始处理：「{excerpt}」〔#{code}〕"
-BRIDGE_WAIT_TEMPLATE = "⏳ 还在排队（原生通道第 {n} 位）：前面任务还没结束，已等{dur}〔#{code}〕；/stop 取消"
+STARTED_NOTICE_TEMPLATE = "▶️ 开始处理：「{excerpt}」"
+BRIDGE_WAIT_TEMPLATE = "⏳ 排队中（第 {n} 位，已等{dur}）"
 WAIT_REMIND_SECS = 180
 
 
@@ -718,7 +718,7 @@ def is_stop_request(text):
     return False
 
 
-SOFT_ACK_TEMPLATE = "已收到，排队第 {n} 位，当前任务进行中；/stop 取消"
+SOFT_ACK_TEMPLATE = "收到，排队第 {n} 位"
 
 
 def soft_ack_text(state_dir, hook_state_dir, text):
@@ -2150,8 +2150,7 @@ class Gateway:
                     if self._queue_notice(
                             chatid, rec.get("chattype", ""),
                             STARTED_NOTICE_TEMPLATE.format(
-                                excerpt=rec.get("excerpt", ""),
-                                code=str(mid)[:8]),
+                                excerpt=rec.get("excerpt", "")),
                             "started", mid):
                         sent += 1
                 elif (rec.get("queued") and mid in b_pos
@@ -2163,8 +2162,7 @@ class Gateway:
                                 chatid, rec.get("chattype", ""),
                                 BRIDGE_WAIT_TEMPLATE.format(
                                     n=b_pos[mid],
-                                    dur=_dur_str(waited),
-                                    code=str(mid)[:8]),
+                                    dur=_dur_str(waited)),
                                 "waitremind", mid):
                             sent += 1
             return sent
@@ -2227,12 +2225,25 @@ class Gateway:
         quote = body.get("quote") or {}
         if quote:
             qtext = ""
-            if quote.get("msgtype") == "text":
+            qtype = quote.get("msgtype", "")
+            if qtype == "text":
                 qtext = (quote.get("text") or {}).get("content", "")
-            elif quote.get("msgtype") == "voice":
+            elif qtype == "voice":
                 qtext = (quote.get("voice") or {}).get("content", "")
             if qtext:
                 text_parts.append(f"（引用：{qtext}）")
+            elif qtype == "image":
+                # Non-text quotes used to surface only as collected
+                # media, indistinguishable from a fresh attachment;
+                # name the quote explicitly (2026-10-11, aligned with
+                # the Weixin _ref_annotation markers).
+                text_parts.append("（引用：[图片]）")
+            elif qtype == "file":
+                text_parts.append("（引用：[文件]）")
+            elif qtype == "video":
+                text_parts.append("（引用：[视频]）")
+            elif qtype:
+                text_parts.append("（引用：[消息]）")
             _collect_media("image", quote.get("image"))
             _collect_media("file", quote.get("file"))
         for m in media:
@@ -2533,7 +2544,7 @@ class Gateway:
                     update_sub = f"「{title}」— 你选了：{sel_text}"
                 else:
                     update_title = "已确认 ✅" if event_key == "btn_confirm" else "已取消 ❌" if event_key == "btn_cancel" else "已提交 ✅" if is_submit else "已收到 ✅"
-                    update_sub = f"「{title}」— Muse 已收到，正在处理后续。"
+                    update_sub = f"「{title}」— 已收到，处理中"
                 try:
                     resp = await self.send_frame(
                         {

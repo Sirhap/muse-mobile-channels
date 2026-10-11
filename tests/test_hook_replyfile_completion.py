@@ -188,7 +188,7 @@ def run_channel(chan, botdir, hookst, script_name, cli_relpath, entry_fn):
     check("S12 first silence auto-resumes (no cancel, no fail notice)",
           "CALL: cancel" not in calls() and "任务已停止" not in calls()
           and "任务执行失败" not in calls()
-          and "自动续跑一次" in calls())
+          and "已自动续跑" in calls())
     check("S12 batch re-woken as the resume batch, not completed",
           batch().get("msgids") == ["F5"])
 
@@ -241,7 +241,7 @@ def run_channel(chan, botdir, hookst, script_name, cli_relpath, entry_fn):
     # is told instead of the batch vanishing quietly.
     check("S15 detached first silence auto-resumes (no cancel)",
           "CALL: cancel" not in calls()
-          and "自动续跑一次" in calls()
+          and "已自动续跑" in calls()
           and "任务执行失败" not in calls())
     check("S15 detached dropped, re-woken active, NOT silently retired",
           not batch().get("detached") and "F8" not in retired()
@@ -271,7 +271,7 @@ def run_channel(chan, botdir, hookst, script_name, cli_relpath, entry_fn):
     # loss of the worker's own pushes is judged.
     check("S1c silent batch auto-resumed once by deathwatch",
           "CALL: cancel" not in calls()
-          and "自动续跑一次" in calls()
+          and "已自动续跑" in calls()
           and "任务执行失败" not in calls()
           and batch().get("msgids") == ["D1"])
 
