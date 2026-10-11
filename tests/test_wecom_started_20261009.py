@@ -113,7 +113,7 @@ def send_rows(state_dir):
 def started_rows(state_dir):
     """Send rows that are the started notice, not a wait reminder."""
     return [row for row in send_rows(state_dir)
-            if str(row.get("content", "")).startswith("▶️ 排到你了")]
+            if str(row.get("content", "")).startswith("▶️ 开始处理")]
 
 
 def expected_started(msgid, text):

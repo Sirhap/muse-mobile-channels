@@ -347,7 +347,7 @@ w.step(str(spool), None)
 rows = [r for r in read_jsonl(WX / "outbox.jsonl") if r.get("mode") == "send"]
 bodies = [r.get("content", "") for r in rows]
 check("C new activity fires a progress notice before 120s",
-      any("还在处理中" in b for b in bodies))
+      any("处理中" in b for b in bodies))
 check("C event notice carries the folded 最近动态 line",
       any("最近动态：创建了文件 /tmp/x/report.txt" in b for b in bodies))
 saved_turn = nb.load_state()["channels"]["weixin"]["turns"][0]
@@ -479,7 +479,7 @@ set_state("weixin", turns=[turn], last_boundary_ts=0, session_id="sid1")
 w.step(str(spool), None)
 rows = [r for r in read_jsonl(WX / "outbox.jsonl") if r.get("mode") == "send"]
 check("G history delta fires a progress notice before 120s",
-      any("还在处理中" in (r.get("content") or "") for r in rows))
+      any("处理中" in (r.get("content") or "") for r in rows))
 
 (WX / "outbox.jsonl").unlink(missing_ok=True)
 stub.history.append({"event_name": "tool.invoke", "seq": 12,
@@ -498,7 +498,7 @@ nb.save_state(st)
 w.step(str(spool), None)
 rows = [r for r in read_jsonl(WX / "outbox.jsonl") if r.get("mode") == "send"]
 check("G pending history delta fires once the throttle elapses",
-      any("还在处理中" in (r.get("content") or "") for r in rows))
+      any("处理中" in (r.get("content") or "") for r in rows))
 
 (WX / "outbox.jsonl").unlink(missing_ok=True)
 stub = StubGW()
@@ -534,7 +534,7 @@ sup_sends = [r for r in read_jsonl(WX / "outbox.jsonl")
              if r.get("mode") == "send"]
 check("G reply supersedes same-batch tool progress",
       [r["content"] for r in replies_for("m-sup")] == ["最终答案"]
-      and not any("还在处理中" in (r.get("content") or "")
+      and not any("处理中" in (r.get("content") or "")
                   for r in sup_sends))
 check("G superseded history_dirty is cleared",
       nb.load_state()["channels"]["weixin"]["turns"][0].get(
@@ -556,7 +556,7 @@ sup_sends = [r for r in read_jsonl(WX / "outbox.jsonl")
              if r.get("mode") == "send"]
 check("G a pending dirty flag does not outlive the reply",
       [r["content"] for r in replies_for("m-sup2")] == ["后到的答案"]
-      and not any("还在处理中" in (r.get("content") or "")
+      and not any("处理中" in (r.get("content") or "")
                   for r in sup_sends))
 
 (WX / "outbox.jsonl").unlink(missing_ok=True)
@@ -573,7 +573,7 @@ sup_sends = [r for r in read_jsonl(WX / "outbox.jsonl")
              if r.get("mode") == "send"]
 check("G a tool row newer than the reply does not notify",
       [r["content"] for r in replies_for("m-sup3")] == ["先回一段"]
-      and not any("还在处理中" in (r.get("content") or "")
+      and not any("处理中" in (r.get("content") or "")
                   for r in sup_sends))
 check("G post-reply history_dirty is cleared",
       nb.load_state()["channels"]["weixin"]["turns"][0].get(
@@ -603,7 +603,7 @@ act_sends = [r for r in read_jsonl(WX / "outbox.jsonl")
              if r.get("mode") == "send"]
 check("G pending activity_dirty does not outlive the reply",
       [r["content"] for r in replies_for("m-actsup")] == ["正式回复"]
-      and not any("还在处理中" in (r.get("content") or "")
+      and not any("处理中" in (r.get("content") or "")
                   for r in act_sends))
 check("G superseded activity_dirty is cleared",
       nb.load_state()["channels"]["weixin"]["turns"][0].get(
@@ -627,7 +627,7 @@ act_sends = [r for r in read_jsonl(WX / "outbox.jsonl")
              if r.get("mode") == "send"]
 check("G same-step activity older than the reply does not notify",
       [r["content"] for r in replies_for("m-actsup2")] == ["带着旧动态的回复"]
-      and not any("还在处理中" in (r.get("content") or "")
+      and not any("处理中" in (r.get("content") or "")
                   for r in act_sends))
 check("G same-step superseded activity_dirty is cleared",
       nb.load_state()["channels"]["weixin"]["turns"][0].get(
@@ -646,7 +646,7 @@ set_state("weixin", turns=[turn], last_boundary_ts=0, session_id="sid1")
 w.step(str(spool), None)
 check("G reply alone sends no activity notice",
       [r["content"] for r in replies_for("m-actnew")] == ["先到的回复"]
-      and not any("还在处理中" in (r.get("content") or "")
+      and not any("处理中" in (r.get("content") or "")
                   for r in read_jsonl(WX / "outbox.jsonl")
                   if r.get("mode") == "send"))
 saved = nb.load_state()["channels"]["weixin"]["turns"][0]
@@ -664,7 +664,7 @@ w.step(str(spool), None)
 act_sends = [r for r in read_jsonl(WX / "outbox.jsonl")
              if r.get("mode") == "send"]
 check("G activity newer than the reply does not notify",
-      not any("还在处理中" in (r.get("content") or "") for r in act_sends))
+      not any("处理中" in (r.get("content") or "") for r in act_sends))
 check("G post-reply activity_dirty is cleared",
       nb.load_state()["channels"]["weixin"]["turns"][0].get(
           "activity_dirty") is False)
@@ -752,9 +752,9 @@ try:
     check("H still-running turn still gets the 12-minute notice",
           len(run_sends) == 1
           and run_sends[0].get("msgid") == "6f3fcd57-run"
-          and "还在处理中" in (run_sends[0].get("content") or "")
+          and "处理中" in (run_sends[0].get("content") or "")
           and "12 分钟" in (run_sends[0].get("content") or "")
-          and "6f3fcd57" in (run_sends[0].get("content") or "")
+          and (run_sends[0].get("content") or "") == "⏳ 处理中（约 12 分钟）：「生成一段视频」"
           and not any(r.get("mode") == "send" for r in read_jsonl(wc_out)))
 
     wc_out.unlink(missing_ok=True)
@@ -781,7 +781,7 @@ try:
     same_files = [r for r in same_rows if r.get("mode") == "reply_file"
                   and r.get("msgid") == "6f3fcd57-same"]
     same_prog = [r for r in same_rows if r.get("mode") == "reply_notice"
-                 and "还在处理中" in (r.get("content") or "")]
+                 and "处理中" in (r.get("content") or "")]
     check("H same step delivers the formal text",
           [r.get("content") for r in same_replies] == ["视频已生成"])
     check("H same step still delivers reply_file after that text",
@@ -814,7 +814,7 @@ try:
     w.step(str(wc_spool), None)
     later_rows = read_jsonl(wc_out)
     later_prog = [r for r in later_rows if r.get("mode") == "reply_notice"
-                  and "还在处理中" in (r.get("content") or "")]
+                  and "处理中" in (r.get("content") or "")]
     later_tail = [r for r in later_rows if r.get("mode") == "send"
                   and r.get("content") == "补充说明"]
     check("H later timer and newer activity send no progress",

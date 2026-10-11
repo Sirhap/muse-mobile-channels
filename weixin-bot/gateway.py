@@ -58,6 +58,21 @@ from channel_common import (  # noqa: E402
 BASE = Path(__file__).resolve().parent
 STATE = BASE / "state"
 INBOX = STATE / "inbox.jsonl"
+# Raw retention for bridge-diverted messages (2026-10-11): diverted
+# messages skip INBOX, so without this their original payload —
+# including the ref_msg structure needed to debug quote parsing —
+# was lost. Same entry shape as INBOX; NOT consumed by the cold
+# lane, so no double processing.
+DIVERTED_RAW = STATE / "diverted_raw.jsonl"
+# Sent-bubble index (2026-10-11): platform ids of this bot's own
+# successfully sent messages, so a user quote of a bot bubble can be
+# resolved by id (see _resolve_quote). Written by _index_sent only
+# when the send response actually carries an id.
+SENT_INDEX = STATE / "sent_index.jsonl"
+# Bridge spool for this channel — the same file handle_inbound
+# diverts to (assembled from parts; tests rebind this constant).
+QUOTE_SPOOL = (Path("/home/hatch/workspace/native-bridge")
+               / "spool" / "weixin.jsonl")
 OUTBOX = STATE / "outbox.jsonl"
 OUTBOX_RESULTS = STATE / "outbox_results.jsonl"
 OUTBOX_OFFSET = STATE / "outbox.offset"
@@ -542,7 +557,7 @@ def is_stop_request(text):
     return False
 
 
-SOFT_ACK_TEMPLATE = "已收到，排队第 {n} 位，当前任务进行中；/stop 取消"
+SOFT_ACK_TEMPLATE = "收到，排队第 {n} 位"
 
 # Thinking notice (user request, 2026-10-04): WeCom shows a native
 # thinking placeholder via its stream <think></think> first frame;
@@ -554,7 +569,7 @@ SOFT_ACK_TEMPLATE = "已收到，排队第 {n} 位，当前任务进行中；/st
 # the soft ack. It carries no msgid, so it never counts as batch
 # activity/completion, and the late-suppression gate (which only
 # applies to update) never touches it.
-THINKING_NOTICE_TEXT = "🤔 正在思考中，请稍等…"
+THINKING_NOTICE_TEXT = "🤔 思考中…"
 # Burst guard: a quick follow-up within the cooldown reuses the
 # notice already on screen instead of stacking another one per
 # message. Replies normally take longer than this window, so a
@@ -588,13 +603,13 @@ THINKING_NOTICE_COOLDOWN_SECS = 20
 # clears that message's record (see _feedback_on_reply), so the idle
 # path needs no time cooldown at all; burst control lives in the
 # merged branch, which only fires while a message is unanswered.
-STOP_ACK_TEXT = "🛑 收到停止请求，正在优先处理。"
-MERGED_ACK_TEXT = "📩 已收到补充，会和前面一条一起处理。"
+STOP_ACK_TEXT = "🛑 正在停止"
+MERGED_ACK_TEXT = "📩 已并入上一条"
 
-BRIDGE_WAIT_TEMPLATE = "⏳ 还在排队（原生通道第 {n} 位）：前面任务还没结束，已等{dur}〔#{code}〕；/stop 取消"
-MEDIA_ACK_TEMPLATE = "📎 已收到{what}，正在处理…"
-STARTED_NOTICE_TEMPLATE = "▶️ 排到你了，开始处理：「{excerpt}」〔#{code}〕"
-WAIT_REMIND_TEMPLATE = "⏳ 还在排队（第 {n} 位）：前面任务还没结束，已等{dur}〔#{code}〕；/stop 取消"
+BRIDGE_WAIT_TEMPLATE = "⏳ 排队中（第 {n} 位，已等{dur}）"
+MEDIA_ACK_TEMPLATE = "📎 已收到{what}，处理中"
+STARTED_NOTICE_TEMPLATE = "▶️ 开始处理：「{excerpt}」"
+WAIT_REMIND_TEMPLATE = "⏳ 排队中（第 {n} 位，已等{dur}）"
 BURST_MERGE_WINDOW_SECS = 8
 WAIT_REMIND_SECS = 180
 
@@ -1543,10 +1558,186 @@ class Gateway:
 
     # ---------- inbound ----------
 
+    # Quoted-item type spellings seen across iLink payload shapes:
+    # numeric codes (as in item_list) or plain names, int or str.
+    _REF_TYPE_NAMES = {
+        1: "text", 2: "image", 3: "voice", 4: "file", 5: "video",
+        "1": "text", "2": "image", "3": "voice", "4": "file",
+        "5": "video", "text": "text", "image": "image",
+        "voice": "voice", "file": "file", "video": "video",
+    }
+
+    @staticmethod
+    def _ref_annotation(ref: dict) -> str | None:
+        """Short suffix naming the quoted (referenced) message.
+
+        Text/title quotes keep their historical rendering (text now
+        truncated at 200 chars so a quoted wall of text cannot swamp
+        the inbound line); every other quote shape degrades to a
+        typed marker instead of being dropped silently — on
+        2026-10-10 a quoted non-text message reached the agent as a
+        bare word with no hint anything was quoted. A live quote on
+        2026-10-11 still landed on the generic marker, so the parser
+        now tolerates the iLink shape variants (item under
+        message_item / item / item_list[0] / ref itself, type as int,
+        numeric string or name, text under several keys) while a
+        real captured payload is collected via diverted_raw.jsonl
+        to pin the exact shape. Fail-silent: any structural surprise
+        yields the generic marker, never a raise.
+        """
+        try:
+            if not isinstance(ref, dict) or not ref:
+                return None
+
+            def _trunc(s: str) -> str:
+                return s[:200] + "…" if len(s) > 200 else s
+
+            def _str(v) -> str:
+                return v if isinstance(v, str) else ""
+
+            # Locate the quoted item across container variants.
+            item = None
+            for cand in (ref.get("message_item"), ref.get("item")):
+                if isinstance(cand, dict) and cand:
+                    item = cand
+                    break
+            if item is None:
+                il = ref.get("item_list")
+                if (isinstance(il, list) and il
+                        and isinstance(il[0], dict) and il[0]):
+                    item = il[0]
+            if item is None and ("type" in ref or "item_type" in ref
+                                 or "text_item" in ref):
+                item = ref
+            item = item or {}
+
+            raw_type = item.get("type", item.get("item_type"))
+            rtype = Gateway._REF_TYPE_NAMES.get(raw_type)
+
+            def _node_text(node: str) -> str:
+                n = item.get(node) or {}
+                if isinstance(n, dict):
+                    return _str(n.get("text", ""))
+                return ""
+
+            def _item_text() -> str:
+                v = item.get("text")
+                if isinstance(v, str):
+                    return v
+                if isinstance(v, dict):
+                    return _str(v.get("content", ""))
+                return ""
+
+            def _quoted_text() -> str:
+                # Candidate order: structured node, flat item text,
+                # then the ref-level spellings (title/text/content).
+                for v in (_node_text("text_item"), _item_text(),
+                          _str(ref.get("title")), _str(ref.get("text")),
+                          _str(ref.get("content"))):
+                    if v:
+                        return v
+                return ""
+
+            if rtype == "text":
+                rt = _quoted_text()
+                if rt:
+                    return f"（引用：{_trunc(rt)}）"
+            elif rtype == "image":
+                return "（引用：[图片]）"
+            elif rtype == "video":
+                return "（引用：[视频]）"
+            elif rtype == "file":
+                fnode = item.get("file_item") or {}
+                fname = (_str(fnode.get("file_name", ""))
+                         if isinstance(fnode, dict) else "")
+                fname = (fname or _str(item.get("file_name"))
+                         or _str(ref.get("file_name")))
+                if fname:
+                    return f"（引用：[文件 {fname}]）"
+                return "（引用：[文件]）"
+            elif rtype == "voice":
+                vt = _node_text("voice_item") or _item_text()
+                if vt:
+                    return f"（引用：{_trunc(vt)}）"
+                return "（引用：[语音]）"
+            if rtype is None:
+                # Untyped ref: a ref-level text spelling (or the
+                # historical title) still names the quoted content.
+                rt = _quoted_text()
+                if rt:
+                    return f"（引用：{_trunc(rt)}）"
+            has_trace = bool(
+                item or ref.get("message_item") or ref.get("item")
+                or ref.get("item_list") or ref.get("msgid")
+                or ref.get("message_id") or ref.get("id"))
+            if has_trace:
+                return "（引用：[消息]）"
+        except Exception:
+            return "（引用：[消息]）"
+        return None
+
+    @staticmethod
+    def _ref_qid_from(ref: dict) -> str:
+        """Quoted message's platform id inside one ref dict, or "".
+
+        Container order mirrors _ref_annotation (message_item /
+        item / item_list[0] / the ref itself); the id key is
+        msg_id / message_id / id, whichever a shape carries.
+        """
+        cands = []
+        for cand in (ref.get("message_item"), ref.get("item")):
+            if isinstance(cand, dict) and cand:
+                cands.append(cand)
+        il = ref.get("item_list")
+        if (isinstance(il, list) and il
+                and isinstance(il[0], dict) and il[0]):
+            cands.append(il[0])
+        cands.append(ref)
+        for c in cands:
+            for key in ("msg_id", "message_id", "id"):
+                v = c.get(key)
+                if v:
+                    return str(v)
+        return ""
+
+    @staticmethod
+    def _find_ref_qid(msg: dict) -> str:
+        """Platform id of the message this one quotes, or "".
+
+        Live-captured iLink shape (2026-10-11, diverted_raw.jsonl):
+        ref_msg = {"message_item": {"type": 0, "msg_id": "<id>",
+        ...}} — the ref carries ONLY the quoted message's id, never
+        its content, so _ref_annotation can only emit the generic
+        marker and the content has to be recovered by id (see
+        _resolve_quote). Lookup order mirrors _extract_text:
+        item-level refs first, then the message-level ref.
+        Fail-silent.
+        """
+        try:
+            if not isinstance(msg, dict):
+                return ""
+            refs = []
+            for item in msg.get("item_list") or []:
+                if isinstance(item, dict):
+                    r = item.get("ref_msg")
+                    if isinstance(r, dict) and r:
+                        refs.append(r)
+            r = msg.get("ref_msg")
+            if isinstance(r, dict) and r:
+                refs.append(r)
+            for ref in refs:
+                qid = Gateway._ref_qid_from(ref)
+                if qid:
+                    return qid
+        except Exception:
+            return ""
+        return ""
+
     @staticmethod
     def _extract_text(msg: dict) -> tuple[str, list[dict]]:
         parts: list[str] = []
         media: list[dict] = []
+        quoted = False
         for item in msg.get("item_list") or []:
             itype = item.get("type")
             if itype == 1:
@@ -1576,15 +1767,119 @@ class Gateway:
             elif itype == 5:
                 media.append({"kind": "video", "item": item.get("video_item") or {}})
                 parts.append("[视频]")
-            ref = item.get("ref_msg") or {}
-            ref_item = ref.get("message_item") or {}
-            if ref_item.get("type") == 1:
-                rt = (ref_item.get("text_item") or {}).get("text", "")
-                if rt:
-                    parts.append(f"（引用：{rt}）")
-            elif ref.get("title"):
-                parts.append(f"（引用：{ref['title']}）")
+            ann = Gateway._ref_annotation(item.get("ref_msg") or {})
+            if ann:
+                parts.append(ann)
+                quoted = True
+        if not quoted:
+            # iLink shape variant: the reference hangs off the
+            # message itself rather than an item.
+            ann = Gateway._ref_annotation(msg.get("ref_msg") or {})
+            if ann:
+                parts.append(ann)
         return "\n".join(parts), media
+
+    @staticmethod
+    def _tail_jsonl_rows(path: Path, max_rows: int = 400) -> list[dict]:
+        """Last max_rows parsed rows of a jsonl file, newest first.
+
+        Only a bounded tail window is read, so long append-only
+        logs stay cheap. Fail-silent: any error yields [].
+        """
+        try:
+            if not path.exists():
+                return []
+            size = path.stat().st_size
+            window = 2_000_000
+            with path.open("rb") as f:
+                if size > window:
+                    f.seek(size - window)
+                data = f.read()
+            lines = data.decode("utf-8", errors="replace").splitlines()
+            if size > window and lines:
+                lines = lines[1:]  # first line may be cut mid-row
+            rows = []
+            for line in reversed(lines[-max_rows:]):
+                try:
+                    r = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(r, dict):
+                    rows.append(r)
+            return rows
+        except Exception:
+            return []
+
+    def _resolve_quote(self, qid: str) -> str | None:
+        """Recover a quoted message's content by platform id.
+
+        iLink refs carry only the quoted id (see _find_ref_qid), so
+        the content is looked up in records this machine already
+        keeps, newest first: the bridge spool and this gateway's
+        INBOX (the user's own messages), then the sent index (this
+        bot's own bubbles, see _index_sent). Returns the rendered
+        「（引用：…）」suffix, or None when the id is unknown
+        locally. Fail-silent.
+        """
+        try:
+            if not qid:
+                return None
+
+            def _trunc(s: str) -> str:
+                return s[:200] + "…" if len(s) > 200 else s
+
+            for path in (QUOTE_SPOOL, INBOX):
+                for row in Gateway._tail_jsonl_rows(path, 400):
+                    if str(row.get("msgid", "")) == qid:
+                        t = row.get("text")
+                        if isinstance(t, str) and t:
+                            return f"（引用：{_trunc(t)}）"
+            for row in Gateway._tail_jsonl_rows(SENT_INDEX, 400):
+                if str(row.get("mid", "")) == qid:
+                    c = row.get("content")
+                    c = c if isinstance(c, str) else ""
+                    if row.get("kind") == "file":
+                        if c:
+                            return f"（引用：[文件 {c}]）"
+                        return "（引用：[文件]）"
+                    if c:
+                        return f"（引用：{_trunc(c)}）"
+        except Exception:
+            return None
+        return None
+
+    def _index_sent(self, resp, kind: str, content: str) -> None:
+        """Record a successfully sent bubble in SENT_INDEX so a
+        later quote of it can be resolved by platform id (see
+        _resolve_quote). The sendmessage response is probed for
+        the new message id under message_id / msg_id, top level
+        first, then under data; when the response carries no id
+        nothing is written and quotes of that bubble keep the
+        generic marker. Fail-silent. Note: send_text returns only
+        the last chunk's response, so a chunked reply indexes its
+        final chunk only.
+        """
+        try:
+            if not isinstance(resp, dict):
+                return
+            mid = ""
+            for node in (resp, resp.get("data")):
+                if isinstance(node, dict):
+                    for key in ("message_id", "msg_id"):
+                        v = node.get(key)
+                        if v:
+                            mid = str(v)
+                            break
+                if mid:
+                    break
+            if not mid:
+                return
+            self.append_jsonl(SENT_INDEX, {
+                "mid": mid, "kind": kind,
+                "content": content or "", "ts": int(time.time()),
+            })
+        except Exception:
+            pass
 
     @staticmethod
     def _sanitize_raw(msg: dict) -> dict:
@@ -2108,8 +2403,7 @@ class Gateway:
                         if self._queue_notice(
                                 user,
                                 STARTED_NOTICE_TEMPLATE.format(
-                                    excerpt=rec.get("excerpt", ""),
-                                    code=str(mid)[:8]),
+                                    excerpt=rec.get("excerpt", "")),
                                 "started"):
                             sent += 1
                     elif mid in b_pos and not rec.get("wait_reminded"):
@@ -2120,8 +2414,7 @@ class Gateway:
                                     user,
                                     BRIDGE_WAIT_TEMPLATE.format(
                                         n=b_pos[mid],
-                                        dur=_dur_str(waited),
-                                        code=str(mid)[:8]),
+                                        dur=_dur_str(waited)),
                                     "waitremind"):
                                 sent += 1
                     continue
@@ -2130,8 +2423,7 @@ class Gateway:
                     if self._queue_notice(
                             user,
                             STARTED_NOTICE_TEMPLATE.format(
-                                excerpt=rec.get("excerpt", ""),
-                                code=str(mid)[:8]),
+                                excerpt=rec.get("excerpt", "")),
                             "started"):
                         sent += 1
                 elif mid in pos_map and not rec.get("wait_reminded"):
@@ -2141,8 +2433,7 @@ class Gateway:
                         if self._queue_notice(
                                 user,
                                 WAIT_REMIND_TEMPLATE.format(
-                                    n=pos_map[mid], dur=_dur_str(waited),
-                                    code=str(mid)[:8]),
+                                    n=pos_map[mid], dur=_dur_str(waited)),
                                 "waitremind"):
                             sent += 1
             return sent
@@ -2177,6 +2468,15 @@ class Gateway:
             self._mark_seen(msgid)
             return
         text, media = self._extract_text(msg)
+        if "（引用：[消息]）" in text:
+            # iLink refs carry only the quoted id; when the
+            # extractor could not name the quote, recover its
+            # content from local records by id. A quote the
+            # extractor already named is never overwritten, and
+            # an unresolvable id keeps the generic marker.
+            resolved = self._resolve_quote(self._find_ref_qid(msg))
+            if resolved:
+                text = text.replace("（引用：[消息]）", resolved)
         if not media:
             # Slash commands: intercepted after allowlist + dedupe,
             # before the inbox write — they never wake a worker.
@@ -2225,6 +2525,15 @@ class Gateway:
                      "ts": int(time.time())})
                 diverted = True
                 log(f"msg {msgid} diverted to native bridge")
+                # Keep the original payload for diverted messages
+                # (quote-structure debugging, 2026-10-11). Fail-
+                # silent: a retention failure must not break the
+                # divert that just succeeded.
+                try:
+                    self.append_jsonl(DIVERTED_RAW, entry)
+                except Exception as e:
+                    log(f"diverted raw retention failed for "
+                        f"{msgid}: {e}")
             except Exception as e:
                 log(f"native divert failed, using inbox: {e}")
         if not diverted:
@@ -2584,6 +2893,48 @@ class Gateway:
                 if o.get("id") == item_id:
                     break
                 if o.get("mode") not in ("reply", "reply_file") or str(o.get("msgid")) != str(item.get("msgid")):
+                    continue
+                res = results.get(o.get("id"))
+                if res is not None and res.get("ok") is True:
+                    return True
+            return False
+        except Exception:
+            return False
+
+    @staticmethod
+    def _same_reply_text_delivered(item: dict, content: str) -> bool:
+        """True when this reply_file's text is already the delivered
+        formal reply for the same msgid. The queue row supplies the
+        text to compare (including the subagent-label normalization
+        applied to a reply at dispatch), and OUTBOX_RESULTS must say
+        that row landed ok; a merely queued or failed reply does not
+        suppress the file caption. Fail-open, like
+        _delivered_reply_before."""
+        try:
+            if not content or not OUTBOX.exists():
+                return False
+            results: dict[str, dict] = {}
+            if OUTBOX_RESULTS.exists():
+                for line in OUTBOX_RESULTS.read_text(encoding="utf-8").splitlines():
+                    try:
+                        r = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if r.get("id"):
+                        results[r["id"]] = r
+            msgid = str(item.get("msgid", "") or "")
+            for line in OUTBOX.read_text(encoding="utf-8").splitlines():
+                try:
+                    o = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if o.get("id") == item.get("id"):
+                    continue
+                if o.get("mode") != "reply" or str(o.get("msgid", "")) != msgid:
+                    continue
+                queued = str(o.get("content", "") or "")
+                if content not in (queued,
+                                   normalize_subagent_content(msgid, queued)):
                     continue
                 res = results.get(o.get("id"))
                 if res is not None and res.get("ok") is True:
@@ -2954,8 +3305,7 @@ class Gateway:
             self._save_parked(parked)
             await self.send_text(
                 client, creds, to,
-                f"（这个文件已多次发送失败，这次降到 L{level} 档压缩"
-                "发送；原文件没动，在 VM 上可取）",
+                "⚠️ 文件发送失败，已压缩重试（原文件未动）",
                 "", "", 2, f"{item_id}:levelup")
         except Exception as e:
             log(f"level-up notice failed for {item_id}: {e}")
@@ -3005,6 +3355,7 @@ class Gateway:
                     info.get("client_id", ""), 2, item_id,
                 )
                 if resp.get("ret") in (None, 0):
+                    self._index_sent(resp, "text", content)
                     typing_after = (to, token_ctx, 2)
             elif mode == "update":
                 info = self._route_for(str(item.get("msgid", "")))
@@ -3043,9 +3394,12 @@ class Gateway:
                 if was_compressed and lvl > 0:
                     await self._maybe_notify_level_up(
                         client, creds, item_id, to, lvl)
-                caption = content or f"📎 {orig_name}"
+                if not content or self._same_reply_text_delivered(item, content):
+                    caption = f"📎 {orig_name}"
+                else:
+                    caption = content
                 if was_compressed:
-                    caption += "\n（文件较大，已自动压缩发送）"
+                    caption += "（已压缩）"
                 # The caption is a separate text message sent BEFORE
                 # the file. If the file step then fails transiently,
                 # a naive retry re-sends the caption every attempt —
@@ -3064,14 +3418,18 @@ class Gateway:
                         log(f"outbox {mode} {item_id}: ok=False err={result.get('errmsg', '')}")
                         return False
                     self._mark_caption_sent(item_id)
+                    self._index_sent(cap_resp, "text", caption)
                 resp = await self._deliver_file(client, creds, to, fpath, token_ctx)
                 if resp.get("ret") in (None, 0):
+                    self._index_sent(resp, "file", Path(fpath).name)
                     typing_after = (to, token_ctx, 2)
             elif mode == "send":
                 resp = await self.send_text(
                     client, creds, item.get("to_user_id", ""), content,
                     "", "", 2, item_id,
                 )
+                if isinstance(resp, dict) and resp.get("ret") in (None, 0):
+                    self._index_sent(resp, "text", content)
             elif mode == "send_file":
                 to = item.get("to_user_id", "")
                 fpath = item.get("file_path", "")
@@ -3091,7 +3449,7 @@ class Gateway:
                             await self._maybe_notify_level_up(
                                 client, creds, item_id, to, lvl)
                         content = (content + "\n" if content else "") \
-                            + "（文件较大，已自动压缩发送）"
+                            + "（已压缩）"
                 if content and not self._caption_already_sent(item_id):
                     cap_resp = await self.send_text(
                         client, creds, to, content, "", "", 2, f"{item_id}:caption",
@@ -3102,9 +3460,12 @@ class Gateway:
                         self.append_jsonl(OUTBOX_RESULTS, result)
                         return False
                     self._mark_caption_sent(item_id)
+                    self._index_sent(cap_resp, "text", content)
                 resp = await self._deliver_file(
                     client, creds, to, fpath
                 )
+                if isinstance(resp, dict) and resp.get("ret") in (None, 0):
+                    self._index_sent(resp, "file", Path(fpath).name)
             else:
                 result["errmsg"] = f"unknown mode {mode}"
                 self.append_jsonl(OUTBOX_RESULTS, result)

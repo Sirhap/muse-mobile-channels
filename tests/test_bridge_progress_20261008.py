@@ -278,8 +278,8 @@ w.progress_notice(turn, 180)
 rows = sends()
 check("2 notice sent", len(rows) == 1)
 body = rows[-1]["content"] if rows else ""
-check("2 notice: thinking phase word", "思考中" in body)
-check("2 notice: queued-behind count", "后面还排着 2 条" in body)
+check("2 notice: thinking phase word", "⏳ 处理中（约 3 分钟）" in body)
+check("2 notice: queued-behind count", "后面还排着" not in body)
 check("3 notice: activity folded in as 最近动态",
       "最近动态：创建了文件 /tmp/x/report.txt" in body)
 
@@ -287,13 +287,13 @@ w.queue = []
 turn["reply_started"] = True
 w.progress_notice(turn, 240)
 body = sends()[-1]["content"]
-check("2 notice: generating phase word", "已开始生成" in body)
+check("2 notice: generating phase word", "⏳ 处理中（约 4 分钟）" in body)
 check("2 notice: no queue suffix when queue empty", "排着" not in body)
 
 w.progress_notice(turn, 1500)
 body = sends()[-1]["content"]
 check("2 escalation: keeps /stop hint", "/stop" in body)
-check("2 escalation: carries phase word", "已开始生成" in body)
+check("2 escalation: carries phase word", "可能卡住" in body)
 
 # ---------------------------------------------------------------- 5
 CARD_LINE = "渠道内不要使用卡片/选项控件提问；需要用户选择时用纯文本编号列出选项。"
