@@ -575,7 +575,7 @@ def _task_overview_text(channel, state_dir, hook_state_dir):
             txt = texts.get(mid) or inbox_texts.get(mid, "")
             lines.append(f"▶ 桥 {_fmt_dur(a.get('secs', 0))} "
                          f"「{_excerpt(txt)}」")
-        batch, _ids, pcount, dcount = _queue_summary(hook_state_dir)
+        batch, _ids, pcount, _dcount = _queue_summary(hook_state_dir)
         mids = batch.get("msgids") or []
         if mids:
             since = batch.get("since")
@@ -584,14 +584,28 @@ def _task_overview_text(channel, state_dir, hook_state_dir):
             lines.append(f"▶ 冷通道 {_fmt_dur(age)} "
                          f"「{_excerpt(inbox_texts.get(mids[0], ''))}」"
                          f"（本批 {len(mids)} 条）")
+        # Detached batches are still RUNNING (background resume), not
+        # queued: list them as running rows like /queue does, instead
+        # of only folding them into a queue count (2026-10-13 fix:
+        # /status claimed "no task running" for detached long tasks).
+        for d in (batch.get("detached") or []):
+            if not isinstance(d, dict):
+                continue
+            dmids = [str(m) for m in (d.get("msgids") or [])]
+            if not dmids:
+                continue
+            dsince = d.get("since")
+            dage = (time.time() - float(dsince)) \
+                if isinstance(dsince, (int, float)) else 0
+            lines.append(f"▶ 冷通道·后台续跑 {_fmt_dur(dage)} "
+                         f"「{_excerpt(inbox_texts.get(dmids[0], ''))}」"
+                         f"（本批 {len(dmids)} 条）")
         qparts = []
         bq = snap.get("queued", [])
         if bq:
             qparts.append(f"桥 {len(bq)} 条")
         if pcount:
             qparts.append(f"冷通道 {pcount} 条")
-        if dcount:
-            qparts.append(f"冷通道并行 {dcount} 条")
         if qparts:
             lines.append("⏳ 排队：" + "、".join(qparts))
         jobs = _read_json_file(hook_state_dir / "subagent_jobs.json", {}) or {}
@@ -828,10 +842,31 @@ def slash_status_text(chan_label, state_dir, hook_state_dir):
     last_out = _last_jsonl_row(state_dir / "outbox_results.jsonl")
     batch, _ids, pcount, dcount = _queue_summary(hook_state_dir)
     mids = batch.get("msgids") or []
-    if mids:
-        since = batch.get("since")
-        mins = max(0, round((time.time() - float(since)) / 60)) if isinstance(since, (int, float)) else "?"
-        run_part = f"正在处理 {len(mids)} 条（已跑约 {mins} 分钟）"
+    # Full running count (2026-10-13 fix, aligned with /queue): cold
+    # active + cold detached (background-resumed long tasks are still
+    # running) + native-bridge active. The old first line counted only
+    # cold active, so /status claimed "no task running" while a
+    # detached or bridge task was in flight.
+    detached = [d for d in (batch.get("detached") or [])
+                if isinstance(d, dict)]
+    detached_mids = [str(m) for d in detached
+                     for m in (d.get("msgids") or [])]
+    channel = "weixin" if "weixin" in str(hook_state_dir) else "wecom"
+    bridge_active, _bq = _bridge_snapshot(channel)
+    running = len(mids) + len(detached_mids) + len(bridge_active)
+    if running:
+        elapsed = []
+        if mids and isinstance(batch.get("since"), (int, float)):
+            elapsed.append(time.time() - float(batch["since"]))
+        for d in detached:
+            if isinstance(d.get("since"), (int, float)):
+                elapsed.append(time.time() - float(d["since"]))
+        for a in bridge_active:
+            if isinstance(a, dict) \
+                    and isinstance(a.get("secs"), (int, float)):
+                elapsed.append(float(a["secs"]))
+        mins = max(0, round(max(elapsed) / 60)) if elapsed else "?"
+        run_part = f"正在处理 {running} 条（已跑约 {mins} 分钟）"
     else:
         run_part = "当前无任务在跑"
     chk = _read_json_file(hook_state_dir / "last_check.json")
