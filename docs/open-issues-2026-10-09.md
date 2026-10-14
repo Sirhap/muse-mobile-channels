@@ -10,6 +10,8 @@
 - 影响：微信桥 LT2 生产实测做不了；若不是用户没发，则 iLink 入站可能在 connected 假象下静默失效，所有微信入站都受影响。
 - 下一步：用户发一条对照微信消息并同时盯网关入站日志；仍为 0 则查 iLink 订阅/重连，必要时重启网关或重新配对验证。
 - 2026-10-09 代码复查：本仓库没有可对照的 iLink 入站失败日志，不能靠改重连代码修。这不是一行补丁。先有「用户确实发出、网关日志仍为 0」的对照，再决定重启、重新配对，或带着那次日志查订阅。
+- 2026-10-09 晚已结案部分：用户真发对照消息后 msgs_received 由 0 变 1、2，入站通道本身没坏（此前为 0 是没人发），桥 LT2 live 亦跑通（见第 3 项）。
+- 2026-10-14 复查更正（只读诊断）：`msgs_received` 是进程内存计数、重启即归零，历史「恒 0」读数多采于刚重启会话，可信度低；state 文件证明入站实际工作到 2026-10-13 16:24:10 UTC，此后静默约 19 小时但无「用户确实发出而未达」的样本，当前长轮询健康（服务端持续空应答、游标刷新、零报错），入站是否故障**未证**，仍需一条用户对照微信消息判定。新发实锤故障是**出站**：主动发送（mode=send 无 context）最后成功 2026-10-13 22:59:51 UTC、首次失败 23:59:51 UTC，iLink 服务端回 `ret=-2 prepare failed`，跨重启不自愈，同期代码未动、同一 token 的 getupdates 仍正常，疑服务端发送侧会话失效；与入站静默时间不咬合（入站停后出站还正常 6.5 小时），不判同一根因。下一步：用户发一条微信对照消息（入站判定 + 绑定回复顺带验绑定发送），再决定是否扫码重配对（高风险，可能换 bot_id，不盲做）。
 
 ### 2. 主会话「Delivery not confirmed」（用户报告，根因未定位）
 - 证据：在微信/企微网关 state、hooks state、approval-relay 代码中均未搜到该字样或对应记录，本仓库代码里没有这条状态。
@@ -25,10 +27,13 @@
 - 2026-10-09 代码核对（仍非 live）：多段 trailing 是首条 bound reply、其后 unbound send，关单只看 status=completed 加静默（见第 6、7 项）。关单日志带 `outbox_ok=`，值来自网关 `outbox_results.jsonl` 里该 bound reply 的 `id`；没有结果行就是 `pending`。桥不等这条回执，避免微信发送延迟卡住队列。trailing 段的收件人优先用本回合的 from_user / chatid / chattype（idle 扫描没有回合时仍用 config）。
 - 卡点：依赖第 1 项（入站恢复或确认用户发出消息）。
 - 完成标准：指定实测句完整跑通并逐项对账（进度 1 条、结果 1 条、回执 ok=true、trailing 正常关单）。对账时可以同时看桥日志里的 `outbox_ok=true` 和 `outbox_results.jsonl`。
+- 2026-10-09 21:06–21:12 已跑通（机制通过）：msgid 7514310316847596936，progress 21:08:31 ok=true、reply 21:11:52 ok=true、trailing 21:12:23 关单。本项机制部分关单；同轮发现的 reply_file suppressed 缺口已由 ea26885 修复进 HEAD（沙箱 test_reply_file_after_formal 14/14），其 live 复验与两拍关单 live 复验转总清单（2026-10-13）待办 11/12，与用户下一次微信长任务同轮对账。
 
 ### 4. 企微 started / 久等提醒 live 未验证
 - 现状：企微网关对齐已部署（2026-10-09 01:29），专项 26/26、回归全绿；但 started 只发一次、180 秒久等提醒、回复送达清记录这三点没有真实企微长任务验证过。
 - 完成标准：一条真实企微长任务中三点各留一条送达证据。
+- 2026-10-10 更新：started 已 live 实证（PR#6，msgid 88c3db3e2ad91139f24ccb7a081b99ed，恰 1 条、其余全 ok）；只剩久等提醒转总清单待办 13。
+- 2026-10-14 更新：久等提醒沙箱核验完成（新套件 test_wecom_wait_remind 35/35：未满 180 不发、满时恰 1 条、多等待者、提醒后 started、回复清记录、位次取触发时）；沙箱同时挖出并已修复一个真 bug——双网关 `_feedback_scan_once` 先置 `wait_reminded`/`started_notice` 闩再落行，瞬时 IO 失败即永久丢通知，现改为落行成功后置闩（S8/S9 专钉，回归全绿，已重启双网关部署）。live 实证仍待总清单待办 13 的 B 轮（用户发任务触发）。
 
 ### ~~5. 冷通道判死（DEATH_WATCH_SECS=1800）无生产实证~~ （2026-10-10 验收 wecom4b PASS 关单）
 - 结案：演练 4b / wecom4b 验收 PASS。msgid `drill-deathwatch-1791616087-wecom4b`。停止通知 outbox id `3a6457e42768`，`ok=true`，ts≈`1791616092`。since `1791614187`。快照 `SNAP=/tmp/death-watch-drill-snap4b-20261010070807`（hatch）。hatch base64 解出的正文同时含「任务已停止」和字面 `DRILL` / 「【DRILL 冷判死】」。`cancelled.json` 只多了这一条 msgid。没有误取消。没有「自动续跑一次」。`DEATH_WATCH_SECS` 未改。服务保持活动。演练 A 到演练 4a 仍记 FAIL，不因这一轮改写。
