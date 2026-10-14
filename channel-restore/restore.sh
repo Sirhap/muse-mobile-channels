@@ -205,6 +205,11 @@ main() {
   heal_bridge "$WS" "$HOME_DIR" || FAIL=1
   heal_relay "$WS" "$HOME_DIR" || FAIL=1
 
+  # Outbound delivery probe (2026-10-14): process-alive is not the
+  # same as can-deliver — a channel whose sends keep failing (e.g.
+  # iLink ret=-2) stays green here without it. Advisory only.
+  python3 "$WS/channel-restore/outbound_probe.py" --ws "$WS" || true
+
   if [[ "$FAIL" == "0" ]]; then
     echo "channel-restore: all gateways healthy"
   else
