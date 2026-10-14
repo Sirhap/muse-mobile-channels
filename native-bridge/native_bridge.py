@@ -39,7 +39,10 @@ CONF_DIR = os.path.expanduser("~/.config/native-bridge")
 STATE_F = os.path.join(BASE, "state.json")
 STATUS_F = os.path.join(BASE, "status.json")
 POLL_SECS = 2
-PROG_FIRST_SECS = 120
+PROG_FIRST_SECS = 45         # first progress bubble: earlier than the
+                            # second-step cadence and the 60s activity
+                            # throttle, so a fresh turn shows motion
+                            # quickly (user decision 2026-10-14, was 120)
 PROG_EVERY_SECS = 300
 ESCALATE_SECS = 1200        # turn age where progress notices turn into
                             # an actionable "looks stuck, /stop it" warning
