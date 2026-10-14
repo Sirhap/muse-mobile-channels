@@ -2181,24 +2181,36 @@ class Gateway:
                 if mid in b_merged_ids and not rec.get("started_notice"):
                     rec["started_notice"] = True
                 elif mid in b_active_ids and not rec.get("started_notice"):
-                    rec["started_notice"] = True
-                    if self._queue_notice(
+                    # Latch only AFTER the notice row is queued: setting
+                    # the flag first lost the notice forever when the
+                    # append hit a transient IO error (2026-10-14,
+                    # found by the wait-remind sandbox suite).
+                    try:
+                        queued_ok = self._queue_notice(
                             chatid, rec.get("chattype", ""),
                             STARTED_NOTICE_TEMPLATE.format(
                                 excerpt=rec.get("excerpt", "")),
-                            "started", mid):
+                            "started", mid)
+                    except Exception:
+                        queued_ok = False
+                    if queued_ok:
+                        rec["started_notice"] = True
                         sent += 1
                 elif (rec.get("queued") and mid in b_pos
                       and not rec.get("wait_reminded")):
                     waited = now - float(rec.get("queued_at") or now)
                     if waited >= WAIT_REMIND_SECS:
-                        rec["wait_reminded"] = True
-                        if self._queue_notice(
+                        try:
+                            queued_ok = self._queue_notice(
                                 chatid, rec.get("chattype", ""),
                                 BRIDGE_WAIT_TEMPLATE.format(
                                     n=b_pos[mid],
                                     dur=_dur_str(waited)),
-                                "waitremind", mid):
+                                "waitremind", mid)
+                        except Exception:
+                            queued_ok = False
+                        if queued_ok:
+                            rec["wait_reminded"] = True
                             sent += 1
             return sent
         except Exception as e:

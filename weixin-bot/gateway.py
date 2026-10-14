@@ -2434,42 +2434,62 @@ class Gateway:
                         # good (2026-10-08, user order).
                         rec["started_notice"] = True
                     elif mid in b_active_ids and not rec.get("started_notice"):
-                        rec["started_notice"] = True
-                        if self._queue_notice(
+                        # Latch only AFTER the notice row is queued:
+                        # setting the flag first lost the notice forever
+                        # when the append hit a transient IO error
+                        # (2026-10-14, same bug as the WeCom gateway).
+                        try:
+                            queued_ok = self._queue_notice(
                                 user,
                                 STARTED_NOTICE_TEMPLATE.format(
                                     excerpt=rec.get("excerpt", "")),
-                                "started"):
+                                "started")
+                        except Exception:
+                            queued_ok = False
+                        if queued_ok:
+                            rec["started_notice"] = True
                             sent += 1
                     elif mid in b_pos and not rec.get("wait_reminded"):
                         waited = now - float(rec.get("queued_at") or now)
                         if waited >= WAIT_REMIND_SECS:
-                            rec["wait_reminded"] = True
-                            if self._queue_notice(
+                            try:
+                                queued_ok = self._queue_notice(
                                     user,
                                     BRIDGE_WAIT_TEMPLATE.format(
                                         n=b_pos[mid],
                                         dur=_dur_str(waited)),
-                                    "waitremind"):
+                                    "waitremind")
+                            except Exception:
+                                queued_ok = False
+                            if queued_ok:
+                                rec["wait_reminded"] = True
                                 sent += 1
                     continue
                 if mid in active and not rec.get("started_notice"):
-                    rec["started_notice"] = True
-                    if self._queue_notice(
+                    try:
+                        queued_ok = self._queue_notice(
                             user,
                             STARTED_NOTICE_TEMPLATE.format(
                                 excerpt=rec.get("excerpt", "")),
-                            "started"):
+                            "started")
+                    except Exception:
+                        queued_ok = False
+                    if queued_ok:
+                        rec["started_notice"] = True
                         sent += 1
                 elif mid in pos_map and not rec.get("wait_reminded"):
                     waited = now - float(rec.get("queued_at") or now)
                     if waited >= WAIT_REMIND_SECS:
-                        rec["wait_reminded"] = True
-                        if self._queue_notice(
+                        try:
+                            queued_ok = self._queue_notice(
                                 user,
                                 WAIT_REMIND_TEMPLATE.format(
                                     n=pos_map[mid], dur=_dur_str(waited)),
-                                "waitremind"):
+                                "waitremind")
+                        except Exception:
+                            queued_ok = False
+                        if queued_ok:
+                            rec["wait_reminded"] = True
                             sent += 1
             return sent
         except Exception as e:
