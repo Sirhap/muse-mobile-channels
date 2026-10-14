@@ -404,20 +404,37 @@ def _task_overview_text(channel, state_dir, hook_state_dir):
         snap = ch.get("queue_snapshot", {}) or {}
         texts = _spool_texts(channel)
         inbox_texts = _inbox_texts(state_dir)
-        for a in snap.get("active", []):
-            mid = a.get("msgid", "")
-            txt = texts.get(mid) or inbox_texts.get(mid, "")
-            lines.append(f"▶ 桥 {_fmt_dur(a.get('secs', 0))} "
-                         f"「{_excerpt(txt)}」")
+        # Bridge rows prefer the bridge's own status.json summary
+        # (todo 6: it carries the last-activity age the state.json
+        # snapshot lacks); when it has no usable rows, fall back to
+        # the snapshot rendering exactly as before.
+        status_rows = _bridge_status_active(channel)
+        if status_rows:
+            for r in status_rows:
+                idle = r.get("idle_secs")
+                idle_part = f" · 最后活动 {_fmt_dur(idle)}前" \
+                    if isinstance(idle, (int, float)) else ""
+                lines.append(f"▶ 桥 {_fmt_dur(r.get('run_secs', 0))} "
+                             f"「{_excerpt(r.get('text', ''))}」{idle_part}")
+        else:
+            for a in snap.get("active", []):
+                mid = a.get("msgid", "")
+                txt = texts.get(mid) or inbox_texts.get(mid, "")
+                lines.append(f"▶ 桥 {_fmt_dur(a.get('secs', 0))} "
+                             f"「{_excerpt(txt)}」")
         batch, _ids, pcount, _dcount = _queue_summary(hook_state_dir)
         mids = batch.get("msgids") or []
         if mids:
             since = batch.get("since")
             age = (time.time() - float(since)) \
                 if isinstance(since, (int, float)) else 0
+            last_ts = _last_outbound_ts(state_dir, mids)
+            idle_part = f" · 最后活动 " \
+                        f"{_fmt_dur(time.time() - last_ts)}前" \
+                if last_ts else ""
             lines.append(f"▶ 冷通道 {_fmt_dur(age)} "
                          f"「{_excerpt(inbox_texts.get(mids[0], ''))}」"
-                         f"（本批 {len(mids)} 条）")
+                         f"（本批 {len(mids)} 条）{idle_part}")
         # Detached batches are still RUNNING (background resume), not
         # queued: list them as running rows like /queue does, instead
         # of only folding them into a queue count (2026-10-13 fix:
@@ -431,9 +448,13 @@ def _task_overview_text(channel, state_dir, hook_state_dir):
             dsince = d.get("since")
             dage = (time.time() - float(dsince)) \
                 if isinstance(dsince, (int, float)) else 0
+            dlast_ts = _last_outbound_ts(state_dir, dmids)
+            didle_part = f" · 最后活动 " \
+                         f"{_fmt_dur(time.time() - dlast_ts)}前" \
+                if dlast_ts else ""
             lines.append(f"▶ 冷通道·后台续跑 {_fmt_dur(dage)} "
                          f"「{_excerpt(inbox_texts.get(dmids[0], ''))}」"
-                         f"（本批 {len(dmids)} 条）")
+                         f"（本批 {len(dmids)} 条）{didle_part}")
         qparts = []
         bq = snap.get("queued", [])
         if bq:
@@ -474,6 +495,55 @@ def _bridge_snapshot(channel):
         return snap.get("active", []) or [], snap.get("queued", []) or []
     except Exception:
         return [], []
+
+
+def _bridge_status_active(channel):
+    """Active-turn summary rows from the bridge status.json
+    (todo 6): [{text, run_secs, idle_secs}] the bridge writes about
+    its own running turns — which task, how long running, how long
+    since its last sign of life. Only well-formed rows survive.
+    Fail-silent []."""
+    try:
+        st = _read_json_file(
+            Path("/home/hatch/workspace/native-bridge/status.json"),
+            {}) or {}
+        rows = (st.get("active") or {}).get(channel) or []
+        return [r for r in rows if isinstance(r, dict)
+                and isinstance(r.get("run_secs"), (int, float))]
+    except Exception:
+        return []
+
+
+def _last_outbound_ts(state_dir, msgids):
+    """Newest queued_at/ts among this gateway's outbox rows bound
+    to any of msgids — a cold batch's last push (worker update or
+    reply row), tail-read like _spool_texts. None when the batch
+    has not pushed anything yet. Fail-silent."""
+    try:
+        idset = {str(m) for m in (msgids or [])}
+        if not idset:
+            return None
+        with open(state_dir / "outbox.jsonl", "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 524288))
+            data = f.read().decode("utf-8", "replace")
+        best = None
+        for line in data.splitlines():
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if str(row.get("msgid") or "") not in idset:
+                continue
+            ts = row.get("queued_at")
+            if not isinstance(ts, (int, float)):
+                ts = row.get("ts")
+            if isinstance(ts, (int, float)):
+                best = ts if best is None else max(best, float(ts))
+        return best
+    except Exception:
+        return None
 
 
 def _bridge_queued_rows(channel):
@@ -3110,7 +3180,15 @@ class Gateway:
                 f"{rec['upload_fail']} consecutive upload-stage "
                 f"failures; notifying user + rerouting via WeCom "
                 f"(wedge guard, no longer silent)")
-        elif mode not in FORMAL_MODES and n >= SEND_MAX_ATTEMPTS:
+        elif (mode not in FORMAL_MODES and not item.get("proactive")
+                and n >= SEND_MAX_ATTEMPTS):
+            # Proactive rows (bridge idle results + bridge alerts,
+            # marked proactive=True by the producer) are completion
+            # reports, not ephemeral bubbles: like formal rows they
+            # park and retry until the channel recovers instead of
+            # dead-lettering after ~35 min of outage (2026-10-14,
+            # audit G1 — the bridgealert rows in the 2026-10-13
+            # WeChat outage died exactly this way).
             action = "deadletter"
             self.append_jsonl(OUTBOX_RESULTS, {
                 "id": item_id, "mode": mode, "ts": int(time.time()),
