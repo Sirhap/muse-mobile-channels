@@ -123,6 +123,33 @@ DEATH_WATCH_SECS = 1800
 # "execution failed" verdict). A missing or unreadable probe
 # is not life: the hook then uses the resume/cancel path.
 # See death_watch_activity.py.
+# --- Early signals (PROTOTYPE 2026-10-14, todo tasks 4+5; sandbox
+# only, NOT deployed) ---
+# Task 4: a batch that has NEVER pushed (no bound outbox row from
+# the worker itself since batch start) gets its first stall notice
+# at STALL_FIRST_NOTICE_SECS instead of STALL_NOTICE_SECS. The
+# classifier is "zero pushes so far", an observable fact -- not
+# message length or a guessed task type: a short question can spawn
+# long work and a long message can be trivial, but a worker that
+# has not made its first push in 5 minutes is already ~2.5x past
+# the ~2-minute push cadence workers are told to keep. Batches
+# that HAVE pushed keep the 1200s threshold: a worker already
+# proven alive going quiet is a different risk, and every push
+# restarts its silence clock, so an actively reporting long task
+# never sees either notice.
+STALL_FIRST_NOTICE_SECS = 300
+# Task 5: early resume on positive process-death evidence. For
+# every msgid in the batch: a heartbeat pid file exists, that pid
+# is dead, and the beat file has been stale for
+# EARLY_RESUME_HB_STALE_SECS (3 missed 60s beats) -- while the
+# worker's own outbox silence is already at least
+# EARLY_RESUME_MIN_SILENCE_SECS. This only RE-TIMES the existing
+# death routing (_route_death: covered -> silent drop, probe
+# alive -> hold, first loss -> resume once, second loss ->
+# fail-stop); it adds no new resume/cancel machinery. A missing
+# pid file is unknown, never death; one live pid vetoes the batch.
+EARLY_RESUME_MIN_SILENCE_SECS = 300
+EARLY_RESUME_HB_STALE_SECS = 180
 CLAIM_TTL_SECS = 600
 # Preemption: queued messages must not wait behind a heartbeating long
 # batch forever. If the oldest queued message has waited
@@ -191,6 +218,51 @@ def _hb_ts(mid):
             os.path.dirname(inbox_path), "heartbeats", str(mid)))
     except OSError:
         return 0.0
+
+def _hb_pid_alive(mid):
+    """PROTOTYPE (task 5): True/False when the heartbeat pid file
+    for mid names a process that is / is not alive; None when there
+    is no readable pid file (unknown -- never treated as death).
+    The pid in heartbeats/<msgid>.pid is the detached heartbeat
+    loop's own pid (the only worker-side pid recorded on disk; the
+    hooks record no worker pid). PID reuse errs safe: a recycled
+    pid reads as alive and vetoes early resume."""
+    try:
+        with open(os.path.join(os.path.dirname(inbox_path),
+                               "heartbeats", str(mid) + ".pid"),
+                  encoding="utf-8") as f:
+            pid = int((f.read() or "").strip())
+    except (OSError, ValueError):
+        return None
+    if pid <= 0:
+        return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return None
+    return True
+
+
+def _early_dead(ids):
+    """PROTOTYPE (task 5): positive evidence the worker-side
+    process set is gone -- for EVERY msgid: heartbeat pid file
+    exists, its pid is dead, AND the beat file is stale by at
+    least EARLY_RESUME_HB_STALE_SECS. Any msgid unknown or alive
+    vetoes the batch. Beat staleness reuses _hb_ts (mtime)."""
+    ids = [str(m) for m in ids]
+    if not ids:
+        return False
+    for mid in ids:
+        if _hb_pid_alive(mid) is not False:
+            return False
+        if now - _hb_ts(mid) < EARLY_RESUME_HB_STALE_SECS:
+            return False
+    return True
+
 
 def load_jsonl(path):
     rows = []
@@ -641,7 +713,13 @@ if batch_active:
                 _save_json_obj(_resume_attempts_path, _resume_attempts)
             if _resume_queue.pop(str(_m), None) is not None:
                 _save_json_obj(_resume_queue_path, _resume_queue)
-    elif now - last_activity >= DEATH_WATCH_SECS:
+    elif (now - last_activity >= DEATH_WATCH_SECS
+          or (now - last_activity >= EARLY_RESUME_MIN_SILENCE_SECS
+              and _early_dead(batch_ids))):
+        # PROTOTYPE (task 5): the second disjunct is the early
+        # path -- same routing below (covered / probe-alive hold /
+        # resume once / fail-stop), only reached sooner when the
+        # process-death evidence is positive.
         # Loss of life signs (2026-10-09 status-push fix): no
         # formal reply and no push from the worker ITSELF for a full
         # death-watch window. Since 2026-10-07 BATCH_CAP_SECS is
@@ -746,7 +824,9 @@ if detached:
                 if _resume_queue.pop(str(_m), None) is not None:
                     _save_json_obj(_resume_queue_path, _resume_queue)
             continue
-        if now - dlast >= DEATH_WATCH_SECS:
+        if (now - dlast >= DEATH_WATCH_SECS
+                or (now - dlast >= EARLY_RESUME_MIN_SILENCE_SECS
+                    and _early_dead(dids))):
             # Death watch (2026-10-09, reworked by the same day's
             # status-push fix): the worker's own pushes gone for
             # DEATH_WATCH_SECS -- same routing as the active batch:
@@ -877,14 +957,31 @@ STALL_NOTICE_SECS = 1200
 if not dry:
     _stall_candidates = []
     if batch_active and not batch_done:
-        if (now - last_activity >= STALL_NOTICE_SECS
+        if now - last_activity >= STALL_NOTICE_SECS:
+            if not _activity_blocks(batch_ids):
+                _stall_candidates.append(
+                    (list(batch_ids), batch_since, last_activity,
+                     "stall"))
+        elif (last_activity <= batch_since + 2
+                and now - batch_since >= STALL_FIRST_NOTICE_SECS
                 and not _activity_blocks(batch_ids)):
+            # PROTOTYPE (task 4): zero pushes since batch start --
+            # the user has had no signal at all; first notice comes
+            # at STALL_FIRST_NOTICE_SECS, throttled under its own
+            # key so the regular stall notice can still follow.
             _stall_candidates.append(
-                (list(batch_ids), batch_since, last_activity))
+                (list(batch_ids), batch_since, last_activity,
+                 "first"))
     for _dids, _dsince, _dlast in detached_activity:
-        if (now - _dlast >= STALL_NOTICE_SECS
+        if now - _dlast >= STALL_NOTICE_SECS:
+            if not _activity_blocks(_dids):
+                _stall_candidates.append((_dids, _dsince, _dlast,
+                                          "stall"))
+        elif (_dlast <= _dsince + 2
+                and now - _dsince >= STALL_FIRST_NOTICE_SECS
                 and not _activity_blocks(_dids)):
-            _stall_candidates.append((_dids, _dsince, _dlast))
+            _stall_candidates.append((_dids, _dsince, _dlast,
+                                      "first"))
     if _stall_candidates:
         _sn_path = os.path.join(os.path.dirname(pending_path),
                                 "stall_notices.json")
@@ -899,8 +996,8 @@ if not dry:
                if isinstance(v, (int, float)) and now - float(v) < 7200}
         _sn_by_id = {e["msgid"]: e for e in entries}
         _sn_dirty = False
-        for _mids, _since, _last in _stall_candidates:
-            _key = str(int(_since)) + ":" + ",".join(
+        for _mids, _since, _last, _kind in _stall_candidates:
+            _key = _kind + ":" + str(int(_since)) + ":" + ",".join(
                 str(m) for m in _mids)
             if now - _sn.get(_key, 0) < 3600:
                 continue
@@ -913,9 +1010,15 @@ if not dry:
                 continue
             _mins = int((now - _last) // 60)
             _t = (_e0.get("text") or "").strip() or "（无文字消息）"
-            _notice = ("⏳ 任务「" + _t[:20] + "」已 " + str(_mins)
-                       + " 分钟无推送（未报错），再推即继续；"
-                         "满 30 分钟无推送将自动续跑，/stop 取消")
+            if _kind == "first":
+                _notice = ("⏳ 任务「" + _t[:20] + "」已 " + str(_mins)
+                           + " 分钟还没有第一条推送（未报错）；"
+                             "无推送满 30 分钟将自动续跑，进程已"
+                             "消失且心跳过期会提前续跑，/stop 取消")
+            else:
+                _notice = ("⏳ 任务「" + _t[:20] + "」已 " + str(_mins)
+                           + " 分钟无推送（未报错），再推即继续；"
+                             "满 30 分钟无推送将自动续跑，/stop 取消")
             _sent = False
             try:
                 r = subprocess.run([cli_path, "send", "--chatid",
@@ -997,7 +1100,7 @@ if not dry:
                 "chat_type": 2 if _fe.get("chattype") == "group" else 1,
                 "text": "⚠️ 任务已停止："
                         + "、".join(_parts)
-                        + "（30 分钟无推送，续跑后仍无推送；"
+                        + "（长时间无推送，自动续跑后仍无推送；"
                           "非确认失败，要重试告诉我）"})
     if _fn_pending:
         _fn_still = []
