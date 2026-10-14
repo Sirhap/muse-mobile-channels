@@ -118,8 +118,9 @@ NODE_ID = "native-bridge"
 
 # --- /new exit audit (P4, 2026-10-08) ---------------------------------
 # When the user rotates with /new, the fresh session must not leak the
-# previous session's content (the PREAMBLE_FRESH rule is behavioural;
-# this audit is the bridge-side backstop). At the moment session_for
+# previous session's content (the behavioural preamble clause was
+# removed by the user on 2026-10-14; this audit is the bridge-side
+# backstop that remains). At the moment session_for
 # creates the /new session, the OLD session's history is fingerprinted
 # into a frozen corpus (hashes only — the old text itself is never
 # persisted). Replies of THAT fresh session are checked in
@@ -142,27 +143,19 @@ AUDIT_BLOCK_TEXT = (
     "请换个问法，或把需要的背景在新会话里重新发我。")
 
 PREAMBLE = (
-    "【渠道桥接说明】你正在通过桥接程序回复手机渠道（微信/企业微信）上的用户。"
-    "你的最终回复文本会被原样转发到该渠道，所以：结论先行、简洁自然；"
+    "【渠道桥接说明】你正在通过桥接程序回复手机渠道上的用户。"
+    "结论先行、简洁自然；"
     "如果生成了要发给用户的文件，在回复末尾单独一行写 [[FILE:文件的绝对路径]]；"
     "不要提及桥接机制。"
-    "渠道内不要使用卡片/选项控件提问；需要用户选择时用纯文本编号列出选项。"
     "\n\n用户消息："
 )
-# A session created by the user's /new carries one extra rule. The
-# rotation itself only swaps the session id; the agent's platform
-# tools can still READ other sessions, and when the user tested /new
-# by asking "what did I just ask you", the fresh session looked the
-# old conversation up and quoted it (2026-10-08 02:41, session
-# 6bdfcfbe) — to the user, /new had not worked. The ack promises
-# earlier conversation is not carried in; this clause makes the
-# agent honour that instead of fetching it.
-PREAMBLE_FRESH = PREAMBLE.replace(
-    "不要提及桥接机制。",
-    "不要提及桥接机制。\n"
-    "【新会话】用户刚主动开了新会话，这是全新对话：不要查阅、引用或复述"
-    "其它会话（包括刚结束的上一个会话）的内容；即使用户问起之前聊过什么，"
-    "也只说明这是新会话、之前的内容没有带入，请用户在新会话里重新说明。")
+# Sessions created by the user's /new used to carry one extra
+# clause (the 【新会话】 no-cross-session rule). The user removed
+# that clause — and the rest of the trimming above — on 2026-10-14,
+# so a fresh session now gets exactly the same preamble as any
+# other. PREAMBLE_FRESH stays as an alias so session_for and the
+# /new exit audit keep their existing code paths unchanged.
+PREAMBLE_FRESH = PREAMBLE
 
 _state_lock = threading.Lock()
 

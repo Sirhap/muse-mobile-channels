@@ -12,7 +12,10 @@ Covers the native-bridge P3 changes:
      (timestamp, message_id, type) dedup) and folded into the
      progress notice as a neutral 最近动态 line; failures silent.
   4. queue_snapshot active entries gain phase / last_activity.
-  5. PREAMBLE / PREAMBLE_FRESH carry the no-cards rule, and
+  5. PREAMBLE / PREAMBLE_FRESH match the trimmed text the user
+     settled on 2026-10-14 (fresh-session clause, no-cards rule,
+     channel parenthetical and the verbatim-forwarding sentence all
+     removed; PREAMBLE_FRESH is now an alias of PREAMBLE), and
      deliver_reply strips standalone [[hatch_widget:...]] lines
      while keeping inline mentions.
 
@@ -297,8 +300,19 @@ check("2 escalation: carries phase word", "可能卡住" in body)
 
 # ---------------------------------------------------------------- 5
 CARD_LINE = "渠道内不要使用卡片/选项控件提问；需要用户选择时用纯文本编号列出选项。"
-check("5 PREAMBLE has no-cards rule", CARD_LINE in nb.PREAMBLE)
-check("5 PREAMBLE_FRESH has no-cards rule", CARD_LINE in nb.PREAMBLE_FRESH)
+EXPECTED_PREAMBLE = (
+    "【渠道桥接说明】你正在通过桥接程序回复手机渠道上的用户。"
+    "结论先行、简洁自然；"
+    "如果生成了要发给用户的文件，在回复末尾单独一行写 [[FILE:文件的绝对路径]]；"
+    "不要提及桥接机制。"
+    "\n\n用户消息："
+)
+check("5 PREAMBLE is the trimmed 2026-10-14 text",
+      nb.PREAMBLE == EXPECTED_PREAMBLE)
+check("5 PREAMBLE_FRESH aliases PREAMBLE", nb.PREAMBLE_FRESH == nb.PREAMBLE)
+for removed in (CARD_LINE, "【新会话】", "（微信/企业微信）",
+                "你的最终回复文本会被原样转发到该渠道，所以："):
+    check(f"5 PREAMBLE drops {removed[:12]}", removed not in nb.PREAMBLE)
 
 nb.deliver_reply("weixin", "m-5a",
                  "第一行\n[[hatch_widget:{\"kind\":\"options\"}]]\n"
