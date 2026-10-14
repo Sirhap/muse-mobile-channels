@@ -123,7 +123,7 @@ DEATH_WATCH_SECS = 1800
 # "execution failed" verdict). A missing or unreadable probe
 # is not life: the hook then uses the resume/cancel path.
 # See death_watch_activity.py.
-# --- Early signals (PROTOTYPE 2026-10-14, todo tasks 4+5; sandbox
+# --- Early signals (2026-10-14, todo tasks 4+5; deployed
 # only, NOT deployed) ---
 # Task 4: a batch that has NEVER pushed (no bound outbox row from
 # the worker itself since batch start) gets its first stall notice
@@ -220,7 +220,7 @@ def _hb_ts(mid):
         return 0.0
 
 def _hb_pid_alive(mid):
-    """PROTOTYPE (task 5): True/False when the heartbeat pid file
+    """(task 5, deployed 2026-10-14) True/False when the heartbeat pid file
     for mid names a process that is / is not alive; None when there
     is no readable pid file (unknown -- never treated as death).
     The pid in heartbeats/<msgid>.pid is the detached heartbeat
@@ -248,7 +248,7 @@ def _hb_pid_alive(mid):
 
 
 def _early_dead(ids):
-    """PROTOTYPE (task 5): positive evidence the worker-side
+    """(task 5, deployed 2026-10-14) Positive evidence the worker-side
     process set is gone -- for EVERY msgid: heartbeat pid file
     exists, its pid is dead, AND the beat file is stale by at
     least EARLY_RESUME_HB_STALE_SECS. Any msgid unknown or alive
@@ -716,7 +716,7 @@ if batch_active:
     elif (now - last_activity >= DEATH_WATCH_SECS
           or (now - last_activity >= EARLY_RESUME_MIN_SILENCE_SECS
               and _early_dead(batch_ids))):
-        # PROTOTYPE (task 5): the second disjunct is the early
+        # (task 5) The second disjunct is the early
         # path -- same routing below (covered / probe-alive hold /
         # resume once / fail-stop), only reached sooner when the
         # process-death evidence is positive.
@@ -965,7 +965,7 @@ if not dry:
         elif (last_activity <= batch_since + 2
                 and now - batch_since >= STALL_FIRST_NOTICE_SECS
                 and not _activity_blocks(batch_ids)):
-            # PROTOTYPE (task 4): zero pushes since batch start --
+            # (task 4) Zero pushes since batch start --
             # the user has had no signal at all; first notice comes
             # at STALL_FIRST_NOTICE_SECS, throttled under its own
             # key so the regular stall notice can still follow.
@@ -1065,20 +1065,25 @@ if not dry and _resume_notice_entries:
 # send from a worker that revives), and send the user ONE failure
 # notice per poll via the CLI's unbound send. If the notice cannot
 # be queued (CLI error), it is kept in failed_notices.json and
-# retried on later polls for up to an hour, so the user always
-# learns the task died. Retrying is the user's call — nothing here
-# ever re-dispatches the work.
+# retried on later polls for up to 24 hours, and a queued notice is
+# only discharged once the gateway's result row for its queued id
+# says ok=true (a dead-lettered row re-queues it), so the user
+# always learns the task died — even through an hours-long channel
+# outage (2026-10-14, audit G3). Retrying is the user's call —
+# nothing here ever re-dispatches the work.
 if not dry:
     _fn_path = os.path.join(os.path.dirname(pending_path), "failed_notices.json")
     _fn_pending = []
+    _pn = None
     try:
         with open(_fn_path, encoding="utf-8") as f:
             _pn = json.load(f)
         if isinstance(_pn, list):
             _fn_pending = [n for n in _pn if isinstance(n, dict)
-                           and now - float(n.get("ts") or 0) < 3600]
+                           and now - float(n.get("ts") or 0) < 86400]
     except (OSError, json.JSONDecodeError):
         _fn_pending = []
+    _fn_loaded = len(_pn) if isinstance(_pn, list) else 0
     if failed_entries:
         for e in failed_entries:
             try:
@@ -1103,21 +1108,52 @@ if not dry:
                         + "（长时间无推送，自动续跑后仍无推送；"
                           "非确认失败，要重试告诉我）"})
     if _fn_pending:
+        _res_by_id = {}
+        for _rr in load_jsonl(os.path.join(
+                os.path.dirname(outbox_path), "outbox_results.jsonl")):
+            if _rr.get("id"):
+                _res_by_id.setdefault(_rr["id"], []).append(_rr)
         _fn_still = []
         for n in _fn_pending:
-            try:
-                r = subprocess.run([cli_path, "send", "--chatid", str(n["chatid"]),
-                                    "--chat-type", str(n["chat_type"]),
-                                    "--text", str(n["text"])],
-                                   capture_output=True, timeout=20)
-                if r.returncode == 0:
+            qid = n.get("queued_id")
+            if qid:
+                rows = _res_by_id.get(qid) or []
+                if any(r.get("ok") is True for r in rows):
                     continue
-            except Exception:
-                pass
-            _fn_still.append(n)
+                if any(r.get("deadletter") for r in rows):
+                    n.pop("queued_id", None)
+                    qid = None
+                else:
+                    _fn_still.append(n)
+                    continue
+            if not qid:
+                try:
+                    r = subprocess.run(
+                        [cli_path, "send", "--chatid", str(n["chatid"]),
+                         "--chat-type", str(n["chat_type"]),
+                         "--text", str(n["text"])],
+                                       capture_output=True, timeout=20,
+                                       text=True)
+                    if r.returncode == 0:
+                        marker = "queued send id="
+                        out = r.stdout or ""
+                        if marker in out:
+                            n["queued_id"] = out.split(
+                                marker, 1)[1].split()[0]
+                except Exception:
+                    pass
+                _fn_still.append(n)
         try:
             with open(_fn_path, "w", encoding="utf-8") as f:
                 json.dump(_fn_still, f, ensure_ascii=False)
+        except OSError:
+            pass
+    elif _fn_loaded != len(_fn_pending):
+        # Nothing to send, but the 24h filter dropped stale entries:
+        # purge them from disk so the file cannot grow dead weight.
+        try:
+            with open(_fn_path, "w", encoding="utf-8") as f:
+                json.dump(_fn_pending, f, ensure_ascii=False)
         except OSError:
             pass
 
