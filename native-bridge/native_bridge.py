@@ -198,12 +198,21 @@ def ch_state(st, ch):
     return c
 
 
-def write_status(extra):
+def write_status(extra, active=None):
     try:
         cur = json.load(open(STATUS_F))
     except (OSError, ValueError):
         cur = {}
     cur.update(extra)
+    if active is not None:
+        # Per-channel merge: each channel worker refreshes only its
+        # own key of the shared "active" summary (todo 6), so the
+        # three workers never clobber each other's rows.
+        cur_active = cur.get("active")
+        if not isinstance(cur_active, dict):
+            cur_active = {}
+        cur_active.update(active)
+        cur["active"] = cur_active
     cur["ts"] = int(time.time())
     tmp = STATUS_F + ".tmp"
     json.dump(cur, open(tmp, "w"), ensure_ascii=False, indent=1)
@@ -283,6 +292,63 @@ def append_jsonl(path, row):
 
 def bridge_row_id(msgid, suffix=""):
     return hashlib.sha256(f"bridge:{msgid}:{suffix}".encode()).hexdigest()[:12]
+
+
+# --- Progress checklists (todo 9, 2026-10-14) ----------------------
+# An executor (main session / worker) MAY publish the turn's real
+# checklist as progress_lists/<channel>-<msgid>.json under BASE:
+# {"items": [{"text": "...", "done": false}, ...]}, replaced
+# atomically (tmp + rename; see progress_list.py). progress_notice
+# folds ONE summary line into the existing bubble when the file is
+# present and well-formed; anything else (missing, corrupt, empty)
+# leaves the bubble byte-identical to before — the checklist is a
+# garnish on the notice, never a second push and never a reason to
+# break the notice itself. step() drops the file when the turn
+# closes so a stale list cannot leak into a later bubble.
+PROGRESS_LIST_ITEM_MAX = 24  # bubble chars of the current item
+
+
+def progress_list_path(ch, msgid):
+    return os.path.join(BASE, "progress_lists", f"{ch}-{msgid}.json")
+
+
+def _progress_list_line(ch, msgid):
+    """'清单 k/n：<current item>' for the turn's checklist, or None.
+
+    k counts completed items; the text is the first unfinished one,
+    whitespace-collapsed and truncated. All-done collapses to
+    '清单 n/n ✓'. Any read/parse/shape problem returns None.
+    """
+    try:
+        with open(progress_list_path(ch, msgid), encoding="utf-8") as f:
+            items = json.load(f)["items"]
+        if not isinstance(items, list) or not items:
+            return None
+        done = 0
+        current = None
+        for it in items:
+            if not isinstance(it, dict) \
+                    or not isinstance(it.get("text"), str):
+                return None
+            if it.get("done"):
+                done += 1
+            elif current is None:
+                current = it["text"]
+    except Exception:
+        return None
+    if current is None:
+        return f"清单 {len(items)}/{len(items)} ✓"
+    cur = _normalize_audit_text(current)
+    if len(cur) > PROGRESS_LIST_ITEM_MAX:
+        cur = cur[:PROGRESS_LIST_ITEM_MAX] + "…"
+    return f"清单 {done}/{len(items)}：{cur}"
+
+
+def _drop_progress_list(ch, msgid):
+    try:
+        os.unlink(progress_list_path(ch, msgid))
+    except OSError:
+        pass
 
 
 def outbox_already_has(ch, row_id):
@@ -912,6 +978,12 @@ class ChannelWorker(threading.Thread):
                 if isinstance(a, dict) and a.get("text")]
         if acts:
             text += "\n最近动态：" + "；".join(acts[-2:])
+        # Checklist fold (todo 9): same rule as the activity fold —
+        # into THIS notice only, never a separate bubble. Silent
+        # when the turn has no (valid) checklist file.
+        plist = _progress_list_line(self.ch, turn["msgid"])
+        if plist:
+            text += "\n" + plist
         rid = f"bridgeprog-{turn['msgid'][:8]}-{int(age // 60)}"
         if self.ch == "weixin":
             to = turn.get("from_user", "")
@@ -1344,7 +1416,7 @@ class ChannelWorker(threading.Thread):
         rows = []
         if body:
             r = {"id": rid, "mode": "send", "content": body,
-                 "queued_at": now}
+                 "proactive": True, "queued_at": now}
             r.update(addr)
             if self.ch not in ("weixin", "wecom"):
                 r["text"] = body
@@ -1352,7 +1424,7 @@ class ChannelWorker(threading.Thread):
         for i, p in enumerate(files):
             r = {"id": f"{rid}-f{i}", "mode": "send_file",
                  "file_path": p, "content": body if i == 0 else "",
-                 "queued_at": now}
+                 "proactive": True, "queued_at": now}
             r.update(addr)
             rows.append(r)
         for r in rows:
@@ -1490,6 +1562,41 @@ class ChannelWorker(threading.Thread):
             self.update_cs(idle_push_seq=new_wm,
                            idle_pushed_ids=pushed[-200:])
 
+    def _active_summary(self):
+        """Compact status.json summary of this channel's running
+        turns (todo 6): which task, how long it has been running,
+        how long since its last sign of life — the newest activity
+        event, the last progress notice, or the last reply,
+        whichever is freshest. Capped at 3 rows with the text cut
+        to 20 chars: status.json is rewritten on the poll cadence
+        and must stay small. Finished turns vanish on their own
+        because they leave the turns list."""
+        now = time.time()
+        rows = []
+        for t in self.cs().get("turns") or []:
+            sent = t.get("sent_at")
+            last = float(sent) if isinstance(sent, (int, float)) else now
+            for act in reversed(t.get("activities") or []):
+                if not isinstance(act, dict):
+                    continue
+                ts = _activity_ts_epoch(act.get("ts"))
+                if ts is not None:
+                    last = max(last, ts)
+                    break
+            for key in ("last_event_prog", "last_reply_at"):
+                v = t.get(key)
+                if isinstance(v, (int, float)) and v:
+                    last = max(last, float(v))
+            run_from = float(sent) if isinstance(sent, (int, float)) else now
+            rows.append({
+                "text": " ".join((t.get("text") or "").split())[:20],
+                "run_secs": max(0, int(now - run_from)),
+                "idle_secs": max(0, int(now - last)),
+            })
+            if len(rows) >= 3:
+                break
+        return rows
+
     def run(self):
         ch = self.ch
         cfg = CFG["channels"][ch]
@@ -1507,9 +1614,14 @@ class ChannelWorker(threading.Thread):
             except Exception:
                 traceback.print_exc()
             try:
-                cur = json.load(open(STATUS_F))
-                if time.time() - (cur.get("ts") or 0) > 10:
-                    write_status({})
+                # Refresh this channel's active summary on a fixed
+                # cadence (todo 6): the old stale-ts gate raced the
+                # supervisor's own status writes and in practice only
+                # one channel's summary ever landed.
+                if time.time() - getattr(self, "_active_written_at",
+                                         0) >= 15:
+                    self._active_written_at = time.time()
+                    write_status({}, active={ch: self._active_summary()})
             except Exception:
                 pass
             time.sleep(POLL_SECS)
@@ -1556,6 +1668,13 @@ class ChannelWorker(threading.Thread):
                     self.drop_gw()
                     alive.append(turn)
                     continue
+                if outcome != "running":
+                    # The turn is closing — done / cancelled /
+                    # abnormal end all funnel through poll_turn's
+                    # return value here. Drop its checklist file
+                    # (todo 9) so nothing stale can surface in a
+                    # later bubble.
+                    _drop_progress_list(ch, turn["msgid"])
                 if outcome == "running":
                     age = int(time.time()) - turn["sent_at"]
                     nxt = turn.get("next_prog") or 0
@@ -1737,7 +1856,7 @@ class ChannelWorker(threading.Thread):
                 # ok=true — the hourly empty messages. Keep "text"
                 # alongside for any older reader.
                 out = {"id": rid, "mode": "send", "content": text,
-                       "text": text}
+                       "text": text, "proactive": True}
                 if self.ch == "wecom":
                     cid = (row or {}).get("chatid") or \
                         CFG["channels"][self.ch].get("chatid", "")
@@ -1759,7 +1878,8 @@ class ChannelWorker(threading.Thread):
                 append_jsonl(os.path.join(BASE, "shadow",
                                           f"{self.ch}-outbox.jsonl"),
                              {"id": rid, "mode": "send",
-                              "content": text, "text": text})
+                              "content": text, "text": text,
+                              "proactive": True})
         except Exception as e:
             self.log(f"alert send failed: {str(e)[:80]}")
 
