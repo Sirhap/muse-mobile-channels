@@ -139,6 +139,17 @@ OUTBOX_PARKED = STATE / "outbox_parked.json"
 # retry lane retries parked rows on their own backoff. Parked
 # state is persisted in OUTBOX_PARKED, so a restart resets nothing.
 FORMAL_MODES = ("reply", "reply_file")
+# Stuck-formal notice (2026-10-14, audit G2 — the WeChat gateway has
+# had this since 2026-10-08; WeCom formal rows used to park forever
+# in silence): after this many failed attempts the user is told
+# ONCE, in-channel via an unbound send row and cross-channel via a
+# row appended to the WeChat outbox.
+FORMAL_STUCK_NOTIFY_ATTEMPTS = 3
+STUCK_NOTICE_WEIXIN_OUTBOX = (
+    Path(os.environ.get("HOME") or "/home/hatch")
+    / "workspace" / "weixin-bot" / "state" / "outbox.jsonl")
+STUCK_NOTICE_WEIXIN_TO = os.environ.get(
+    "WECOM_STUCK_NOTICE_TO", "〈wechat-user-id〉")
 CANCELLED_FILE = STATE / "cancelled.json"
 SEEN_FILE = STATE / "seen_ids.jsonl"
 LOCK_FILE = STATE / "gateway.lock"
@@ -570,20 +581,37 @@ def _task_overview_text(channel, state_dir, hook_state_dir):
         snap = ch.get("queue_snapshot", {}) or {}
         texts = _spool_texts(channel)
         inbox_texts = _inbox_texts(state_dir)
-        for a in snap.get("active", []):
-            mid = a.get("msgid", "")
-            txt = texts.get(mid) or inbox_texts.get(mid, "")
-            lines.append(f"▶ 桥 {_fmt_dur(a.get('secs', 0))} "
-                         f"「{_excerpt(txt)}」")
+        # Bridge rows prefer the bridge's own status.json summary
+        # (todo 6: it carries the last-activity age the state.json
+        # snapshot lacks); when it has no usable rows, fall back to
+        # the snapshot rendering exactly as before.
+        status_rows = _bridge_status_active(channel)
+        if status_rows:
+            for r in status_rows:
+                idle = r.get("idle_secs")
+                idle_part = f" · 最后活动 {_fmt_dur(idle)}前" \
+                    if isinstance(idle, (int, float)) else ""
+                lines.append(f"▶ 桥 {_fmt_dur(r.get('run_secs', 0))} "
+                             f"「{_excerpt(r.get('text', ''))}」{idle_part}")
+        else:
+            for a in snap.get("active", []):
+                mid = a.get("msgid", "")
+                txt = texts.get(mid) or inbox_texts.get(mid, "")
+                lines.append(f"▶ 桥 {_fmt_dur(a.get('secs', 0))} "
+                             f"「{_excerpt(txt)}」")
         batch, _ids, pcount, _dcount = _queue_summary(hook_state_dir)
         mids = batch.get("msgids") or []
         if mids:
             since = batch.get("since")
             age = (time.time() - float(since)) \
                 if isinstance(since, (int, float)) else 0
+            last_ts = _last_outbound_ts(state_dir, mids)
+            idle_part = f" · 最后活动 " \
+                        f"{_fmt_dur(time.time() - last_ts)}前" \
+                if last_ts else ""
             lines.append(f"▶ 冷通道 {_fmt_dur(age)} "
                          f"「{_excerpt(inbox_texts.get(mids[0], ''))}」"
-                         f"（本批 {len(mids)} 条）")
+                         f"（本批 {len(mids)} 条）{idle_part}")
         # Detached batches are still RUNNING (background resume), not
         # queued: list them as running rows like /queue does, instead
         # of only folding them into a queue count (2026-10-13 fix:
@@ -597,9 +625,13 @@ def _task_overview_text(channel, state_dir, hook_state_dir):
             dsince = d.get("since")
             dage = (time.time() - float(dsince)) \
                 if isinstance(dsince, (int, float)) else 0
+            dlast_ts = _last_outbound_ts(state_dir, dmids)
+            didle_part = f" · 最后活动 " \
+                         f"{_fmt_dur(time.time() - dlast_ts)}前" \
+                if dlast_ts else ""
             lines.append(f"▶ 冷通道·后台续跑 {_fmt_dur(dage)} "
                          f"「{_excerpt(inbox_texts.get(dmids[0], ''))}」"
-                         f"（本批 {len(dmids)} 条）")
+                         f"（本批 {len(dmids)} 条）{didle_part}")
         qparts = []
         bq = snap.get("queued", [])
         if bq:
@@ -659,6 +691,55 @@ def _bridge_snapshot(channel):
         return snap.get("active", []) or [], snap.get("queued", []) or []
     except Exception:
         return [], []
+
+
+def _bridge_status_active(channel):
+    """Active-turn summary rows from the bridge status.json
+    (todo 6): [{text, run_secs, idle_secs}] the bridge writes about
+    its own running turns — which task, how long running, how long
+    since its last sign of life. Only well-formed rows survive.
+    Fail-silent []."""
+    try:
+        st = _read_json_file(
+            Path("/home/hatch/workspace/native-bridge/status.json"),
+            {}) or {}
+        rows = (st.get("active") or {}).get(channel) or []
+        return [r for r in rows if isinstance(r, dict)
+                and isinstance(r.get("run_secs"), (int, float))]
+    except Exception:
+        return []
+
+
+def _last_outbound_ts(state_dir, msgids):
+    """Newest queued_at/ts among this gateway's outbox rows bound
+    to any of msgids — a cold batch's last push (worker update or
+    reply row), tail-read like _spool_texts. None when the batch
+    has not pushed anything yet. Fail-silent."""
+    try:
+        idset = {str(m) for m in (msgids or [])}
+        if not idset:
+            return None
+        with open(state_dir / "outbox.jsonl", "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 524288))
+            data = f.read().decode("utf-8", "replace")
+        best = None
+        for line in data.splitlines():
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if str(row.get("msgid") or "") not in idset:
+                continue
+            ts = row.get("queued_at")
+            if not isinstance(ts, (int, float)):
+                ts = row.get("ts")
+            if isinstance(ts, (int, float)):
+                best = ts if best is None else max(best, float(ts))
+        return best
+    except Exception:
+        return None
 
 
 def _bridge_queued_rows(channel):
@@ -1679,8 +1760,18 @@ class Gateway:
         rec["n"] = int(rec.get("n") or 0) + 1
         n = rec["n"]
         rec["next"] = time.time() + retry_backoff_secs(n)
+        if (mode in FORMAL_MODES
+                and n >= FORMAL_STUCK_NOTIFY_ATTEMPTS
+                and not rec.get("notified")):
+            rec["notified"] = True
+            self._notify_stuck_formal(item, n)
         action = "park"
-        if mode not in FORMAL_MODES and n >= SEND_MAX_ATTEMPTS:
+        if (mode not in FORMAL_MODES and not item.get("proactive")
+                and n >= SEND_MAX_ATTEMPTS):
+            # Proactive rows (bridge idle results + bridge alerts):
+            # completion reports — park and retry like formal rows
+            # instead of dead-lettering in a long outage (2026-10-14,
+            # audit G1; mirrors the WeChat gateway).
             action = "deadletter"
             self.append_jsonl(OUTBOX_RESULTS, {
                 "id": item_id,
@@ -1694,13 +1785,70 @@ class Gateway:
         retry = self._load_retry()
         if action == "park":
             parked[item_id] = rec
-            retry[item_id] = {"n": n, "next": rec["next"]}
+            mirror = {"n": n, "next": rec["next"]}
+            if rec.get("notified"):
+                mirror["notified"] = True
+            retry[item_id] = mirror
         else:
             parked.pop(item_id, None)
             retry.pop(item_id, None)
         self._save_parked(parked)
         self._save_retry(retry)
         return action
+
+    def _notify_stuck_formal(self, item: dict, attempts: int) -> None:
+        """A formal reply has failed FORMAL_STUCK_NOTIFY_ATTEMPTS
+        times. It is NOT dropped (see FORMAL_MODES) — but the user
+        must know (2026-10-14, audit G2; the WeChat gateway's
+        _notify_stuck_formal is the reference). Both legs are plain
+        outbox appends, best-effort: (a) in-channel, an unbound send
+        row behind nothing (it delivers when the channel recovers,
+        or parks on its own), and (b) cross-channel, a send row in
+        the WeChat outbox, which reaches the user even while WeCom
+        is down. For a stuck reply_file the file itself is also
+        appended to the WeChat outbox. Called once per stuck row
+        (the caller persists a notified flag in the parked record).
+        """
+        try:
+            fpath = str(item.get("file_path") or "")
+            is_file = item.get("mode") == "reply_file" \
+                and fpath and Path(fpath).exists()
+            if is_file:
+                text = (f"⚠️ 文件「{Path(fpath).name}」发送状态："
+                        f"① 服务端：企微发送连续失败 {attempts} 次，"
+                        "企微服务端尚未接受这个文件；"
+                        "② 转投：已把原文件转投到你的微信应急；"
+                        "③ 企微这边仍在继续重试、不会丢弃，最终以你"
+                        "在企微实际收到为准。")
+            else:
+                text = (f"⚠️ 企业微信这边有一条正式回复已连续发送失败 "
+                        f"{attempts} 次，仍在自动重试、不会丢弃。多半"
+                        "是企微发送通道临时故障。")
+            chatid = str(item.get("chatid") or "")
+            if chatid:
+                self.append_jsonl(OUTBOX, {
+                    "id": f"stucknote-{uuid.uuid4().hex[:12]}",
+                    "mode": "send", "chatid": chatid,
+                    "chat_type": int(item.get("chat_type") or 1),
+                    "content": text,
+                    "queued_at": int(time.time())})
+            if STUCK_NOTICE_WEIXIN_OUTBOX.exists():
+                self.append_jsonl(STUCK_NOTICE_WEIXIN_OUTBOX, {
+                    "id": f"stucknote-{uuid.uuid4().hex[:12]}",
+                    "mode": "send", "to_user_id": STUCK_NOTICE_WEIXIN_TO,
+                    "content": "【企业微信通道提醒】" + text,
+                    "queued_at": int(time.time())})
+                if is_file:
+                    self.append_jsonl(STUCK_NOTICE_WEIXIN_OUTBOX, {
+                        "id": f"stucknote-{uuid.uuid4().hex[:12]}",
+                        "mode": "send_file",
+                        "to_user_id": STUCK_NOTICE_WEIXIN_TO,
+                        "file_path": fpath,
+                        "queued_at": int(time.time())})
+            log(f"stuck-formal notice sent for "
+                f"{item.get('id')} after {attempts} attempts")
+        except Exception as e:
+            log(f"stuck-formal notice failed: {e}")
 
     def _cleanup_item(self, item_id: str) -> None:
         """A row reached a terminal state (delivered): drop its
