@@ -47,8 +47,13 @@ def _session_key(item: dict) -> tuple:
 
 
 def _content_text(item: dict) -> str:
-    """Send body as text. A missing body joins as an empty segment."""
-    content = item.get("content")
+    """Send body as text. A missing body joins as an empty segment.
+
+    Falls back to ``text`` (2026-10-14): the bridge's alert writer
+    historically carried its body in ``text`` only, and merging such
+    a row on ``content`` alone silently emptied it before dispatch.
+    """
+    content = item.get("content") or item.get("text")
     if content is None:
         return ""
     return str(content)

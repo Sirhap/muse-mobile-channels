@@ -3352,7 +3352,11 @@ class Gateway:
         in the retry lane via _note_failure (park-and-continue)."""
         item_id = item.get("id", "")
         mode = item.get("mode", "")
-        content = item.get("content", "")
+        # Body fallback (2026-10-14): the bridge's alert writer put
+        # the body in "text" while dispatchers read only "content",
+        # so alerts were dispatched with an empty body. Accept
+        # "text" as a fallback for every mode.
+        content = item.get("content") or item.get("text") or ""
         if mode == "reply":
             content = normalize_subagent_content(item.get("msgid", ""), content)
         result = {"id": item_id, "mode": mode, "ts": int(time.time()), "ok": False}
@@ -3373,6 +3377,17 @@ class Gateway:
             self.append_jsonl(OUTBOX_RESULTS, result)
             log(f"outbox {mode} {item_id}: skipped, already replied msgid={_mid}")
             return True  # consumed: late duplicate, never reaches the user
+        if mode == "send" and not str(content).strip():
+            # An empty unbound send is never a real message (the
+            # 2026-10-14 bridge-alert incident: body sat in "text",
+            # dispatch read only "content"). Consume it — retrying
+            # cannot add a body — and record why, instead of sending
+            # an empty bubble or retrying it for hours.
+            result["errmsg"] = "empty send content; dropped, not sent"
+            result["suppressed"] = True
+            self.append_jsonl(OUTBOX_RESULTS, result)
+            log(f"outbox {mode} {item_id}: skipped, empty send content")
+            return True  # consumed: never reaches the user
         resp = None
         typing_after = None  # (to, token_ctx, status)
         try:
