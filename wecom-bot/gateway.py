@@ -3248,7 +3248,12 @@ class Gateway:
     async def dispatch_outbox_item(self, item: dict) -> bool:
         item_id = item.get("id", "")
         mode = item.get("mode", "")
-        content = item.get("content", "")
+        # Body fallback (2026-10-14): the bridge's alert writer put
+        # the body in "text" while this dispatcher read only
+        # "content", so hourly alerts went out as EMPTY bubbles with
+        # ok=true. Accept "text" as a fallback for every mode, and
+        # never dispatch an empty unbound "send" again (see below).
+        content = item.get("content") or item.get("text") or ""
         if mode == "reply":
             content = normalize_subagent_content(item.get("msgid", ""), content)
         result = {"id": item_id, "mode": mode, "ts": int(time.time()), "ok": False}
@@ -3268,6 +3273,16 @@ class Gateway:
             result["suppressed"] = True
             self.append_jsonl(OUTBOX_RESULTS, result)
             log(f"outbox {mode} {item_id}: skipped, already replied msgid={_mid}")
+            return True
+        if mode == "send" and not str(content).strip():
+            # An empty unbound send is never a real message: in the
+            # 2026-10-14 incident the platform accepted "" and the
+            # user got an empty bubble every hour. Consume the row
+            # (no retry — retrying cannot add a body) and record why.
+            result["errmsg"] = "empty send content; dropped, not sent"
+            result["suppressed"] = True
+            self.append_jsonl(OUTBOX_RESULTS, result)
+            log(f"outbox send {item_id}: {result['errmsg']}")
             return True
         try:
             if mode == "reply" and self.reqinfo(item.get("msgid", "")).get("event"):

@@ -83,6 +83,15 @@ LT_EVENT_PROG_MIN_SECS = 60   # LT2: min gap between event-triggered
                                 # triggers so neither source can spam.
 IDLE_FAIL_ALERT_STREAK = 3    # LT2: idle-scan failures before alerting
 IDLE_ALERT_MIN_SECS = 3600    # LT2: min gap between idle-scan alerts
+# Credential-class connect failures (2026-10-14): the muse.ai session
+# behind cookies.txt was invalidated server-side (auth/check 401
+# hatchAdmissionInvalidated) and the stored token's WebSocket upgrade
+# is refused 403 — per the native-probe baseline, 401/403 here mean
+# the credential itself is dead, not a transient network error. Such
+# failures cannot heal by retrying: pause connect attempts for
+# AUTH_FAIL_BACKOFF_SECS (a changed credential file retries at once),
+# and alert ONCE per credential set instead of hourly forever.
+AUTH_FAIL_BACKOFF_SECS = 600
 MERGE_CHANNELS = {"weixin", "test", "wecom"}
 # Channels in MERGE_CHANNELS fold a queued message into the running
 # turn (official-client steering) while that turn's reply has not
@@ -185,6 +194,7 @@ def ch_state(st, ch):
         "admin_offset": 0,
         "idle_push_seq": 0, "idle_pushed_ids": [],
         "idle_scan_fail_streak": 0, "idle_scan_last_alert": 0,
+        "idle_auth_alert_stamp": None,
         "queue_snapshot": {"active": [], "queued": []}}
     c = st["channels"].setdefault(ch, {})
     for k, v in defaults.items():
@@ -225,6 +235,35 @@ def is_session_not_found(exc):
     if getattr(exc, "status", None) == 404:
         return True
     return "session not found" in str(exc).lower()
+
+
+def is_auth_failure(exc):
+    """True when a connect failure means the stored credential itself
+    is dead (muse.ai session invalidated / token refused), as opposed
+    to a transient network error. Matches the AuthError type from
+    muse_cli.gateway plus the 401/403 markers the probe baseline
+    established for this gateway (empty token 401, bad token 403)."""
+    if type(exc).__name__ == "AuthError":
+        return True
+    s = str(exc)
+    return "hatchAdmissionInvalidated" in s or " 401" in s \
+        or " 403" in s or "upgrade: 403" in s
+
+
+def cred_stamp():
+    """Fingerprint of the credential files connect() can use, so a
+    re-exported credential is noticed (and retried / re-alerted)
+    without polling the files' contents. Names + mtime + size only;
+    credential values are never read here."""
+    parts = []
+    for name in ("cookies.txt", "vm_id.txt", "token.json"):
+        p = os.path.join(CONF_DIR, name)
+        try:
+            st = os.stat(p)
+            parts.append(f"{name}:{st.st_mtime_ns}:{st.st_size}")
+        except OSError:
+            parts.append(f"{name}:missing")
+    return "|".join(parts)
 
 
 def outbox_path(ch):
@@ -651,6 +690,8 @@ class ChannelWorker(threading.Thread):
         self._turn_reply_marks = []   # [(seq, mid)] delivered as turn replies
         self._turns_dirty = False    # a turn field changed during polling
         self._session_from_stored = False   # LT2: last session_for reused sid
+        self._auth_blocked_until = 0.0   # credential-class backoff (2026-10-14)
+        self._auth_blocked_stamp = None
 
     def log(self, *a):
         print(f"[{self.ch}]", *a, flush=True)
@@ -666,16 +707,45 @@ class ChannelWorker(threading.Thread):
             c.update(kw)
             save_state(st)
 
+    def _auth_connect_blocked(self):
+        """True while a credential-class failure is in backoff AND the
+        credential files are unchanged. A re-exported credential (stamp
+        change) clears the block so the next attempt runs at once."""
+        if time.time() >= self._auth_blocked_until:
+            return False
+        if self._auth_blocked_stamp != cred_stamp():
+            self._auth_blocked_until = 0.0
+            self._auth_blocked_stamp = None
+            return False
+        return True
+
+    def _note_connect_failure(self, e):
+        """Start the credential backoff when a connect failure is
+        credential-class; returns True when it was."""
+        if not is_auth_failure(e):
+            return False
+        self._auth_blocked_until = time.time() + AUTH_FAIL_BACKOFF_SECS
+        self._auth_blocked_stamp = cred_stamp()
+        return True
+
+    def _clear_auth_block(self):
+        self._auth_blocked_until = 0.0
+        self._auth_blocked_stamp = None
+
     def ensure_gw(self):
         if self.gw is not None:
             return True
+        if self._auth_connect_blocked():
+            return False
         self.last_connect_try = time.time()
         try:
             self.gw = connect()
+            self._clear_auth_block()
             self.log("connected")
             return True
         except Exception as e:
             self.log("connect failed:", type(e).__name__, str(e)[:140])
+            self._note_connect_failure(e)
             self.gw = None
             return False
 
@@ -1310,6 +1380,25 @@ class ChannelWorker(threading.Thread):
             return
         streak = (cs.get("idle_scan_fail_streak") or 0) + 1
         kw = {"idle_scan_fail_streak": streak}
+        if is_auth_failure(exc):
+            # Credential is dead: retrying cannot heal it, and an
+            # hourly alert forever is spam. Alert once per credential
+            # set (the stamp is re-armed when the files change or a
+            # scan succeeds again); connect attempts back off via
+            # _note_connect_failure in the caller.
+            stamp = cred_stamp()
+            if cs.get("idle_auth_alert_stamp") != stamp:
+                kw["idle_auth_alert_stamp"] = stamp
+                kw["idle_scan_last_alert"] = int(time.time())
+                self.update_cs(**kw)
+                self._send_alert_text(
+                    "⚠️ 原生桥登录凭证已失效，空闲扫描与主动推送已暂停"
+                    "（普通问答不受影响）；需要重新导出 muse.ai 凭证"
+                    "才能恢复，这条只提醒这一次，不再每小时重复。")
+                self.log(f"idle scan auth alert sent streak={streak}")
+            else:
+                self.update_cs(**kw)
+            return
         alert = streak >= IDLE_FAIL_ALERT_STREAK and \
             time.time() - (cs.get("idle_scan_last_alert") or 0) \
             >= IDLE_ALERT_MIN_SECS
@@ -1346,11 +1435,15 @@ class ChannelWorker(threading.Thread):
             return
         gated = longtask_mode(self.ch)
         if self.gw is None:
+            if self._auth_connect_blocked():
+                return
             try:
                 self.gw = connect()
+                self._clear_auth_block()
             except Exception as e:
                 self.log("idle scan connect failed:",
                          type(e).__name__, str(e)[:100])
+                self._note_connect_failure(e)
                 if gated:
                     self._note_idle_scan_failure(cs, e)
                 return
@@ -1363,8 +1456,10 @@ class ChannelWorker(threading.Thread):
             if gated:
                 self._note_idle_scan_failure(cs, e)
             return
-        if gated and cs.get("idle_scan_fail_streak"):
-            self.update_cs(idle_scan_fail_streak=0)
+        if gated and (cs.get("idle_scan_fail_streak")
+                      or cs.get("idle_auth_alert_stamp")):
+            self.update_cs(idle_scan_fail_streak=0,
+                           idle_auth_alert_stamp=None)
         if not evs:
             return
         wm = cs.get("idle_push_seq") or 0
@@ -1639,7 +1734,14 @@ class ChannelWorker(threading.Thread):
         rid = f"bridgealert-{int(time.time())}"
         try:
             if live_mode(self.ch):
-                out = {"id": rid, "mode": "send", "text": text}
+                # Gateways read the body from "content" ONLY (every
+                # other bridge outbox writer uses it). This writer
+                # used "text" alone until 2026-10-14, so both gateways
+                # dispatched an EMPTY bubble and still reported
+                # ok=true — the hourly empty messages. Keep "text"
+                # alongside for any older reader.
+                out = {"id": rid, "mode": "send", "content": text,
+                       "text": text}
                 if self.ch == "wecom":
                     cid = (row or {}).get("chatid") or \
                         CFG["channels"][self.ch].get("chatid", "")
@@ -1660,7 +1762,8 @@ class ChannelWorker(threading.Thread):
             else:
                 append_jsonl(os.path.join(BASE, "shadow",
                                           f"{self.ch}-outbox.jsonl"),
-                             {"id": rid, "mode": "send", "text": text})
+                             {"id": rid, "mode": "send",
+                              "content": text, "text": text})
         except Exception as e:
             self.log(f"alert send failed: {str(e)[:80]}")
 
