@@ -384,6 +384,78 @@ def register_cancel(path: Path, msgid: str) -> None:
             fcntl.flock(lock_handle, fcntl.LOCK_UN)
 
 
+def _merge_worker_activity(path: Path, msgids: list[str], now: float,
+                             source: str, run_id: str | None = None,
+                             progress: str | None = None,
+                             hold_secs: float | None = None) -> dict:
+    """Read-merge-write worker_activity.json under a lock.
+
+    The file is the worker's own activity ledger for the death watch
+    (see death_watch_activity.py, source 2/3): ``{msgid: {"ts":
+    epoch, "source": str, "run_id": str|None, "progress": str|None,
+    "hold_until": epoch|None}}``. Records written by older writers
+    (a bare epoch, or a dict without run_id) are preserved as-is
+    apart from the fields this call sets. A corrupt existing file
+    is replaced by a fresh map: the ledger is a liveness hint, not
+    history, and self-healing beats wedging every later write.
+    Returns the records written, keyed by msgid.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name("worker_activity.lock")
+    written: dict = {}
+    with lock_path.open("a+") as lock_handle:
+        fcntl.flock(lock_handle, fcntl.LOCK_EX)
+        try:
+            data = load_json_dict(path)
+            for msgid in msgids:
+                mid = str(msgid)
+                raw = data.get(mid)
+                rec = dict(raw) if isinstance(raw, dict) else {}
+                rec["ts"] = now
+                rec["source"] = source
+                if run_id:
+                    rec["run_id"] = run_id
+                if progress is not None:
+                    rec["progress"] = progress
+                if hold_secs is not None:
+                    if hold_secs > 0:
+                        rec["hold_until"] = now + float(hold_secs)
+                    else:
+                        rec.pop("hold_until", None)
+                data[mid] = rec
+                written[mid] = rec
+            atomic_write_text(path, json.dumps(data, ensure_ascii=False))
+        finally:
+            fcntl.flock(lock_handle, fcntl.LOCK_UN)
+    return written
+
+
+def register_worker_activity(path: Path, msgids: list[str],
+                             run_id: str, now: float) -> dict:
+    """Batch-start self-registration (todo 21, route C mapping a).
+
+    The worker copies the run_id from its own first message header;
+    that run_id is the key the platform-check runbook resolves
+    against agent.agents spawn metadata.
+    """
+    return _merge_worker_activity(
+        path, msgids, now, source="worker-register", run_id=run_id)
+
+
+def update_worker_activity(path: Path, msgid: str, now: float,
+                           progress: str | None = None,
+                           hold_secs: float | None = None) -> dict:
+    """One beat (optionally with progress text) or one hold write.
+
+    hold_secs > 0 declares "I will be silent this long on purpose";
+    hold_secs == 0 clears an earlier declaration.
+    """
+    source = "worker-hold" if hold_secs is not None else "worker-beat"
+    return _merge_worker_activity(
+        path, [msgid], now, source=source, progress=progress,
+        hold_secs=hold_secs)
+
+
 def trim_mapping(items: list[tuple[str, object]], cap: int, pinned: set[str]) -> dict:
     """Keep the newest cap entries, always retaining pinned keys."""
     if len(items) <= cap:
