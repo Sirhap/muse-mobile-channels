@@ -29,6 +29,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 import httpx
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 _REPO = Path(__file__).resolve().parent.parent
 if str(_REPO) not in sys.path:
@@ -40,7 +41,6 @@ from channel_common import (  # noqa: E402
     atomic_write_text,
     complete_jsonl_lines,
     load_json_dict,
-    media_filename,
     media_url_allowed,
     merge_queue_admin,
     muse_home,
@@ -53,6 +53,15 @@ from channel_common import (  # noqa: E402
     waiting_ahead,
     write_offset,
     read_offset,
+)
+from inbound_media import (  # noqa: E402
+    INBOUND_MEDIA_MAX_BYTES,
+    InboundMediaTooLarge,
+    inbound_temp_path,
+    publish_inbound_plaintext,
+    remove_file_quietly,
+    save_inbound_body,
+    stream_pkcs7_decrypt_to_file,
 )
 
 BASE = Path(__file__).resolve().parent
@@ -1390,8 +1399,6 @@ def parse_aes_key(aes_key_b64: str) -> bytes:
 
 
 def aes_ecb_decrypt(data: bytes, key: bytes) -> bytes:
-    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-
     dec = Cipher(algorithms.AES(key), modes.ECB()).decryptor()
     plain = dec.update(data) + dec.finalize()
     if not plain:
@@ -1402,9 +1409,24 @@ def aes_ecb_decrypt(data: bytes, key: bytes) -> bytes:
     return plain[:-pad]
 
 
-def aes_ecb_encrypt(data: bytes, key: bytes) -> bytes:
-    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+def aes_ecb_decrypt_file(src: Path, dst: Path, key: bytes) -> None:
+    """Write the ``aes_ecb_decrypt`` plaintext of ``src`` to ``dst`` without one ciphertext buffer.
 
+    ECB decrypts a block at a time. The streaming helper holds back one
+    block so the PKCS#7 check stays the same predicate as
+    ``aes_ecb_decrypt`` (pad 1..16).
+    """
+    decryptor = Cipher(algorithms.AES(key), modes.ECB()).decryptor()
+    stream_pkcs7_decrypt_to_file(
+        src,
+        dst,
+        decryptor.update,
+        decryptor.finalize,
+        max_pad=16,
+    )
+
+
+def aes_ecb_encrypt(data: bytes, key: bytes) -> bytes:
     pad = 16 - (len(data) % 16)
     padded = data + bytes([pad]) * pad
     enc = Cipher(algorithms.AES(key), modes.ECB()).encryptor()
@@ -2779,25 +2801,32 @@ class Gateway:
             if not media_url_allowed(url):
                 log(f"media {msgid}/{i}: refused non-Tencent url host")
                 continue
+            # Stream onto a temp file and count bytes as they arrive.
+            # Over the cap: log, delete the partial, leave local_path
+            # unset. The caller still records the inbox row.
+            cipher_path = inbound_temp_path(MEDIA_DIR, "cipher")
+            plain_path = inbound_temp_path(MEDIA_DIR, "plain")
             try:
-                r = await client.get(url, timeout=httpx.Timeout(30.0, connect=10.0))
-                r.raise_for_status()
-                data = r.content
-                if len(data) > 25 * 1024 * 1024:
-                    log(f"media {msgid}/{i}: too large ({len(data)} bytes), skipped")
-                    continue
-                plain = aes_ecb_decrypt(data, key)
-                path = MEDIA_DIR / media_filename(msgid, i, sniff_ext(plain))
-                path.write_bytes(plain)
+                async with client.stream(
+                    "GET", url, timeout=httpx.Timeout(30.0, connect=10.0),
+                ) as response:
+                    await save_inbound_body(response, cipher_path, INBOUND_MEDIA_MAX_BYTES)
+                aes_ecb_decrypt_file(cipher_path, plain_path, key)
+                path = publish_inbound_plaintext(plain_path, msgid, i, sniff_ext)
                 m["local_path"] = str(path)
                 if m.get("kind") == "voice":
                     m["format"] = path.suffix.lstrip(".")
                     for k in ("playtime", "sample_rate", "encode_type"):
                         if item.get(k) is not None:
                             m[k] = item[k]
-                log(f"media {msgid}/{i}: saved {path} ({len(plain)} bytes)")
+                log(f"media {msgid}/{i}: saved {path} ({path.stat().st_size} bytes)")
+            except InboundMediaTooLarge as exc:
+                log(f"media {msgid}/{i}: too large ({exc.nbytes} bytes), skipped")
             except Exception as e:
                 log(f"media {msgid}/{i}: download/decrypt failed: {e}")
+            finally:
+                remove_file_quietly(cipher_path)
+                remove_file_quietly(plain_path)
 
     async def _get_typing_ticket(self, client: httpx.AsyncClient, creds: dict,
                                  user_id: str, context_token: str) -> str:
