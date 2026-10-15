@@ -332,6 +332,199 @@ check("wecom late update still suppressed",
       and wc_update.get("ok") is not True
       and wc_update.get("suppressed") is True)
 
+# ------------------------------------------------- fencing: second reply
+# Fencing fix (2026-10-15): the CLI enqueue gate blocks a second
+# formal reply once the first is delivered, but it is fail-open and
+# bypassable (--force, or the >120s no-result window), so dispatch
+# must suppress a second mode="reply" for a msgid that already has
+# a delivered formal reply — exactly one suppressed result row, and
+# nothing reaches the send stub. The first reply, a different
+# msgid's reply, and a reply after a FAILED first reply still
+# deliver; a reply_file after the delivered reply stays exempt.
+F1, F2, F3 = "fence-wx-1", "fence-wx-2", "fence-wx-3"
+sandbox_paths(gw, SBX / "weixin-fence")
+fmedia = SBX / "weixin-fence" / "clip.mp4"
+shutil.copy(clip, fmedia)
+write_outbox(gw, [
+    {"id": "fr1", "mode": "reply", "msgid": F1, "content": "第一份正式回复"},
+    {"id": "fr2", "mode": "reply", "msgid": F1, "content": "第二份正式回复"},
+    {"id": "fr3", "mode": "reply", "msgid": F1, "content": "第三份正式回复"},
+    {"id": "fo", "mode": "reply", "msgid": F2, "content": "另一个问题的正式回复"},
+    {"id": "ff", "mode": "reply_file", "msgid": F1,
+     "file_path": str(fmedia), "content": ""},
+    {"id": "frfail", "mode": "reply", "msgid": F3, "content": "第一次没发出去"},
+    {"id": "frretry", "mode": "reply", "msgid": F3, "content": "重发正式回复"},
+])
+
+sent2 = []
+delivered2 = []
+
+
+async def fake_send_text2(self, client, creds, to, content,
+                          token_ctx="", client_id="",
+                          message_state=2, item_id=""):
+    sent2.append(content)
+    return {"ret": 0}
+
+
+async def fake_deliver2(self, client, creds, to, fpath, token_ctx=""):
+    delivered2.append(fpath)
+    return {"ret": 0}
+
+
+_route = {"from_user_id": "u1", "context_token": "tok", "client_id": "c1"}
+g2 = gw.Gateway.__new__(gw.Gateway)
+g2.context = {F1: dict(_route), F2: dict(_route)}  # F3 routed only later
+g2.feedback_track = {}
+g2.send_text = fake_send_text2.__get__(g2)
+g2._deliver_file = fake_deliver2.__get__(g2)
+g2._typing_best_effort = no_typing.__get__(g2)
+g2.write_status = lambda: None
+
+
+async def dispatch_weixin_fence():
+    out = {}
+    out["fr1"] = await g2.dispatch_outbox_item(
+        None, {}, {"id": "fr1", "mode": "reply", "msgid": F1,
+                   "content": "第一份正式回复"})
+    out["fr2"] = await g2.dispatch_outbox_item(
+        None, {}, {"id": "fr2", "mode": "reply", "msgid": F1,
+                   "content": "第二份正式回复"})
+    out["fr3"] = await g2.dispatch_outbox_item(
+        None, {}, {"id": "fr3", "mode": "reply", "msgid": F1,
+                   "content": "第三份正式回复"})
+    out["fo"] = await g2.dispatch_outbox_item(
+        None, {}, {"id": "fo", "mode": "reply", "msgid": F2,
+                   "content": "另一个问题的正式回复"})
+    out["ff"] = await g2.dispatch_outbox_item(
+        None, {}, {"id": "ff", "mode": "reply_file", "msgid": F1,
+                   "file_path": str(fmedia), "content": ""})
+    out["frfail"] = await g2.dispatch_outbox_item(
+        None, {}, {"id": "frfail", "mode": "reply", "msgid": F3,
+                   "content": "第一次没发出去"})
+    g2.context[F3] = dict(_route)
+    out["frretry"] = await g2.dispatch_outbox_item(
+        None, {}, {"id": "frretry", "mode": "reply", "msgid": F3,
+                   "content": "重发正式回复"})
+    return out
+
+
+fout = asyncio.run(dispatch_weixin_fence())
+fr2_res = result_for(gw, "fr2")
+all_res = read_jsonl(gw.OUTBOX_RESULTS)
+check("weixin fencing: first reply delivers",
+      fout["fr1"] is True and result_for(gw, "fr1").get("ok") is True
+      and "第一份正式回复" in sent2)
+check("weixin fencing: second reply suppressed at dispatch",
+      fout["fr2"] is True and fr2_res is not None
+      and fr2_res.get("ok") is not True
+      and fr2_res.get("suppressed") is True
+      and fr2_res.get("errmsg") == "suppressed: msgid already has a delivered formal reply"
+      and "第二份正式回复" not in sent2)
+check("weixin fencing: second reply accounted exactly once",
+      len([r for r in all_res if r.get("id") == "fr2"]) == 1)
+check("weixin fencing: third reply also suppressed",
+      fout["fr3"] is True and result_for(gw, "fr3").get("suppressed") is True
+      and "第三份正式回复" not in sent2)
+check("weixin fencing: different msgid reply still delivers",
+      fout["fo"] is True and result_for(gw, "fo").get("ok") is True
+      and "另一个问题的正式回复" in sent2)
+check("weixin fencing: reply_file after delivered reply still exempt",
+      fout["ff"] is True and result_for(gw, "ff").get("ok") is True
+      and not result_for(gw, "ff").get("suppressed")
+      and delivered2 == [str(fmedia)])
+check("weixin fencing: reply after a FAILED first reply still delivers",
+      result_for(gw, "frfail").get("ok") is not True
+      and fout["frretry"] is True
+      and result_for(gw, "frretry").get("ok") is True
+      and "重发正式回复" in sent2)
+
+
+# ------------------------------------------------- fencing: wecom mirror
+W1, W2, W3 = "fence-wc-1", "fence-wc-2", "fence-wc-3"
+sandbox_paths(wc, SBX / "wecom-fence")
+wfmedia = SBX / "wecom-fence" / "clip.mp4"
+shutil.copy(clip, wfmedia)
+write_outbox(wc, [
+    {"id": "wr1", "mode": "reply", "msgid": W1, "content": "第一份正式回复"},
+    {"id": "wr2", "mode": "reply", "msgid": W1, "content": "第二份正式回复"},
+    {"id": "wo", "mode": "reply", "msgid": W2, "content": "另一个问题的正式回复"},
+    {"id": "wf", "mode": "reply_file", "msgid": W1,
+     "file_path": str(wfmedia), "content": ""},
+    {"id": "wrfail", "mode": "reply", "msgid": W3, "content": "第一次没发出去"},
+    {"id": "wrretry", "mode": "reply", "msgid": W3, "content": "重发正式回复"},
+])
+
+wc_sent2 = []
+wc_uploaded2 = []
+
+
+async def fake_respond2(self, req_id, body):
+    wc_sent2.append(body)
+    return {"errcode": 0, "errmsg": ""}
+
+
+async def fake_upload2(self, data, mtype, name):
+    wc_uploaded2.append(name)
+    return "media-1"
+
+
+w2 = wc.Gateway.__new__(wc.Gateway)
+w2.reqmap = {W1: {"req_id": "req-w1", "stream_id": "stream-w1"},
+             W2: {"req_id": "req-w2", "stream_id": "stream-w2"}}
+w2.msgs_sent = 0
+w2.open_streams = {W1: {"stream_id": "stream-w1"},
+                   W2: {"stream_id": "stream-w2"}}
+w2.feedback_track = {}
+w2.respond = fake_respond2.__get__(w2)
+w2.upload_media = fake_upload2.__get__(w2)
+w2.write_status = lambda: None
+
+
+async def dispatch_wecom_fence():
+    out = {}
+    out["wr1"] = await w2.dispatch_outbox_item(
+        {"id": "wr1", "mode": "reply", "msgid": W1, "content": "第一份正式回复"})
+    out["wr2"] = await w2.dispatch_outbox_item(
+        {"id": "wr2", "mode": "reply", "msgid": W1, "content": "第二份正式回复"})
+    out["wo"] = await w2.dispatch_outbox_item(
+        {"id": "wo", "mode": "reply", "msgid": W2, "content": "另一个问题的正式回复"})
+    out["wf"] = await w2.dispatch_outbox_item(
+        {"id": "wf", "mode": "reply_file", "msgid": W1,
+         "file_path": str(wfmedia), "content": ""})
+    out["wrfail"] = await w2.dispatch_outbox_item(
+        {"id": "wrfail", "mode": "reply", "msgid": W3, "content": "第一次没发出去"})
+    w2.reqmap[W3] = {"req_id": "req-w3", "stream_id": "stream-w3"}
+    w2.open_streams[W3] = {"stream_id": "stream-w3"}
+    out["wrretry"] = await w2.dispatch_outbox_item(
+        {"id": "wrretry", "mode": "reply", "msgid": W3, "content": "重发正式回复"})
+    return out
+
+
+wout = asyncio.run(dispatch_wecom_fence())
+wr2_res = result_for(wc, "wr2")
+wc_all_res = read_jsonl(wc.OUTBOX_RESULTS)
+check("wecom fencing: first reply delivers",
+      wout["wr1"] is True and result_for(wc, "wr1").get("ok") is True
+      and len(wc_sent2) >= 1)
+check("wecom fencing: second reply suppressed at dispatch",
+      wout["wr2"] is True and wr2_res is not None
+      and wr2_res.get("ok") is not True
+      and wr2_res.get("suppressed") is True
+      and wr2_res.get("errmsg") == "suppressed: msgid already has a delivered formal reply")
+check("wecom fencing: second reply accounted exactly once",
+      len([r for r in wc_all_res if r.get("id") == "wr2"]) == 1)
+check("wecom fencing: different msgid reply still delivers",
+      wout["wo"] is True and result_for(wc, "wo").get("ok") is True)
+check("wecom fencing: reply_file after delivered reply still exempt",
+      wout["wf"] is True and result_for(wc, "wf").get("ok") is True
+      and not result_for(wc, "wf").get("suppressed")
+      and wc_uploaded2 == [wfmedia.name])
+check("wecom fencing: reply after a FAILED first reply still delivers",
+      result_for(wc, "wrfail").get("ok") is not True
+      and wout["wrretry"] is True
+      and result_for(wc, "wrretry").get("ok") is True)
+
 fails = [name for name, ok in RESULTS if not ok]
 print(f"\n== {len(RESULTS) - len(fails)}/{len(RESULTS)} passed ==")
 sys.exit(1 if fails else 0)

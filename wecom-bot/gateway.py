@@ -1900,7 +1900,8 @@ class Gateway:
         mirroring the weixin channel): True when an outbox row queued
         BEFORE this item is a formal reply or reply_file for the same
         msgid whose delivery result is ok. Dispatch uses this to drop
-        a late progress update. It does not drop reply_file: the
+        a late progress update — and, since the 2026-10-15 fencing
+        fix, a second formal reply. It does not drop reply_file: the
         bridge queues the media row after the text reply for the same
         msgid, and that file is part of the answer. Only rows before
         this item count, so an update queued before its reply (normal
@@ -3425,10 +3426,19 @@ class Gateway:
             log(f"outbox {mode} {item_id}: skipped, cancelled msgid={_mid}")
             return True
         # Progress updates after a delivered formal reply are late
-        # duplicates. reply_file is the media that belongs with that
-        # reply (bridge writes text, then file0..fileN) and must still
-        # be sent. Same rule as the Weixin gateway.
-        if mode in ("update", "reply_notice") and _mid and self._delivered_reply_before(item):
+        # duplicates. A second formal reply for the same msgid is a
+        # late duplicate too (fencing fix, 2026-10-15): a formal
+        # reply is singular per msgid — the CLI enqueue gate blocks
+        # a second one once the first is delivered and supplements
+        # go via "send" — so a racing duplicate that still reached
+        # the outbox (--force, the gate's fail-open read, or the
+        # >120s no-result window) is suppressed here instead of
+        # double-delivering. reply_file is the media that belongs
+        # with that reply (bridge writes text, then file0..fileN —
+        # several reply_file rows per msgid are one answer and
+        # cannot be told apart from a duplicate by mode+msgid), so
+        # it must still be sent. Same rule as the Weixin gateway.
+        if mode in ("update", "reply_notice", "reply") and _mid and self._delivered_reply_before(item):
             result["errmsg"] = "suppressed: msgid already has a delivered formal reply"
             result["suppressed"] = True
             self.append_jsonl(OUTBOX_RESULTS, result)
