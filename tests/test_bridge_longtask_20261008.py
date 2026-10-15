@@ -492,7 +492,12 @@ check("G second history delta inside 60s sends no extra notice",
 check("G throttled history delta stays pending",
       saved.get("history_dirty") is True)
 st = nb.load_state()
+# 2026-10-15: the event throttle now measures from the shared
+# last_prog_at, so simulating "throttle elapsed" rewinds it too
+# (the check below is unchanged).
 st["channels"]["weixin"]["turns"][0]["last_event_prog"] = \
+    int(time.time()) - nb.LT_EVENT_PROG_MIN_SECS - 1
+st["channels"]["weixin"]["turns"][0]["last_prog_at"] = \
     int(time.time()) - nb.LT_EVENT_PROG_MIN_SECS - 1
 nb.save_state(st)
 w.step(str(spool), None)

@@ -937,7 +937,8 @@ class ChannelWorker(threading.Thread):
                 "reply_delivered": False, "cursor_seq": baseline,
                 "last_reply_at": 0, "trailing_since": 0,
                 "activity_dirty": False, "history_dirty": False,
-                "hist_seen_seq": baseline, "last_event_prog": 0}
+                "hist_seen_seq": baseline, "last_event_prog": 0,
+                "last_prog_at": 0}
         self.log(f"turn sent msgid={row['msgid']} "
                  f"baseline={baseline}")
         return turn
@@ -1000,6 +1001,18 @@ class ChannelWorker(threading.Thread):
                    "chat_type": 2 if turn.get("chattype") == "group" else 1,
                    "content": text, "queued_at": int(time.time())}
         else:
+            return
+        # Idempotency backstop (2026-10-15): the formal-reply and
+        # idle-push write paths both check outbox_already_has before
+        # appending; this path did not, and step()'s timed + LT2
+        # event triggers could land in the same minute bucket and
+        # queue the same rid twice (live dupe: Weixin
+        # bridgeprog-75163870-0 written and delivered twice,
+        # 2026-10-15 14:39). One notice per (turn, minute bucket):
+        # a rid already in the outbox means this bubble exists.
+        if outbox_already_has(self.ch, rid):
+            self.log(f"progress notice deduped msgid={turn['msgid']} "
+                     f"rid={rid}")
             return
         append_jsonl(outbox_path(self.ch), out)
         self.log(f"progress notice msgid={turn['msgid']} age={age}s")
@@ -1583,7 +1596,8 @@ class ChannelWorker(threading.Thread):
                 if ts is not None:
                     last = max(last, ts)
                     break
-            for key in ("last_event_prog", "last_reply_at"):
+            for key in ("last_event_prog", "last_prog_at",
+                        "last_reply_at"):
                 v = t.get(key)
                 if isinstance(v, (int, float)) and v:
                     last = max(last, float(v))
@@ -1701,25 +1715,43 @@ class ChannelWorker(threading.Thread):
                     # and the 2s history poll from spamming.
                     # Applies only while the formal reply is still
                     # outstanding (see reply_delivered above).
+                    #
+                    # Shared throttle (2026-10-15): both trigger
+                    # paths measure from the SAME last_prog_at —
+                    # the last progress notice this turn actually
+                    # queued, whichever path fired it — and each
+                    # path's own minimum gap applies on top of it
+                    # (PROG_EVERY_SECS for the timer,
+                    # LT_EVENT_PROG_MIN_SECS for events). The two
+                    # paths used to keep separate clocks (next_prog
+                    # vs last_event_prog, the latter starting at 0),
+                    # so a timed notice and an event notice ~14s
+                    # apart stacked the same 「约 1 分钟」 bubble
+                    # twice (live dupe bridgeprog-75163870-0,
+                    # 2026-10-15 14:39). Legacy turns without
+                    # last_prog_at fall back to last_event_prog.
                     fired = False
+                    now_i = int(time.time())
+                    last_prog = turn.get("last_prog_at") \
+                        or turn.get("last_event_prog") or 0
                     event_dirty = turn.get("activity_dirty") \
                         or turn.get("history_dirty")
                     if longtask_mode(ch) and event_dirty \
-                            and time.time() - \
-                            (turn.get("last_event_prog") or 0) \
+                            and now_i - last_prog \
                             >= LT_EVENT_PROG_MIN_SECS:
                         turn["activity_dirty"] = False
                         turn["history_dirty"] = False
-                        turn["last_event_prog"] = int(time.time())
-                        turn["next_prog"] = int(time.time()) \
-                            + PROG_EVERY_SECS
+                        turn["last_event_prog"] = now_i
+                        turn["last_prog_at"] = now_i
+                        turn["next_prog"] = now_i + PROG_EVERY_SECS
                         prog_dirty = True
                         self.progress_notice(turn, age)
                         fired = True
                     if not fired and age >= PROG_FIRST_SECS \
-                            and time.time() >= nxt:
-                        turn["next_prog"] = int(time.time()) \
-                            + PROG_EVERY_SECS
+                            and time.time() >= nxt \
+                            and now_i - last_prog >= PROG_EVERY_SECS:
+                        turn["next_prog"] = now_i + PROG_EVERY_SECS
+                        turn["last_prog_at"] = now_i
                         prog_dirty = True
                         self.progress_notice(turn, age)
                     alive.append(turn)
