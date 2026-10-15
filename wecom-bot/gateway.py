@@ -58,7 +58,6 @@ from channel_common import (  # noqa: E402
     append_jsonl as append_jsonl_line,
     complete_jsonl_lines,
     load_json_dict,
-    media_filename,
     merge_queue_admin,
     muse_home,
     outbound_file_allowed,
@@ -70,6 +69,15 @@ from channel_common import (  # noqa: E402
     waiting_ahead,
     atomic_write_text,
     write_offset,
+)
+from inbound_media import (  # noqa: E402
+    INBOUND_MEDIA_MAX_BYTES,
+    InboundMediaTooLarge,
+    inbound_temp_path,
+    publish_inbound_plaintext,
+    remove_file_quietly,
+    save_inbound_body,
+    stream_pkcs7_decrypt_to_file,
 )
 
 _WECOM_DIR = Path(__file__).resolve().parent
@@ -327,15 +335,24 @@ def split_chunks(text: str, limit: int = CHUNK_LIMIT) -> list[str]:
     return chunks
 
 
-def decrypt_wecom_media(data: bytes, aeskey_b64: str) -> bytes:
-    """AES-256-CBC; key = base64decode(aeskey), IV = first 16 key bytes,
-    PKCS#7 padding to a 32-byte block (per the official SDK's decryptFile)."""
+def _decode_wecom_aes_key(aeskey_b64: str) -> bytes:
+    """AES key from a WeCom media callback.
+
+    Padding characters are restored first. The urlsafe alphabet is only
+    the fallback, matching the historical ``decrypt_wecom_media`` path.
+    """
     key_arg = aeskey_b64.strip()
     key_arg += "=" * (-len(key_arg) % 4)  # callbacks may strip b64 padding
     try:
-        key = base64.b64decode(key_arg)
+        return base64.b64decode(key_arg)
     except Exception:
-        key = base64.urlsafe_b64decode(key_arg)
+        return base64.urlsafe_b64decode(key_arg)
+
+
+def decrypt_wecom_media(data: bytes, aeskey_b64: str) -> bytes:
+    """AES-256-CBC; key = base64decode(aeskey), IV = first 16 key bytes,
+    PKCS#7 padding to a 32-byte block (per the official SDK's decryptFile)."""
+    key = _decode_wecom_aes_key(aeskey_b64)
     iv = key[:16]
     decryptor = Cipher(algorithms.AES(key), modes.CBC(iv)).decryptor()
     plain = decryptor.update(data) + decryptor.finalize()
@@ -345,6 +362,23 @@ def decrypt_wecom_media(data: bytes, aeskey_b64: str) -> bytes:
     if pad < 1 or pad > 32 or pad > len(plain) or plain[-pad:] != bytes([pad]) * pad:
         raise ValueError(f"bad PKCS#7 padding: {pad}")
     return plain[:-pad]
+
+
+def decrypt_wecom_media_file(src: Path, dst: Path, aeskey_b64: str) -> None:
+    """Write ``decrypt_wecom_media`` to ``dst`` without one ciphertext buffer.
+
+    CBC still runs in order; the decryptor keeps the previous ciphertext
+    block. Padding may be 32 bytes, so that tail is what stays in memory.
+    """
+    key = _decode_wecom_aes_key(aeskey_b64)
+    decryptor = Cipher(algorithms.AES(key), modes.CBC(key[:16])).decryptor()
+    stream_pkcs7_decrypt_to_file(
+        src,
+        dst,
+        decryptor.update,
+        decryptor.finalize,
+        max_pad=32,
+    )
 
 
 def sniff_ext(data: bytes) -> str:
@@ -2921,24 +2955,34 @@ class Gateway:
                 continue
             last_error: Exception | None = None
             for _attempt in range(3):
+                # Stream onto a temp file and count bytes as they arrive.
+                # Over the cap is not a retry: log, delete the partial,
+                # leave local_path unset. The caller still records the row.
+                cipher_path = inbound_temp_path(MEDIA_DIR, "cipher")
+                plain_path = inbound_temp_path(MEDIA_DIR, "plain")
                 try:
-                    r = await client.get(url, timeout=httpx.Timeout(20.0, connect=10.0))
-                    r.raise_for_status()
-                    data = r.content
-                    if len(data) > 25 * 1024 * 1024:
-                        log(f"media {msgid}/{i}: too large ({len(data)} bytes), skipped")
-                        last_error = None
-                        break
-                    plain = decrypt_wecom_media(data, aeskey)
-                    path = MEDIA_DIR / media_filename(msgid, i, sniff_ext(plain))
-                    path.write_bytes(plain)
+                    async with client.stream(
+                        "GET", url, timeout=httpx.Timeout(20.0, connect=10.0),
+                    ) as response:
+                        await save_inbound_body(
+                            response, cipher_path, INBOUND_MEDIA_MAX_BYTES,
+                        )
+                    decrypt_wecom_media_file(cipher_path, plain_path, aeskey)
+                    path = publish_inbound_plaintext(plain_path, msgid, i, sniff_ext)
                     m["local_path"] = str(path)
-                    log(f"media {msgid}/{i}: saved {path} ({len(plain)} bytes)")
+                    log(f"media {msgid}/{i}: saved {path} ({path.stat().st_size} bytes)")
+                    last_error = None
+                    break
+                except InboundMediaTooLarge as exc:
+                    log(f"media {msgid}/{i}: too large ({exc.nbytes} bytes), skipped")
                     last_error = None
                     break
                 except Exception as e:
                     last_error = e
                     await asyncio.sleep(1)
+                finally:
+                    remove_file_quietly(cipher_path)
+                    remove_file_quietly(plain_path)
             if last_error is not None:
                 log(f"media {msgid}/{i}: download/decrypt failed: {last_error!r}")
 
