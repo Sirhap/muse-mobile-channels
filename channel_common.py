@@ -507,3 +507,368 @@ def waiting_ahead(pending_ids, in_service_ids) -> int:
 def chunk_slices(chunks: list[str], start: int) -> list[tuple[int, str]]:
     """(index, text) pairs at and after start."""
     return [(index, part) for index, part in enumerate(chunks) if index >= start]
+
+
+# --- pending answers (one ledger for every unanswered path) -----------
+# covered-drop, fail-stop, and bridge fallback used to leave three
+# different traces. The sweep could only see covered_drops.jsonl.
+# All three now record here, under the same lock and atomic replace
+# as worker_activity.json. covered_drops.jsonl is unchanged.
+
+PENDING_ANSWER_SOURCES = ("covered-drop", "fail-stop", "bridge-fallback")
+PENDING_SUMMARY_MAX = 80
+PENDING_SUMMARY_EMPTY = "（无文字消息）"
+PENDING_ANSWER_EXPOSE_SECS = 12 * 3600
+FORMAL_REPLY_MODES = ("reply", "reply_file")
+
+
+class PendingLedgerError(ValueError):
+    """The ledger file exists but is not a JSON object.
+
+    The writer does not replace it. The report fails closed so a
+    corrupt file is not announced as "nothing unanswered".
+    """
+
+
+def question_summary(text: str, limit: int = PENDING_SUMMARY_MAX) -> str:
+    """One line of the user's question, capped for the sweep report."""
+    sample = " ".join(str(text or "").split())
+    if not sample:
+        return PENDING_SUMMARY_EMPTY
+    if len(sample) <= limit:
+        return sample
+    return sample[:limit]
+
+
+def pending_answers_path(explicit: str | os.PathLike[str] | None = None) -> Path:
+    """Shared ledger path.
+
+    Hooks pass the sibling of their own state directory, which is
+    ``$HOME/hooks/state/pending_answers.json``. The bridge, whose unit
+    sets ``HOME=/home/hatch``, resolves the same file through here.
+    ``PENDING_ANSWERS_PATH`` overrides both.
+    """
+    if explicit is not None and str(explicit).strip():
+        return Path(explicit)
+    env = os.environ.get("PENDING_ANSWERS_PATH", "").strip()
+    if env:
+        return Path(env)
+    home = os.environ.get("HOME", "").strip()
+    if home and home != "/root":
+        return Path(home) / "hooks" / "state" / "pending_answers.json"
+    return muse_home() / "hooks" / "state" / "pending_answers.json"
+
+
+def pending_answers_dismissed_path(ledger: str | os.PathLike[str]) -> Path:
+    """Sibling file the sweep reads when the user has written a msgid off."""
+    path = Path(ledger)
+    return path.with_name("pending_answers_dismissed.json")
+
+
+def load_pending_ledger(path: str | os.PathLike[str]) -> dict:
+    """Channel map ``{channel: {msgid: {source, ts, summary}}}``.
+
+    A missing file is an empty map. A present file that is not a JSON
+    object raises PendingLedgerError.
+    """
+    ledger = Path(path)
+    if not ledger.exists():
+        return {}
+    try:
+        raw = ledger.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise PendingLedgerError(str(ledger)) from exc
+    if not raw.strip():
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise PendingLedgerError(str(ledger)) from exc
+    if not isinstance(data, dict):
+        raise PendingLedgerError(str(ledger))
+    return data
+
+
+def _prepare_pending_row(row: dict) -> dict | None:
+    """Normalized row, or None when channel or msgid is blank."""
+    channel = str(row.get("channel") or "").strip()
+    msgid = str(row.get("msgid") or "").strip()
+    source = str(row.get("source") or "").strip()
+    if source not in PENDING_ANSWER_SOURCES:
+        raise ValueError(f"unknown pending-answer source {source!r}")
+    if not channel or not msgid:
+        return None
+    stamp = row.get("ts")
+    if isinstance(stamp, bool) or not isinstance(stamp, (int, float)):
+        stamp = time.time()
+    summary = row.get("summary")
+    if summary is None:
+        summary = row.get("text") or ""
+    return {
+        "channel": channel,
+        "msgid": msgid,
+        "source": source,
+        "ts": float(stamp),
+        "summary": question_summary(str(summary)),
+    }
+
+
+def record_pending_answers(path: str | os.PathLike[str], rows: list[dict]) -> int:
+    """Insert or update pending-answer rows. Returns how many changed.
+
+    The first sighting of a msgid keeps its timestamp. A later path
+    for the same msgid replaces ``source`` (and a non-empty summary)
+    and leaves that timestamp. The same source twice is a no-op.
+    A corrupt ledger is left untouched and raises PendingLedgerError.
+    """
+    prepared = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        item = _prepare_pending_row(row)
+        if item is not None:
+            prepared.append(item)
+    if not prepared:
+        return 0
+    ledger = Path(path)
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = ledger.with_name(ledger.name + ".lock")
+    changed = 0
+    with lock_path.open("a+") as lock_handle:
+        fcntl.flock(lock_handle, fcntl.LOCK_EX)
+        try:
+            data = load_pending_ledger(ledger)
+            for item in prepared:
+                channel_rows = data.get(item["channel"])
+                if not isinstance(channel_rows, dict):
+                    channel_rows = {}
+                    data[item["channel"]] = channel_rows
+                previous = channel_rows.get(item["msgid"])
+                if isinstance(previous, dict) and previous.get("source"):
+                    if previous.get("source") == item["source"]:
+                        continue
+                    previous["source"] = item["source"]
+                    if item["summary"] != PENDING_SUMMARY_EMPTY:
+                        previous["summary"] = item["summary"]
+                    changed += 1
+                    continue
+                channel_rows[item["msgid"]] = {
+                    "source": item["source"],
+                    "ts": item["ts"],
+                    "summary": item["summary"],
+                }
+                changed += 1
+            if changed:
+                atomic_write_text(
+                    ledger, json.dumps(data, ensure_ascii=False) + "\n")
+        finally:
+            fcntl.flock(lock_handle, fcntl.LOCK_UN)
+    return changed
+
+
+def _jsonl_dicts(path: Path) -> list[dict]:
+    """JSON objects from a jsonl file. Missing or unreadable is empty."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return []
+    rows: list[dict] = []
+    for line in text.splitlines():
+        parsed = parse_jsonl_line(line.encode("utf-8"))
+        if not parsed or parsed.get("__invalid__"):
+            continue
+        rows.append(parsed)
+    return rows
+
+
+def delivered_formal_msgids(state_dir: str | os.PathLike[str]) -> set[str]:
+    """Msgids whose formal reply or reply_file was delivered ok=true.
+
+    Result rows name the outbox id. The msgid is taken from the result
+    when it carries one, otherwise from the outbox row with that id.
+    A delivered unbound ``send`` (stall notice, stop notice) is not an
+    answer to the question.
+    """
+    state = Path(state_dir)
+    id_to_msgid: dict[str, str] = {}
+    for row in _jsonl_dicts(state / "outbox.jsonl"):
+        row_id = str(row.get("id") or "")
+        if row_id:
+            id_to_msgid[row_id] = str(row.get("msgid") or "")
+    answered: set[str] = set()
+    for row in _jsonl_dicts(state / "outbox_results.jsonl"):
+        if row.get("ok") is not True:
+            continue
+        if row.get("mode") not in FORMAL_REPLY_MODES:
+            continue
+        msgid = str(row.get("msgid") or "")
+        if not msgid:
+            msgid = id_to_msgid.get(str(row.get("id") or ""), "")
+        if msgid:
+            answered.add(msgid)
+    return answered
+
+
+def _inbox_texts(state_dir: Path) -> dict[str, str]:
+    """Latest inbox text for each msgid. Missing inbox is an empty map."""
+    texts: dict[str, str] = {}
+    for row in _jsonl_dicts(state_dir / "inbox.jsonl"):
+        msgid = str(row.get("msgid") or "")
+        if msgid:
+            texts[msgid] = str(row.get("text") or "")
+    return texts
+
+
+def _legacy_covered_rows(
+    channel: str,
+    hook_dir: Path,
+    texts: dict[str, str],
+) -> list[dict]:
+    """covered_drops.jsonl rows not yet copied into the ledger.
+
+    Read-only. The historical file stays the audit log it already is.
+    """
+    rows: list[dict] = []
+    for record in _jsonl_dicts(hook_dir / "covered_drops.jsonl"):
+        stamp = record.get("ts")
+        if isinstance(stamp, bool) or not isinstance(stamp, (int, float)):
+            continue
+        msgids = record.get("msgids")
+        if not isinstance(msgids, list):
+            continue
+        for raw in msgids:
+            msgid = str(raw or "").strip()
+            if not msgid:
+                continue
+            rows.append({
+                "channel": channel,
+                "msgid": msgid,
+                "source": "covered-drop",
+                "ts": float(stamp),
+                "summary": question_summary(texts.get(msgid, "")),
+            })
+    return rows
+
+
+def load_dismissed_msgids(path: str | os.PathLike[str] | None) -> set[tuple[str, str]]:
+    """``(channel, msgid)`` pairs the user wrote off.
+
+    A missing file dismisses nothing. A corrupt file dismisses nothing:
+    hiding a still-unanswered question because the write-off file is
+    unreadable would repeat the original gap.
+    """
+    if path is None:
+        return set()
+    dismissed = Path(path)
+    if not dismissed.exists():
+        return set()
+    try:
+        data = json.loads(dismissed.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return set()
+    if not isinstance(data, dict):
+        return set()
+    found: set[tuple[str, str]] = set()
+    for channel, msgids in data.items():
+        if not isinstance(msgids, list):
+            continue
+        for raw in msgids:
+            msgid = str(raw or "").strip()
+            if msgid:
+                found.add((str(channel), msgid))
+    return found
+
+
+def _ledger_items(data: dict) -> list[dict]:
+    """Flat rows from a ledger object. Odd shapes are skipped."""
+    items: list[dict] = []
+    for channel, msgids in data.items():
+        if not isinstance(msgids, dict):
+            continue
+        for msgid, record in msgids.items():
+            if not isinstance(record, dict):
+                continue
+            source = str(record.get("source") or "")
+            stamp = record.get("ts")
+            if source not in PENDING_ANSWER_SOURCES:
+                continue
+            if isinstance(stamp, bool) or not isinstance(stamp, (int, float)):
+                continue
+            msgid_text = str(msgid or "").strip()
+            channel_text = str(channel or "").strip()
+            if not channel_text or not msgid_text:
+                continue
+            items.append({
+                "channel": channel_text,
+                "msgid": msgid_text,
+                "source": source,
+                "ts": float(stamp),
+                "summary": question_summary(str(record.get("summary") or "")),
+            })
+    return items
+
+
+def summarize_pending_answers(
+    ledger: str | os.PathLike[str],
+    *,
+    state_dirs: dict[str, str | os.PathLike[str]] | None = None,
+    hook_dirs: dict[str, str | os.PathLike[str]] | None = None,
+    now: float | None = None,
+    min_age_secs: float = 0.0,
+    dismissed_path: str | os.PathLike[str] | None = None,
+) -> dict[str, list[dict]]:
+    """Unanswered questions, grouped by channel. Does not write.
+
+    Each item is ``msgid``, ``source``, ``ts``, ``summary``. ``ts`` is
+    when the msgid first landed on the ledger. ``source`` is the latest
+    path that recorded it (``covered-drop``, ``fail-stop``, or
+    ``bridge-fallback``).
+
+    A msgid drops out once ``state_dirs[channel]`` shows an ok=true
+    formal reply, once it is listed in the dismiss file, or while it
+    is younger than ``min_age_secs``. The sweep passes
+    ``PENDING_ANSWER_EXPOSE_SECS``. Historical covered_drops.jsonl
+    rows are folded in from ``hook_dirs`` when that msgid is not
+    already on the ledger; the question text is read from that
+    channel's inbox.jsonl.
+    """
+    data = load_pending_ledger(ledger)
+    items = _ledger_items(data)
+    present = {(item["channel"], item["msgid"]) for item in items}
+    states = {key: Path(value) for key, value in (state_dirs or {}).items()}
+    for channel, hook_dir in (hook_dirs or {}).items():
+        texts = _inbox_texts(states[channel]) if channel in states else {}
+        for item in _legacy_covered_rows(channel, Path(hook_dir), texts):
+            key = (item["channel"], item["msgid"])
+            if key in present:
+                continue
+            items.append(item)
+            present.add(key)
+    moment = time.time() if now is None else float(now)
+    dismissed = load_dismissed_msgids(dismissed_path)
+    answered = {
+        channel: delivered_formal_msgids(state)
+        for channel, state in states.items()
+    }
+    grouped: dict[str, list[dict]] = {}
+    for item in items:
+        channel = item["channel"]
+        msgid = item["msgid"]
+        if (channel, msgid) in dismissed:
+            continue
+        if msgid in answered.get(channel, set()):
+            continue
+        if moment - item["ts"] < min_age_secs:
+            continue
+        grouped.setdefault(channel, []).append({
+            "msgid": msgid,
+            "source": item["source"],
+            "ts": item["ts"],
+            "summary": item["summary"],
+        })
+    report: dict[str, list[dict]] = {}
+    for channel in sorted(grouped):
+        rows = grouped[channel]
+        rows.sort(key=lambda row: (row["ts"], row["msgid"]))
+        report[channel] = rows
+    return report

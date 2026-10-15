@@ -105,3 +105,21 @@ channel-restore/liveness-probe.sh --ssh hatch@<vm-ssh-target>
 ```sh
 bash channel-restore/liveness-probe.sh --self-test
 ```
+
+## 漏答问题巡检
+
+微信 hook、企微 hook、原生桥共用一份清单：`$HOME/hooks/state/pending_answers.json`（桥的 unit 把 `HOME` 和 `MUSE_HOME` 都设成 `/home/hatch`，与 hook 的 `$HOME/hooks/state` 是同一个文件）。三条路径在产生时各写入一条记录，加锁后整文件原子替换。同一 msgid 保留第一次写入的时间，后来的路径只更新 `source`。
+
+`covered-drop` 是判死路由里被同会话后续回复盖住、静默丢弃的原问题。`covered_drops.jsonl` 仍按原来的字段追加，这份清单不代替它。`fail-stop` 是二次判死已经取消 msgid、准备发停止通知的时候。`bridge-fallback` 是桥在回合发出前回退到冷通道收件箱的时候；冷通道若随后送达正式答复，下面的报告会把它去掉。
+
+巡检只读，不改清单，不改 outbox，不改销账文件：
+
+```sh
+python3 /home/hatch/workspace/ops/pending_answers_report.py
+```
+
+默认只列出距第一次落表已满 12 小时、并且该 msgid 还没有 `ok=true` 正式答复（`reply` 或 `reply_file`）的项。输出按渠道分组，每项是 msgid、source、ts、问题摘要。送达的停止通知和久等提醒是不带这条 msgid 的 `send`，不会把问题从报告里划掉。
+
+用户销账放在同目录 `pending_answers_dismissed.json`，形如 `{"weixin": ["msgid"], "wecom": []}`。报告会读它。没有这个文件就没有任何销账。文件坏了则不隐藏任何 msgid。
+
+存量 `covered_drops.jsonl` 不搬进清单。默认报告在读的时候把还没进清单的 msgid 并进来，摘要从该渠道 `inbox.jsonl` 取。清单本身损坏时命令以退出码 2 结束，不能把坏账读成「没有漏答」。
