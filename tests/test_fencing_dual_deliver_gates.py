@@ -28,6 +28,12 @@ REAL_CHANNELS = ("weixin", "wecom", "production", "prod", "hatch", "live", "both
 BAD_SWITCHES = ("", "0", "true", "yes", "1 ", "on")
 RESULTS: list[tuple[str, bool]] = []
 BEFORE_SNAPS = set(Path("/tmp").glob("fencing-dual-deliver-snap-*"))
+WATCHED_PATHS = (
+    Path("/home/hatch"),
+    REPO / "weixin-bot" / "state",
+    REPO / "wecom-bot" / "state",
+)
+BEFORE_PATHS = {p: p.exists() for p in WATCHED_PATHS}
 
 
 def check(name: str, cond: bool) -> None:
@@ -138,7 +144,7 @@ def test_path_override_refused() -> None:
         proc.returncode == 2
         and "FENCING_STATE_DIR" in proc.stderr
         and "渠道门拒绝" in proc.stderr
-        and not target.exists(),
+        and target.exists() == BEFORE_PATHS[target],
     )
 
 
@@ -250,9 +256,20 @@ def test_workspace_untouched() -> None:
     """The suite must not leave a plant, a snapshot, or a channel state dir."""
     after = set(Path("/tmp").glob("fencing-dual-deliver-snap-*"))
     check("no new snapshot directory", after == BEFORE_SNAPS)
-    check("hatch home still absent", not Path("/home/hatch").exists())
-    check("weixin state dir still absent", not (REPO / "weixin-bot" / "state").exists())
-    check("wecom state dir still absent", not (REPO / "wecom-bot" / "state").exists())
+    check(
+        "hatch home unchanged",
+        Path("/home/hatch").exists() == BEFORE_PATHS[Path("/home/hatch")],
+    )
+    check(
+        "weixin state dir unchanged",
+        (REPO / "weixin-bot" / "state").exists()
+        == BEFORE_PATHS[REPO / "weixin-bot" / "state"],
+    )
+    check(
+        "wecom state dir unchanged",
+        (REPO / "wecom-bot" / "state").exists()
+        == BEFORE_PATHS[REPO / "wecom-bot" / "state"],
+    )
 
 
 def main() -> int:
