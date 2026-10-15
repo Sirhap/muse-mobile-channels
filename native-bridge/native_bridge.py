@@ -25,7 +25,7 @@ this directory; otherwise shadow (outbox/inbox writes go to shadow/).
 Credentials: env NATIVE_TOKEN_JSON, else cookies.txt + vm_id.txt in
 ~/.config/native-bridge/ (auto-renew, primary), else token.json there.
 """
-import hashlib, json, os, sys, threading, time, traceback
+import hashlib, importlib.util, json, os, sys, threading, time, traceback
 from datetime import datetime, timezone
 
 BASE = "/home/hatch/workspace/native-bridge"
@@ -465,6 +465,64 @@ def connect():
     raise RuntimeError("no native credential (cookies.txt or token.json)")
 
 
+def _load_channel_common():
+    """Shared ledger helpers, or None when the file cannot be loaded.
+
+    This process is started from native-bridge/ and the bridge tests
+    exec the file without putting the repo root on sys.path, so a
+    plain import of channel_common would fail in both places. The
+    ledger is optional: fallback still delivers the inbox row when
+    the helper is missing.
+    """
+    path = os.environ.get("CHANNEL_COMMON_PY", "").strip()
+    if not path:
+        here = globals().get("__file__")
+        if not here:
+            return None
+        path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(here))),
+            "channel_common.py")
+    if not os.path.isfile(path):
+        return None
+    spec = importlib.util.spec_from_file_location("muse_channel_common", path)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+try:
+    _CHANNEL_COMMON = _load_channel_common()
+except Exception:
+    _CHANNEL_COMMON = None
+
+
+def _note_bridge_fallback(ch, msgid, text, ts):
+    """Record a bridge fallback on the shared pending-answers ledger.
+
+    The cold path may still answer it. The sweep drops the msgid once
+    a formal reply is delivered. A ledger failure must not block the
+    inbox handoff.
+    """
+    try:
+        module = _CHANNEL_COMMON
+        if module is None:
+            return
+        path = os.environ.get("PENDING_ANSWERS_PATH", "").strip()
+        if not path:
+            path = str(module.pending_answers_path())
+        module.record_pending_answers(path, [{
+            "channel": ch,
+            "msgid": msgid,
+            "source": "bridge-fallback",
+            "ts": ts,
+            "summary": text or "",
+        }])
+    except Exception:
+        pass
+
+
 def fallback_to_inbox(ch, row, why):
     cfg = CFG["channels"][ch]
     msgid, text = row["msgid"], row.get("text", "")
@@ -489,6 +547,7 @@ def fallback_to_inbox(ch, row, why):
                          {"msgid": msgid, "ts": int(time.time())})
         except Exception:
             pass
+        _note_bridge_fallback(ch, msgid, text, rec["ts"])
         print(f"[{ch}] FALLBACK msgid={msgid} why={why}", flush=True)
         return
     append_jsonl(inbox_path(ch), rec)
@@ -498,6 +557,7 @@ def fallback_to_inbox(ch, row, why):
                      {"msgid": msgid, "ts": int(time.time())})
     except Exception:
         pass
+    _note_bridge_fallback(ch, msgid, text, rec["ts"])
     print(f"[{ch}] FALLBACK msgid={msgid} why={why}", flush=True)
 
 
