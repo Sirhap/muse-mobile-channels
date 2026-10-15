@@ -16,6 +16,7 @@ import shutil
 import sys
 import time
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 SBX = Path("/tmp/slash-audit-20261015")
@@ -195,7 +196,19 @@ def check_status_label(gateway, label):
     text = gateway.slash_status_text("测试", state, hook)
     check(f"{label} status says 后台续跑 batches",
           "后台续跑 1 批" in text and "并行" not in text)
-    overview = gateway._task_overview_text(label, state, hook)
+    # _task_overview_text reads the bridge state from a fixed production
+    # path; where the real bridge runs, that file exists and the
+    # missing-state branch never triggers. Force the read to miss so the
+    # branch itself is what is tested, wherever the suite runs.
+    real_read_text = Path.read_text
+
+    def _missing_bridge_state(self, *args, **kwargs):
+        if str(self) == "/home/hatch/workspace/native-bridge/state.json":
+            raise FileNotFoundError(str(self))
+        return real_read_text(self, *args, **kwargs)
+
+    with mock.patch.object(Path, "read_text", _missing_bridge_state):
+        overview = gateway._task_overview_text(label, state, hook)
     check(f"{label} overview keeps cold rows when bridge state is missing",
           "后台续跑" in overview and "桥状态暂时读不到" in overview)
 
