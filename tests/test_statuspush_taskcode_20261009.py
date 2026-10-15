@@ -190,7 +190,12 @@ check("bridge weixin escalation is short form, no code",
       and "〔#" not in body and MID[:8] not in body,
       body)
 
-# weixin: activity fold still appends 最近动态 to the same notice
+# weixin: activity fold still appends 最近动态 to the same notice.
+# Start from an empty outbox (as the other bridge suites do before
+# direct progress_notice calls): since the 2026-10-15 dedupe guard,
+# a same-rid re-call is a no-op by design, so the fold check must
+# not share an outbox with the same-bucket notice above.
+(WX / "outbox.jsonl").unlink(missing_ok=True)
 wx.progress_notice(make_turn(activities=[{"text": "正在查资料"}]), 180)
 body = read_jsonl(WX / "outbox.jsonl")[-1]["content"]
 check("bridge progress folds activity, still no code",
