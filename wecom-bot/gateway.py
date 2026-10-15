@@ -416,7 +416,8 @@ def log(msg: str) -> None:
 
 # ---------- slash commands (gateway-intercepted) ----------
 # The user can send /ping, /status, /stop, /new, /check,
-# /queue, /help and /subagent in chat. Commands are intercepted
+# /queue, /help, /subagent and the approval commands in chat.
+# Commands are intercepted
 # after the allowlist +
 # dedupe checks and BEFORE the inbox write: they never wake a worker;
 # the gateway answers itself through the normal proactive send path.
@@ -605,34 +606,53 @@ def _spool_texts(channel):
 def _task_overview_text(channel, state_dir, hook_state_dir):
     """Unified task board appended to /status: every in-flight or queued
     task across the native bridge, the cold hook path and subagent jobs,
-    plus bridge lifetime counters. Fail-silent per section."""
+    plus bridge lifetime counters. A read failure is one explicit line,
+    not a missing section."""
+    lines = []
+    ch = {}
+    snap = {}
+    bridge_note = ""
     try:
-        lines = []
         st = json.loads(Path(
             "/home/hatch/workspace/native-bridge/state.json"
         ).read_text(encoding="utf-8"))
+        if not isinstance(st, dict):
+            raise ValueError("bridge state is not an object")
         ch = st.get("channels", {}).get(channel, {}) or {}
+        if not isinstance(ch, dict):
+            ch = {}
         snap = ch.get("queue_snapshot", {}) or {}
+        if not isinstance(snap, dict):
+            snap = {}
+    except Exception:
+        bridge_note = "桥状态暂时读不到"
+    try:
         texts = _spool_texts(channel)
         inbox_texts = _inbox_texts(state_dir)
         # Bridge rows prefer the bridge's own status.json summary
         # (todo 6: it carries the last-activity age the state.json
         # snapshot lacks); when it has no usable rows, fall back to
-        # the snapshot rendering exactly as before.
-        status_rows = _bridge_status_active(channel)
-        if status_rows:
-            for r in status_rows:
-                idle = r.get("idle_secs")
-                idle_part = f" · 最后活动 {_fmt_dur(idle)}前" \
-                    if isinstance(idle, (int, float)) else ""
-                lines.append(f"▶ 桥 {_fmt_dur(r.get('run_secs', 0))} "
-                             f"「{_excerpt(r.get('text', ''))}」{idle_part}")
+        # the snapshot rendering exactly as before. A missing bridge
+        # file must not hide the cold-channel rows below.
+        if bridge_note:
+            lines.append(bridge_note)
         else:
-            for a in snap.get("active", []):
-                mid = a.get("msgid", "")
-                txt = texts.get(mid) or inbox_texts.get(mid, "")
-                lines.append(f"▶ 桥 {_fmt_dur(a.get('secs', 0))} "
-                             f"「{_excerpt(txt)}」")
+            status_rows = _bridge_status_active(channel)
+            if status_rows:
+                for r in status_rows:
+                    idle = r.get("idle_secs")
+                    idle_part = f" · 最后活动 {_fmt_dur(idle)}前" \
+                        if isinstance(idle, (int, float)) else ""
+                    lines.append(f"▶ 桥 {_fmt_dur(r.get('run_secs', 0))} "
+                                 f"「{_excerpt(r.get('text', ''))}」{idle_part}")
+            else:
+                for a in snap.get("active", []) or []:
+                    if not isinstance(a, dict):
+                        continue
+                    mid = a.get("msgid", "")
+                    txt = texts.get(mid) or inbox_texts.get(mid, "")
+                    lines.append(f"▶ 桥 {_fmt_dur(a.get('secs', 0))} "
+                                 f"「{_excerpt(txt)}」")
         batch, _ids, pcount, _dcount = _queue_summary(hook_state_dir)
         mids = batch.get("msgids") or []
         if mids:
@@ -691,7 +711,7 @@ def _task_overview_text(channel, state_dir, hook_state_dir):
             return "\n🧭 任务总览：当前没有进行中或排队的任务"
         return "\n🧭 任务总览\n" + "\n".join(lines)
     except Exception:
-        return ""
+        return "\n🧭 任务总览：暂时读不到（桥状态不可用）"
 
 
 # ---------- bridge-lane arrival feedback (2026-10-09) ----------
@@ -803,6 +823,31 @@ def _bridge_queued_rows(channel):
         return []
 
 
+def _bridge_active_detail(channel):
+    """Rows for bridge turns that are already running.
+
+    Each row is ``{msgid, text, lane, secs}``. Fail-silent ``[]``.
+    Text comes from the spool; a missing spool leaves the excerpt blank.
+    """
+    try:
+        active, _queued = _bridge_snapshot(channel)
+        texts = _spool_texts(channel)
+        rows = []
+        for item in active or []:
+            if not isinstance(item, dict):
+                continue
+            mid = str(item.get("msgid") or "")
+            rows.append({
+                "msgid": mid,
+                "text": texts.get(mid, ""),
+                "lane": item.get("lane") or "main",
+                "secs": item.get("secs", 0),
+            })
+        return rows
+    except Exception:
+        return []
+
+
 def _bridge_admin(channel, action, msgids):
     """Append a queue-admin instruction for the native bridge."""
     return _append_jsonl_file(
@@ -906,22 +951,22 @@ def soft_ack_text(state_dir, hook_state_dir, text):
         return None
 
 
-SLASH_HELP_TEXT = """【命令表】在聊天里直接发，网关秒回、不排队
-普通消息走原生通道秒回；长任务在原生通道排队，冷通道保底
-/ping 连通自检
-/status 渠道状态 + 任务总览（谁在跑、谁在排队、副助手、累计）
-/queue 队列明细（冷通道 + 原生桥都列）
-/queue clear 清掉排队中未开工的消息（桥和冷通道一起清）
-/queue drop N 只删冷通道排队第 N 条；/queue drop 桥N 删原生桥排队第 N 条
-/stop 取消正在跑的任务
-/subagent <任务> 派副助手并行执行（别名 /副助手）；/subagent list 查、/subagent stop <编号> 停
-/new 开新会话：换一个全新的原生会话，之前的对话不再带入（别名 /新会话）
-/check 一次性自检，跑完即结束（别名 /自检）
+SLASH_HELP_TEXT = """【命令表】在聊天里直接发，网关当场回复，不进任务队列
+单聊纯文字在分流开启时进原生桥，桥忙时按到达顺序排队；图片、文件、群聊，以及桥不可用时，走冷通道
+/ping 连通自检：网关当场回 pong 和当前状态，不唤醒任务
+/status 渠道状态 + 任务总览（谁在跑、谁在排队、副助手、累计）；桥状态读不到时会直说
+/queue 队列明细（冷通道和原生桥都列；两边都空才说空闲）
+/queue clear 清掉排队中未开工的消息（桥和冷通道一起清，正在跑的不动）
+/queue drop N 只删冷通道排队第 N 条；/queue drop 桥N 或 bN 删原生桥排队第 N 条
+/stop 取消正在跑的任务（冷通道在跑、后台续跑、原生桥进行中；还没开工的排队不动）。冷通道在下一次进度检查时停下并回一句已取消；原生桥回合下一轮直接取消，不再另发确认
+/subagent <任务> 登记副助手后台执行（别名 /副助手），名额满了会先排队；/subagent list 查、/subagent stop <编号> 停
+/new 记下换会话边界（别名 /新会话）：此刻不建新会话。下一条走原生桥的文字才会新建，这之前的对话不再带入
+/check 一次性自检，跑完即结束（别名 /自检）。原生桥要心跳新鲜且该渠道为 live 才算通过
 /help 本命令表（别名 /命令）
-/审批 待审批列表（网络/浏览器类审批，出现时也会主动通知）
+/审批 待审批列表（网络/浏览器类审批，出现时也会主动通知；英文 /approvals 相同）
 {approval_legend}
 {approval_reply}
-仍可用 /批 N（仅这次）、/批 N 永、/拒 N，以及 /批准、/拒绝（永也可写永久）
+仍可用 /批 N（仅这次）、/批 N 永、/拒 N，以及 /批准、/拒绝（永也可写永久）；英文 /approve、/deny 相同
 注：只有以上是命令；其他以 / 开头的话会当普通消息处理。"""
 
 
@@ -936,6 +981,18 @@ def slash_help_text():
         approval_legend=APPROVAL_LEGEND,
         approval_reply=APPROVAL_REPLY_LINE,
     )
+
+
+# Receipts whose wording is the contract. Both gateways keep these
+# strings identical; the slash audit test compares them.
+SLASH_NEW_ACK = (
+    "已记下换会话边界，新会话还没创建。"
+    "下一条走原生桥的文字消息才会新建会话，并且不再带入这之前的对话。"
+    "现在只发图片、或这条消息没进桥，网站上还不会出现新会话。"
+)
+SLASH_NEW_FAIL_ACK = (
+    "换会话没记下：边界文件暂时写不了，请稍后再试。当前会话没有变。"
+)
 
 
 def slash_ping_text(chan_label, state_dir, hook_state_dir=None):
@@ -996,7 +1053,7 @@ def slash_status_text(chan_label, state_dir, hook_state_dir):
     lines = [
         f"📊 {chan_label}通道状态",
         f"网关：{state}（{conn}，{err_part}）· 最近入站 {_fmt_hm((last_in or {}).get('ts'))} · 最近出站 {_fmt_hm((last_out or {}).get('ts'))}",
-        f"队列：{run_part} · 排队 {pcount} 条 · 并行 {dcount} 条",
+        f"队列：{run_part} · 排队 {pcount} 条 · 后台续跑 {dcount} 批",
         f"上次自检：{chk_part}",
     ]
     return "\n".join(lines)
@@ -1068,10 +1125,15 @@ def slash_run_check(chan_label, state_dir, hook_state_dir):
         bts = bmode.get("ts")
         balive = isinstance(bts, (int, float)) and (now - float(bts) <= 30)
         blive = (bmode.get("mode", {}) or {}).get(bkey) == "live"
-        items.append(("原生桥", bool(balive),
-                      "运行中（live）" if balive and blive else
-                      ("运行中（shadow，未接管）" if balive
-                       else "无心跳，桥可能未运行")))
+        if balive and blive:
+            bridge_detail = "运行中（live）"
+        elif balive:
+            bridge_detail = "运行中（shadow，未接管）"
+        else:
+            bridge_detail = "无心跳，桥可能未运行"
+        # A fresh heartbeat in shadow is not "all passed": that mode
+        # is not taking this channel's turns.
+        items.append(("原生桥", bool(balive and blive), bridge_detail))
     except Exception:
         items.append(("原生桥", False, "状态不可读"))
 
@@ -1128,8 +1190,12 @@ def _inbox_texts(state_dir):
 
 
 def slash_queue_text(chan_label, state_dir, hook_state_dir):
-    """/queue detail listing: per-message view of the same state that
-    /status only counts. Empty sections are omitted."""
+    """Cold-channel lines for /queue.
+
+    Empty cold state returns the idle sentence. ``slash_queue_report``
+    is what the command sends: it keeps that sentence only when the
+    native bridge is idle too, and it adds the closing hint.
+    """
     batch, _ids, _p, _d = _queue_summary(hook_state_dir)
     texts = _inbox_texts(state_dir)
     now = time.time()
@@ -1156,8 +1222,45 @@ def slash_queue_text(chan_label, state_dir, hook_state_dir):
             age = _dur_str(now - float(dsince)) if isinstance(dsince, (int, float)) else "未知"
             for m in (d.get("msgids") or []):
                 lines.append(f"·「{_excerpt(texts.get(str(m), ''))}」已跑{age}")
-    lines.append("（停正在跑的用 /stop）")
     return "\n".join(lines)
+
+
+def slash_queue_report(chan_label, state_dir, hook_state_dir, channel):
+    """Full /queue reply: cold detail plus native-bridge detail.
+
+    「队列空闲」 is used only when both sides are empty. A cold idle
+    must not introduce a bridge that still has work.
+    """
+    cold = slash_queue_text(chan_label, state_dir, hook_state_dir)
+    cold_idle = cold.startswith("队列空闲")
+    summary, _ids = _bridge_queue_lines(channel)
+    active_rows = _bridge_active_detail(channel)
+    queued_rows = _bridge_queued_rows(channel)
+    bridge_busy = bool(summary or active_rows or queued_rows)
+    if cold_idle and not bridge_busy:
+        return cold
+    parts = []
+    if cold_idle:
+        parts.append(f"【任务队列】{chan_label}")
+        parts.append("冷通道：没有正在处理或排队的任务。")
+    else:
+        parts.append(cold)
+    if summary:
+        parts.append(summary.strip())
+    for row in active_rows:
+        secs = row.get("secs") or 0
+        try:
+            secs = int(secs)
+        except (TypeError, ValueError):
+            secs = 0
+        parts.append(
+            f"· 进行中（{row.get('lane') or 'main'}，已跑 {secs}s）"
+            f"「{_excerpt(row.get('text', ''))}」"
+        )
+    for i, (_mid, text) in enumerate(queued_rows, 1):
+        parts.append(f"  桥{i}. 「{_excerpt(text)}」")
+    parts.append("（停正在跑的用 /stop）")
+    return "\n".join(parts)
 
 
 def slash_register_cancels(msgids):
@@ -1175,6 +1278,28 @@ def slash_register_cancels(msgids):
         except Exception:
             fail += 1
     return ok, fail
+
+
+def slash_stop_ack(cold_n, bridge_n, ok, fail):
+    """Receipt for /stop.
+
+    ``cold_n`` and ``bridge_n`` are how many running messages were
+    found on each side. A side's sentence is included only when that
+    side had work, so a bridge-only stop does not promise the cold
+    channel's confirmation reply. ``ok`` / ``fail`` are the CLI results.
+    """
+    if not ok:
+        return f"取消没有登记上（{fail} 条失败），请稍后再试。"
+    parts = [f"已登记取消 {ok} 条正在跑的消息。"]
+    if cold_n:
+        parts.append("冷通道上的会在下一次进度检查时停下，并回你一句已取消。")
+    if bridge_n:
+        parts.append("原生桥上的回合会在下一轮直接取消，不再另发一句确认。")
+    parts.append("排队中还没开工的不动。")
+    text = "".join(parts)
+    if fail:
+        text += f"（另有 {fail} 条登记失败）"
+    return text
 
 
 # ---------- /subagent: parallel sub-assistant jobs ----------
@@ -1268,10 +1393,26 @@ def _norm_job_id(tok):
     return None
 
 
+def slash_subagent_dispatched_ack(job_id, text):
+    """Receipt after a /subagent request has been written.
+
+    The hook starts the job on a later poll, and only up to that
+    channel's running cap. The receipt must not say the job is
+    already running.
+    """
+    return (f"【副助手 #{job_id} 已登记】{_excerpt(text)}。"
+            "请求已记下，后台即将启动；若同时在跑的名额已满会先排队。"
+            "主对话不受影响；查进度：/subagent list")
+
+
 def slash_subagent_stop_ack(hook_state_dir, job_id):
-    """Validate a /subagent stop against the jobs file and, when the
-    job is still live, append the stop intent for the hook to enact.
-    The jobs file itself is never written from the gateway."""
+    """Validate a /subagent stop and append the stop intent.
+
+    The jobs file itself is never written from the gateway. A queued
+    job is retired on the hook's next poll and does not send a result.
+    A running job is cancelled; the worker prompt tells it to stop and
+    reply with a 【副助手 #id 已停止】 line.
+    """
     jobs = _subagent_jobs_read(hook_state_dir)
     if jobs is None:
         return "副助手状态暂不可读，请稍后再试。"
@@ -1283,7 +1424,14 @@ def slash_subagent_stop_ack(hook_state_dir, job_id):
         return f"副助手 #{job_id} {_JOB_ENDED_LABELS[st]}，无需再停。"
     _append_jsonl_file(hook_state_dir / "subagent_cmd.jsonl",
                        {"type": "stop", "job_id": job_id, "ts": time.time()})
-    return f"已提交停止 #{job_id}，副助手会在下一个检查点停下并回一句确认。"
+    if st == "queued":
+        return (f"已提交停止 #{job_id}。这条还在排队，下一轮会直接退出，"
+                "不再开工，也不会另发一条结果。")
+    if st == "running":
+        return (f"已提交停止 #{job_id}。正在跑的已登记取消，"
+                f"副助手看到后会停下，并回一条以「【副助手 #{job_id} 已停止】」"
+                "开头的结果。")
+    return f"已提交停止 #{job_id}。"
 
 
 
@@ -2068,27 +2216,27 @@ class Gateway:
             elif name == "check":
                 ack = slash_run_check(CHAN_LABEL, STATE, HOOK_STATE_DIR)
             elif name == "stop":
-                _b, ids, _p, _d = _queue_summary(HOOK_STATE_DIR)
-                _btxt, _bids = _bridge_queue_lines("wecom")
-                ids = list(ids) + [i for i in _bids if i not in ids]
+                _b, cold_ids, _p, _d = _queue_summary(HOOK_STATE_DIR)
+                _btxt, bridge_ids = _bridge_queue_lines("wecom")
+                cold_ids = [i for i in cold_ids if i]
+                bridge_ids = [i for i in bridge_ids if i]
+                ids = cold_ids + [i for i in bridge_ids if i not in cold_ids]
                 if not ids:
                     ack = "当前没有正在跑的任务。"
                 else:
                     ok, fail = await asyncio.to_thread(slash_register_cancels, ids)
-                    ack = f"已登记取消共 {ok} 条，正在跑的任务会在下一个进度检查点停下并回你一句确认。"
-                    if fail:
-                        ack += f"（另有 {fail} 条登记失败）"
+                    ack = slash_stop_ack(len(cold_ids), len(bridge_ids), ok, fail)
             elif name == "new":
-                _write_hook_json(HOOK_STATE_DIR, "topic_boundary.json", {"ts": time.time()})
-                ack = "已开新会话：之前的对话不会再带入上下文。"
+                if _write_hook_json(HOOK_STATE_DIR, "topic_boundary.json",
+                                    {"ts": time.time()}):
+                    ack = SLASH_NEW_ACK
+                else:
+                    ack = SLASH_NEW_FAIL_ACK
             elif name == "queue":
                 qtokens = arg.split()
                 if not qtokens:
-                    ack = slash_queue_text(CHAN_LABEL, STATE, HOOK_STATE_DIR)
-                    ack += _bridge_queue_lines("wecom")[0]
-                    for _i, (_m, _t) in enumerate(
-                            _bridge_queued_rows("wecom"), 1):
-                        ack += f"\n  桥{_i}. 「{_excerpt(_t)}」"
+                    ack = slash_queue_report(
+                        CHAN_LABEL, STATE, HOOK_STATE_DIR, "wecom")
                 elif qtokens[0] == "clear":
                     pend = _pending_sorted(HOOK_STATE_DIR)
                     brows = _bridge_queued_rows("wecom")
@@ -2102,6 +2250,8 @@ class Gateway:
                             wrote = enqueue_queue_admin(
                                 HOOK_STATE_DIR, "clear", [m for m, _t in pend])
                             if wrote:
+                                self._feedback_forget([m for m, _t in pend],
+                                                      source="queue-clear")
                                 excerpts = "、".join(
                                     f"「{_excerpt(texts.get(m, ''))}」"
                                     for m, _t in pend)
@@ -2111,6 +2261,9 @@ class Gateway:
                         if brows:
                             if _bridge_admin("wecom", "clear",
                                              [m for m, _t in brows]):
+                                self._feedback_forget(
+                                    [m for m, _t in brows],
+                                    source="queue-clear")
                                 bexcerpts = "、".join(
                                     f"「{_excerpt(t)}」" for _m, t in brows)
                                 parts.append(f"原生桥 {len(brows)} 条：{bexcerpts}")
@@ -2134,6 +2287,7 @@ class Gateway:
                     else:
                         mid, mtext = brows[int(num) - 1]
                         if _bridge_admin("wecom", "drop", [mid]):
+                            self._feedback_forget([mid], source="queue-drop")
                             ack = (f"已提交删除原生桥排队第 {int(num)} 条："
                                    f"「{_excerpt(mtext)}」，约 5 秒内生效。")
                         else:
@@ -2142,13 +2296,15 @@ class Gateway:
                     pend = _pending_sorted(HOOK_STATE_DIR)
                     n = int(qtokens[1])
                     if n < 1 or n > len(pend):
-                        ack = f"排队里没有第 {n} 条（当前共 {len(pend)} 条）。"
+                        ack = f"冷通道排队里没有第 {n} 条（当前共 {len(pend)} 条）。"
                     else:
                         mid = pend[n - 1][0]
                         texts = _inbox_texts(STATE)
                         wrote = enqueue_queue_admin(HOOK_STATE_DIR, "drop", [mid])
                         if wrote:
-                            ack = f"已提交删除排队第 {n} 条：「{_excerpt(texts.get(mid, ''))}」，约 5 秒内生效。"
+                            self._feedback_forget([mid], source="queue-drop")
+                            ack = (f"已提交删除冷通道排队第 {n} 条："
+                                   f"「{_excerpt(texts.get(mid, ''))}」，约 5 秒内生效。")
                         else:
                             ack = "删除排队失败：暂时写不了队列指令，请稍后再试。"
                 else:
@@ -2157,7 +2313,7 @@ class Gateway:
                 tokens = arg.split(None, 1)
                 head = tokens[0].lower() if tokens else ""
                 if not arg:
-                    ack = "用法：/subagent <任务> 派发；/subagent list 查看；/subagent stop <编号> 停止。"
+                    ack = "用法：/subagent <任务> 登记；/subagent list 查看；/subagent stop <编号> 停止。"
                 elif head == "list":
                     ack = slash_subagent_list_text(HOOK_STATE_DIR)
                 elif head == "stop":
@@ -2193,8 +2349,7 @@ class Gateway:
                                 "event": True,
                             }
                             self._save_reqmap()
-                        ack = (f"【副助手 #{jid} 已派发】{_excerpt(arg)}。"
-                               "后台执行中，主对话不受影响；查进度：/subagent list")
+                        ack = slash_subagent_dispatched_ack(jid, arg)
                     else:
                         ack = "派发失败：暂时无法登记副助手任务，请稍后再试。"
             elif name == "approvals":
@@ -2308,6 +2463,30 @@ class Gateway:
                 track.pop(m, None)
         except Exception as e:
             log(f"bridge feedback register failed (ignored): {e!r}")
+
+    def _feedback_forget(self, msgids, source=""):
+        """Drop feedback_track records a slash command just disposed of.
+
+        Same rule as the Weixin gateway: /queue clear and drop must
+        stop a tracked message from later receiving a started or wait
+        notice. Returns the number popped. Fail-silent.
+        """
+        popped = []
+        try:
+            track = getattr(self, "feedback_track", None)
+            if not isinstance(track, dict):
+                return 0
+            for m in (msgids or []):
+                mid = str(m or "")
+                if mid and mid in track:
+                    track.pop(mid, None)
+                    popped.append(mid)
+            if popped:
+                log(f"feedback_track forget ({source or 'manual'}): "
+                    f"popped {len(popped)} record(s): {','.join(popped)}")
+        except Exception as e:
+            log(f"feedback forget failed (ignored): {e!r}")
+        return len(popped)
 
     def _feedback_on_reply(self, msgid):
         """Close a message's feedback record once its formal reply
