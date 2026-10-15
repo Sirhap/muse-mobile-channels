@@ -12,10 +12,12 @@ Covers the native-bridge P3 changes:
      (timestamp, message_id, type) dedup) and folded into the
      progress notice as a neutral 最近动态 line; failures silent.
   4. queue_snapshot active entries gain phase / last_activity.
-  5. PREAMBLE / PREAMBLE_FRESH match the trimmed text the user
-     settled on 2026-10-14 (fresh-session clause, no-cards rule,
-     channel parenthetical and the verbatim-forwarding sentence all
-     removed; PREAMBLE_FRESH is now an alias of PREAMBLE), and
+  5. PREAMBLE / PREAMBLE_FRESH match the text the user settled
+     on 2026-10-14 and extended on 2026-10-15 with the bare-link
+     rule and the sensitive-input secure-entry rule (fresh-session
+     clause, no-cards rule, channel parenthetical and the
+     verbatim-forwarding sentence all removed; PREAMBLE_FRESH is
+     now an alias of PREAMBLE), and
      deliver_reply strips standalone [[hatch_widget:...]] lines
      while keeping inline mentions.
 
@@ -302,12 +304,16 @@ check("2 escalation: carries phase word", "可能卡住" in body)
 CARD_LINE = "渠道内不要使用卡片/选项控件提问；需要用户选择时用纯文本编号列出选项。"
 EXPECTED_PREAMBLE = (
     "【渠道桥接说明】你正在通过桥接程序回复手机渠道上的用户。"
-    "结论先行、简洁自然；"
-    "如果生成了要发给用户的文件，在回复末尾单独一行写 [[FILE:文件的绝对路径]]；"
-    "不要提及桥接机制。"
+    "结论先行、简洁自然、排版紧凑；不要提及桥接机制。"
+    "如果生成了要发给用户的文件，在回复末尾单独一行写 [[FILE:文件的绝对路径]]。"
+    "回复中的所有链接一律只发从域名开始的明文地址，不带 https://、http:// 前缀，"
+    "不用 Markdown 文字链接。"
+    "遇到需要用户填写密码、API key 等敏感信息时，主动识别、"
+    "当场生成系统提供的加密安全录入页并随回复发出链接，不要等用户索要，"
+    "不要让用户在聊天里发明文，也不要自建普通表单；录入内容直进保险库，你不见明文。"
     "\n\n用户消息："
 )
-check("5 PREAMBLE is the trimmed 2026-10-14 text",
+check("5 PREAMBLE is the 2026-10-15 extended text",
       nb.PREAMBLE == EXPECTED_PREAMBLE)
 check("5 PREAMBLE_FRESH aliases PREAMBLE", nb.PREAMBLE_FRESH == nb.PREAMBLE)
 for removed in (CARD_LINE, "【新会话】", "（微信/企业微信）",

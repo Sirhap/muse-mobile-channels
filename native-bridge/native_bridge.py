@@ -147,9 +147,13 @@ AUDIT_BLOCK_TEXT = (
 
 PREAMBLE = (
     "【渠道桥接说明】你正在通过桥接程序回复手机渠道上的用户。"
-    "结论先行、简洁自然；"
-    "如果生成了要发给用户的文件，在回复末尾单独一行写 [[FILE:文件的绝对路径]]；"
-    "不要提及桥接机制。"
+    "结论先行、简洁自然、排版紧凑；不要提及桥接机制。"
+    "如果生成了要发给用户的文件，在回复末尾单独一行写 [[FILE:文件的绝对路径]]。"
+    "回复中的所有链接一律只发从域名开始的明文地址，不带 https://、http:// 前缀，"
+    "不用 Markdown 文字链接。"
+    "遇到需要用户填写密码、API key 等敏感信息时，主动识别、"
+    "当场生成系统提供的加密安全录入页并随回复发出链接，不要等用户索要，"
+    "不要让用户在聊天里发明文，也不要自建普通表单；录入内容直进保险库，你不见明文。"
     "\n\n用户消息："
 )
 # Sessions created by the user's /new used to carry one extra
@@ -158,6 +162,11 @@ PREAMBLE = (
 # so a fresh session now gets exactly the same preamble as any
 # other. PREAMBLE_FRESH stays as an alias so session_for and the
 # /new exit audit keep their existing code paths unchanged.
+# On 2026-10-15 the user extended the preamble with the bare-link
+# rule (no https:// or http:// prefix, no Markdown link text) and
+# the sensitive-input rule (proactively send the system's encrypted
+# secure-entry page; never collect plaintext in chat or build a
+# plain form; entries go straight to the vault, unseen here).
 PREAMBLE_FRESH = PREAMBLE
 
 _state_lock = threading.Lock()
