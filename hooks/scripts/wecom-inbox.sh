@@ -150,6 +150,34 @@ STALL_FIRST_NOTICE_SECS = 300
 # pid file is unknown, never death; one live pid vetoes the batch.
 EARLY_RESUME_MIN_SILENCE_SECS = 300
 EARLY_RESUME_HB_STALE_SECS = 180
+# --- Platform-terminal early route (2026-10-15, todo 21, routes
+# C+E; NOT deployed) ---
+# The gap EARLY_RESUME cannot cover: the worker dies alone while
+# its detached heartbeat loop survives, so the live pid vetoes the
+# batch. The worker now self-registers at batch start (heartbeat-
+# start --run-id writes worker_activity.json; see channel_common)
+# and the probe's third source reads a platform verdict snapshot
+# (worker_platform_status.json, written by the platform-check
+# agent per docs/worker-platform-check-runbook-2026-10-15.md).
+# EARLY_PLATFORM re-times the SAME routing when the conjunction
+# holds: worker-push silence >= EARLY_PLATFORM_MIN_SILENCE_SECS,
+# a fresh platform-terminal verdict for some msgid in the batch,
+# no live hold / fresh signal (the routing's _activity_blocks
+# check still vetoes), and no delivered formal reply (checked by
+# the caller before this branch). Silence alone NEVER routes:
+# measured push gaps run to p90 1838s on long batches, so the
+# terminal verdict is the death evidence and silence is only the
+# gate. A declared hold (worker-hold) vetoes even a terminal
+# verdict. When a suspicious batch (silence >= 300s, no fresh
+# signal, no verdict yet, but a registration exists) is spotted,
+# the hook leaves a throttled check request in
+# platform_check_requests.json for the checker cron: at most one
+# request per PLATFORM_CHECK_EVERY_SECS per msgid, at most
+# PLATFORM_CHECK_MAX_PER_BATCH per batch. No verdict -> the
+# original 1800s path is completely unchanged.
+EARLY_PLATFORM_MIN_SILENCE_SECS = 300
+PLATFORM_CHECK_EVERY_SECS = 300
+PLATFORM_CHECK_MAX_PER_BATCH = 2
 CLAIM_TTL_SECS = 600
 # Preemption: queued messages must not wait behind a heartbeating long
 # batch forever. If the oldest queued message has waited
@@ -567,22 +595,40 @@ _BRIDGE_STATE = (os.environ.get("DEATH_WATCH_BRIDGE_STATE")
                  or "/home/hatch/workspace/native-bridge/state.json")
 _WORKER_ACTIVITY = os.path.join(os.path.dirname(inbox_path),
                                 "worker_activity.json")
+_PLATFORM_STATUS = (os.environ.get("DEATH_WATCH_PLATFORM_STATUS")
+                    or os.path.join(os.path.dirname(inbox_path),
+                                    "worker_platform_status.json"))
+_platform_check_path = os.path.join(os.path.dirname(pending_path),
+                                    "platform_check_requests.json")
+# Msgids routed via the EARLY_PLATFORM evidence this poll; the
+# resume / fail-stop notices name that basis truthfully.
+_platform_routed_ids = set()
 _activity_hold_path = os.path.join(os.path.dirname(pending_path),
                                    "activity_holds.json")
 _activity_probe_path = os.path.join(os.path.dirname(pending_path),
                                     "activity_probe.json")
 
 
-def _assess_msgid(msgid):
-    """Probe result for one msgid. Never raises. Missing probe => not alive."""
+def _assess_msgid(msgid, window=DEATH_WATCH_SECS):
+    """Probe result for one msgid. Never raises. Missing probe => not alive.
+
+    ``window`` is the freshness window for the time-based sources.
+    Early routes (EARLY_RESUME / EARLY_PLATFORM) pass the early
+    floor: a worker-activity write 900s old must not veto a route
+    whose whole point is acting at 300s of silence -- with the
+    1800s window it would, now that registration actually writes
+    the file (todo 21). Live holds and platform-running freshness
+    are window-independent inside the probe and veto at any window.
+    """
     if _activity_probe is None:
         return {"alive": False, "source": None, "activity_ts": None,
                 "degraded": ["probe-missing"]}
     try:
         info = _activity_probe.assess(
-            str(msgid), now=now, window=DEATH_WATCH_SECS,
+            str(msgid), now=now, window=window,
             bridge_state_path=_BRIDGE_STATE,
-            worker_activity_path=_WORKER_ACTIVITY)
+            worker_activity_path=_WORKER_ACTIVITY,
+            platform_status_path=_PLATFORM_STATUS)
     except Exception:
         return {"alive": False, "source": None, "activity_ts": None,
                 "degraded": ["probe-error"]}
@@ -611,7 +657,7 @@ def _note_probe_degraded(rows):
         "ts": now, "rows": rows})
 
 
-def _activity_blocks(msgids):
+def _activity_blocks(msgids, window=DEATH_WATCH_SECS):
     """True when any msgid still has real activity.
 
     One alive msgid holds the whole batch: siblings are not resumed
@@ -622,7 +668,7 @@ def _activity_blocks(msgids):
     holds = []
     degraded = []
     for mid in msgids:
-        info = _assess_msgid(str(mid))
+        info = _assess_msgid(str(mid), window)
         if info.get("alive"):
             holds.append((str(mid), info))
         elif info.get("degraded"):
@@ -636,7 +682,72 @@ def _activity_blocks(msgids):
     return False
 
 
-def _route_death(e):
+def _platform_terminal_any(msgids):
+    """True when some msgid carries a fresh platform-terminal verdict.
+
+    Terminal evidence only -- the caller still applies the silence
+    gate and the routing's alive check, so this alone never routes.
+    """
+    for mid in msgids:
+        if _assess_msgid(str(mid)).get("platform_terminal"):
+            return True
+    return False
+
+
+def _maybe_request_platform_check(msgids, last_activity):
+    """Leave a throttled platform-check request for a suspicious batch.
+
+    Suspicious (todo 21): push silence past the early floor, no
+    fresh signal of any kind (a live hold or a running verdict
+    vetoes), no terminal verdict yet, and at least one msgid was
+    self-registered (no run_id -> nothing the checker can resolve).
+    The checker is a low-frequency agent cron following the
+    runbook; it only writes the verdict snapshot. Best-effort and
+    never in dry runs: a failed write just delays the check.
+    """
+    if dry:
+        return
+    ids = [str(m) for m in msgids]
+    if not ids:
+        return
+    registered = {}
+    worker = _load_json_obj(_WORKER_ACTIVITY)
+    for mid in ids:
+        info = _assess_msgid(mid, EARLY_PLATFORM_MIN_SILENCE_SECS)
+        if info.get("alive") or info.get("platform_terminal"):
+            return
+        rec = worker.get(mid)
+        if isinstance(rec, dict) and rec.get("run_id"):
+            registered[mid] = str(rec["run_id"])
+    if not registered:
+        return
+    cur = _load_json_obj(_platform_check_path)
+    reqs = cur.get("requests")
+    if not isinstance(reqs, dict):
+        reqs = {}
+    reqs = {k: v for k, v in reqs.items()
+            if isinstance(v, dict)
+            and now - float(v.get("last_request_ts") or 0) < 7200}
+    changed = False
+    for mid, run_id in registered.items():
+        rec = reqs.get(mid) or {}
+        count = int(rec.get("count") or 0)
+        last = float(rec.get("last_request_ts") or 0)
+        if count >= PLATFORM_CHECK_MAX_PER_BATCH:
+            continue
+        if now - last < PLATFORM_CHECK_EVERY_SECS:
+            continue
+        reqs[mid] = {"run_id": run_id, "count": count + 1,
+                     "last_request_ts": now, "requested_at": now,
+                     "silence_secs": int(now - last_activity)}
+        changed = True
+    if changed:
+        cur["requests"] = reqs
+        cur["updated"] = now
+        _save_json_obj(_platform_check_path, cur)
+
+
+def _route_death(e, window=DEATH_WATCH_SECS):
     """First loss of worker pushes -> resume once (queue the msgid
     for an orphan re-wake + one factual user notice). Second loss ->
     fail-stop via failed_entries.
@@ -644,11 +755,16 @@ def _route_death(e):
     Real activity is checked again here, before either write, so a
     caller cannot resume or cancel a msgid the probe still calls
     alive. Returns "hold", "resume", or "fail". "hold" does not
-    record a resume attempt.
+    record a resume attempt. Early-route callers pass the early
+    window so the alive recheck matches the trigger's timescale.
     """
     _mid = str(e["msgid"])
-    if _activity_blocks([_mid]):
+    if _activity_blocks([_mid], window):
         return "hold"
+    if _assess_msgid(_mid).get("platform_terminal"):
+        # Routed on platform-terminal evidence (todo 21): remember
+        # the basis so the resume / fail-stop notices can state it.
+        _platform_routed_ids.add(_mid)
     if _resume_attempts.get(_mid):
         return "fail"
     _resume_attempts[_mid] = now
@@ -715,11 +831,18 @@ if batch_active:
                 _save_json_obj(_resume_queue_path, _resume_queue)
     elif (now - last_activity >= DEATH_WATCH_SECS
           or (now - last_activity >= EARLY_RESUME_MIN_SILENCE_SECS
-              and _early_dead(batch_ids))):
+              and _early_dead(batch_ids))
+          or (now - last_activity >= EARLY_PLATFORM_MIN_SILENCE_SECS
+              and _platform_terminal_any(batch_ids))):
         # (task 5) The second disjunct is the early
         # path -- same routing below (covered / probe-alive hold /
         # resume once / fail-stop), only reached sooner when the
         # process-death evidence is positive.
+        # (todo 21) The third disjunct is the same early path on
+        # platform-terminal evidence: the verdict is the death
+        # evidence, the 300s silence is only the gate, and the
+        # routing below (covered / probe-alive hold incl. a live
+        # worker hold / resume once / fail-stop) is unchanged.
         # Loss of life signs (2026-10-09 status-push fix): no
         # formal reply and no push from the worker ITSELF for a full
         # death-watch window. Since 2026-10-07 BATCH_CAP_SECS is
@@ -734,17 +857,31 @@ if batch_active:
         by_id = {e["msgid"]: e for e in entries}
         _cov = _covered_by_followup(batch_ids, batch_since,
                                     last_activity)
+        # Early triggers re-check aliveness on the early timescale;
+        # the full 1800s window would let a batch-start registration
+        # veto the very routes it enables (todo 21).
+        _route_window = (EARLY_RESUME_MIN_SILENCE_SECS
+                         if now - last_activity < DEATH_WATCH_SECS
+                         else DEATH_WATCH_SECS)
         if _cov:
             batch_done = True
             _log_covered(batch_ids, batch_since, last_activity, _cov)
-        elif _activity_blocks(batch.get("msgids") or []):
+        elif _activity_blocks(batch.get("msgids") or [], _route_window):
             pass
         else:
             batch_done = True
             for mid in batch.get("msgids") or []:
                 e = by_id.get(mid)
-                if e is not None and _route_death(e) == "fail":
+                if e is not None and _route_death(e, _route_window) == "fail":
                     failed_entries.append(e)
+    elif now - last_activity >= EARLY_PLATFORM_MIN_SILENCE_SECS:
+        # Suspicious zone only (todo 21): silent past the early
+        # floor, no death evidence yet (the heartbeat loop may well
+        # be alive -- this is exactly the uncovered shape). Leave a
+        # throttled platform-check request; routing waits for the
+        # verdict or the unchanged 1800s watch.
+        _maybe_request_platform_check(batch.get("msgids") or [],
+                                      last_activity)
 
 def is_stop_request(text):
     # Conservative matcher for stop/cancel imperatives: short
@@ -826,13 +963,17 @@ if detached:
             continue
         if (now - dlast >= DEATH_WATCH_SECS
                 or (now - dlast >= EARLY_RESUME_MIN_SILENCE_SECS
-                    and _early_dead(dids))):
+                    and _early_dead(dids))
+                or (now - dlast >= EARLY_PLATFORM_MIN_SILENCE_SECS
+                    and _platform_terminal_any(dids))):
             # Death watch (2026-10-09, reworked by the same day's
             # status-push fix): the worker's own pushes gone for
             # DEATH_WATCH_SECS -- same routing as the active batch:
             # covered -> silent drop; real activity -> keep
             # watching; first loss -> resume once; second loss ->
-            # fail-stop (cancel + factual notice).
+            # fail-stop (cancel + factual notice). The third
+            # disjunct (todo 21) is the platform-terminal early
+            # route, same routing, verdict as the death evidence.
             # This runs BEFORE the retire branch below, so a lost
             # detached batch is reported instead of silently
             # retiring at DETACHED_RETIRE_SECS with no notice.
@@ -840,16 +981,23 @@ if detached:
             if _cov:
                 _log_covered(dids, dsince, dlast, _cov)
                 continue
-            if _activity_blocks(d.get("msgids") or []):
+            _dwindow = (EARLY_RESUME_MIN_SILENCE_SECS
+                        if now - dlast < DEATH_WATCH_SECS
+                        else DEATH_WATCH_SECS)
+            if _activity_blocks(d.get("msgids") or [], _dwindow):
                 detached_activity.append((list(dids), dsince, dlast))
                 kept_detached.append(d)
                 continue
             for mid in d.get("msgids") or []:
                 e = by_id.get(mid)
                 if (e is not None and e not in failed_entries
-                        and _route_death(e) == "fail"):
+                        and _route_death(e, _dwindow) == "fail"):
                     failed_entries.append(e)
             continue
+        if now - dlast >= EARLY_PLATFORM_MIN_SILENCE_SECS:
+            # Suspicious zone (todo 21): same throttled platform
+            # check request as the active batch.
+            _maybe_request_platform_check(list(dids), dlast)
         if now - dlast >= DETACHED_RETIRE_SECS:
             # Zombie retirement (2026-10-07): no delivered reply, no
             # bound outbox activity, no heartbeat, no parked row for
@@ -1014,7 +1162,8 @@ if not dry:
                 _notice = ("⏳ 任务「" + _t[:20] + "」已 " + str(_mins)
                            + " 分钟还没有第一条推送（未报错）；"
                              "无推送满 30 分钟将自动续跑，进程已"
-                             "消失且心跳过期会提前续跑，/stop 取消")
+                             "消失且心跳过期、或平台确认原会话"
+                             "已结束会提前续跑，/stop 取消")
             else:
                 _notice = ("⏳ 任务「" + _t[:20] + "」已 " + str(_mins)
                            + " 分钟无推送（未报错），再推即继续；"
@@ -1049,6 +1198,8 @@ if not dry and _resume_notice_entries:
     for _re in _resume_notice_entries:
         _rt = (_re.get("text") or "").strip() or "（无文字消息）"
         _rnotice = "♻️ 任务中断，已自动续跑：「" + _rt[:20] + "」"
+        if str(_re.get("msgid")) in _platform_routed_ids:
+            _rnotice += "（平台记录显示原执行会话已结束）"
         try:
                 r = subprocess.run([cli_path, "send", "--chatid",
                                     str(_re.get("chatid") or ""),
@@ -1100,13 +1251,20 @@ if not dry:
             _parts.append("「" + _t[:20] + "」")
         _fe = next((e for e in failed_entries if e.get("chatid")), None)
         if _fe is not None:
+            if any(str(e["msgid"]) in _platform_routed_ids
+                   for e in failed_entries):
+                _fn_basis = ("（平台记录显示原执行会话已结束，"
+                             "自动续跑后仍无推送；"
+                             "非确认失败，要重试告诉我）")
+            else:
+                _fn_basis = ("（长时间无推送，自动续跑后仍无推送；"
+                             "非确认失败，要重试告诉我）")
             _fn_pending.append({
                 "ts": now, "chatid": _fe.get("chatid"),
                 "chat_type": 2 if _fe.get("chattype") == "group" else 1,
                 "text": "⚠️ 任务已停止："
                         + "、".join(_parts)
-                        + "（长时间无推送，自动续跑后仍无推送；"
-                          "非确认失败，要重试告诉我）"})
+                        + _fn_basis})
     if _fn_pending:
         _res_by_id = {}
         for _rr in load_jsonl(os.path.join(

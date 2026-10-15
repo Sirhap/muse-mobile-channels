@@ -17,7 +17,30 @@ Sources, in order:
 2. ``<bot-state>/worker_activity.json``, a worker-written map
    ``{msgid: {"ts": epoch, "source": "..."}}`` (a bare epoch is also
    accepted). The timestamp inside the file counts. The file's own
-   mtime does not.
+   mtime does not. Two optional fields ride on the same record
+   (todo 21, routes C+E): ``run_id`` -- the worker's self-registered
+   platform run key, written at batch start -- and ``hold_until``
+   -- an epoch until which the worker has declared it will be
+   silent on purpose (a long operation). A live hold counts as
+   alive (source ``worker-hold``) and outranks every other source,
+   including a platform terminal verdict: a declared silence is
+   never judged dead mid-hold.
+3. ``<bot-state>/worker_platform_status.json``, a verdict snapshot
+   written by the platform-check agent (see
+   docs/worker-platform-check-runbook-2026-10-15.md), a map
+   ``{msgid: {"run_id": ..., "status": ..., "agent_updated_at":
+   epoch, "checked_at": epoch}}``. A terminal status (completed /
+   shutdown / errored / interrupted) whose ``checked_at`` is fresh
+   is returned as ``platform_terminal`` evidence -- positive proof
+   the worker's platform session has ended. It is NOT an alive
+   signal and never sets ``alive`` by itself; the hook only acts on
+   it in conjunction with worker-push silence and no delivered
+   reply. ``status == "running"`` with a fresh ``agent_updated_at``
+   counts as alive (source ``platform-running``), the weakest
+   signal. A verdict whose run_id disagrees with the registered
+   run_id is ignored (a newer wake re-registered the msgid). A
+   stale ``checked_at``, an unknown status, or a missing/corrupt
+   file is no signal, exactly like the other sources.
 
 ``queue_snapshot``, ``status.json``, and heartbeat files are not
 sources.
@@ -38,6 +61,17 @@ from datetime import datetime, timezone
 
 # A timestamp this far in the future is not an observation.
 _FUTURE_SKEW_SECS = 120.0
+
+# Source 3 (todo 21): a verdict snapshot is only trusted while its
+# checked_at is this fresh; a running verdict only counts as alive
+# while the agent record itself updated within this window. The
+# platform's terminal flip can lag a real stall by ~550s (spike,
+# n=1), so neither value is a death threshold on its own -- death
+# still requires the hook's conjunction with push silence.
+PLATFORM_VERDICT_MAX_AGE_SECS = 600.0
+PLATFORM_RUNNING_FRESH_SECS = 300.0
+PLATFORM_TERMINAL_STATUSES = frozenset(
+    {"completed", "shutdown", "errored", "interrupted"})
 
 
 def epoch_of(raw: object) -> float | None:
@@ -170,14 +204,60 @@ def _worker_ts(data: dict, msgid: str) -> float | None:
     return epoch_of(raw)
 
 
+def _worker_record(data: dict, msgid: str) -> dict | None:
+    """The dict form of a worker activity record, or None."""
+    raw = data.get(msgid)
+    return raw if isinstance(raw, dict) else None
+
+
+def _platform_hit(verdicts: dict, msgid: str, now: float,
+                  registered_run_id: str | None) -> dict:
+    """Read one msgid's platform verdict.
+
+    Returns a dict with ``terminal`` (fresh terminal evidence),
+    ``alive_ts`` (fresh running activity, else None) and ``status``
+    (the verdict's status word when it was usable, else None). A
+    verdict whose run_id disagrees with the registration is not
+    usable at all: a newer wake may own this msgid now.
+    """
+    out = {"terminal": False, "alive_ts": None, "status": None}
+    raw = verdicts.get(msgid)
+    if not isinstance(raw, dict):
+        return out
+    verdict_run = raw.get("run_id")
+    if (registered_run_id and isinstance(verdict_run, str)
+            and verdict_run and verdict_run != registered_run_id):
+        return out
+    checked = epoch_of(raw.get("checked_at"))
+    if not _fresh(checked, now, PLATFORM_VERDICT_MAX_AGE_SECS):
+        return out
+    status = str(raw.get("status") or "")
+    if status in PLATFORM_TERMINAL_STATUSES:
+        out["terminal"] = True
+        out["status"] = status
+        return out
+    if status == "running":
+        updated = epoch_of(raw.get("agent_updated_at"))
+        if _fresh(updated, now, PLATFORM_RUNNING_FRESH_SECS):
+            out["alive_ts"] = updated
+            out["status"] = status
+    return out
+
+
 def assess(msgid: str, *, now: float, window: float,
-           bridge_state_path: str, worker_activity_path: str) -> dict:
+           bridge_state_path: str, worker_activity_path: str,
+           platform_status_path: str = "") -> dict:
     """Say whether msgid still has real activity inside ``window`` seconds.
 
-    Returns ``alive``, ``source``, ``activity_ts``, and ``degraded``.
-    ``alive`` is true only for a positive fresh signal. Degraded
-    sources contribute no signal.
+    Returns ``alive``, ``source``, ``activity_ts``, and ``degraded``,
+    plus the todo-21 fields ``platform_terminal``,
+    ``platform_status``, ``worker_run_id``, and
+    ``worker_hold_until``. ``alive`` is true only for a positive
+    fresh signal (a live worker hold counts). ``platform_terminal``
+    is evidence for the hook's early route, never an alive signal.
+    Degraded sources contribute no signal.
     """
+    msgid = str(msgid)
     degraded: list[str] = []
     bridge, bridge_reason = _read_object(bridge_state_path)
     if bridge_reason:
@@ -185,17 +265,46 @@ def assess(msgid: str, *, now: float, window: float,
     worker, worker_reason = _read_object(worker_activity_path)
     if worker_reason:
         degraded.append(worker_reason)
+    verdicts, verdict_reason = _read_object(platform_status_path)
+    if verdict_reason:
+        degraded.append(verdict_reason)
+
+    record = _worker_record(worker, msgid) if isinstance(worker, dict) else None
+    registered_run = None
+    hold_until = None
+    if record is not None:
+        run = record.get("run_id")
+        if isinstance(run, str) and run:
+            registered_run = run
+        hold_until = epoch_of(record.get("hold_until"))
+
+    platform = {"terminal": False, "alive_ts": None, "status": None}
+    if isinstance(verdicts, dict):
+        platform = _platform_hit(verdicts, msgid, now, registered_run)
+
+    extra = {"platform_terminal": platform["terminal"],
+             "platform_status": platform["status"],
+             "worker_run_id": registered_run,
+             "worker_hold_until": hold_until}
+
+    # A live hold outranks everything, terminal verdicts included:
+    # the worker declared this silence in advance.
+    if hold_until is not None and hold_until > now:
+        return {"alive": True, "source": "worker-hold",
+                "activity_ts": hold_until, "degraded": degraded, **extra}
 
     best: tuple[int, float, str] | None = None
     if isinstance(bridge, dict):
-        best = _bridge_hit(bridge, str(msgid), now, window)
+        best = _bridge_hit(bridge, msgid, now, window)
     if isinstance(worker, dict):
-        ts = _worker_ts(worker, str(msgid))
+        ts = _worker_ts(worker, msgid)
         if _fresh(ts, now, window):
             best = _consider(best, 3, ts, "worker-activity")
+    if platform["alive_ts"] is not None:
+        best = _consider(best, 4, platform["alive_ts"], "platform-running")
 
     if best is None:
         return {"alive": False, "source": None, "activity_ts": None,
-                "degraded": degraded}
+                "degraded": degraded, **extra}
     return {"alive": True, "source": best[2], "activity_ts": best[1],
-            "degraded": degraded}
+            "degraded": degraded, **extra}

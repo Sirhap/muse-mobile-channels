@@ -21,9 +21,11 @@ from channel_common import (  # noqa: E402
     pid_alive,
     read_pid_file,
     register_cancel,
+    register_worker_activity,
     reply_block_reason_for_row,
     safe_child_name,
     subagent_outcome_default,
+    update_worker_activity,
 )
 
 BASE = Path(__file__).resolve().parent
@@ -34,6 +36,7 @@ OUTBOX_RESULTS = STATE / "outbox_results.jsonl"
 OUTBOX_RETRY = STATE / "outbox_retry.json"
 STATUS = STATE / "status.json"
 LOGIN_STATE = STATE / "login.json"
+WORKER_ACTIVITY = STATE / "worker_activity.json"
 HOOK_STATE = muse_home() / "hooks" / "state" / "weixin-bot"
 
 
@@ -216,9 +219,29 @@ def main() -> int:
     phb = sub.add_parser("heartbeat-start")
     phb.add_argument("--msgids", required=True,
                      help="comma-separated msgids of the batch being worked on")
+    phb.add_argument("--run-id", dest="run_id",
+                     help="this wake's run_id (from the first message "
+                          "header); also self-registers the batch in "
+                          "worker_activity.json for the death watch")
     phs = sub.add_parser("heartbeat-stop")
     phs.add_argument("--msgids", required=True,
                      help="comma-separated msgids whose heartbeat should stop")
+
+    pwa = sub.add_parser("worker-activity",
+                         help="write the worker's own activity ledger "
+                              "(death watch source 2/3, todo 21)")
+    pwa.add_argument("--msgid", required=True)
+    pwa.add_argument("--register", action="store_true",
+                     help="register this msgid with --run-id")
+    pwa.add_argument("--run-id", dest="run_id",
+                     help="run_id from the first message header")
+    pwa.add_argument("--beat", action="store_true",
+                     help="refresh the activity timestamp")
+    pwa.add_argument("--progress",
+                     help="short stage text stored with a beat")
+    pwa.add_argument("--hold-secs", type=float, dest="hold_secs",
+                     help="declare intentional silence for this many "
+                          "seconds (0 clears a previous hold)")
 
 
     args = p.parse_args()
@@ -353,7 +376,47 @@ def main() -> int:
              str(STATE), str(HOOK_STATE), ",".join(msgids)],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, start_new_session=True)
+        if args.run_id:
+            # Self-registration rides the batch-start command (todo
+            # 21): the ledger is what lets the death watch ask the
+            # platform about THIS worker. Fail-soft -- a registration
+            # error must never break the proven heartbeat path.
+            try:
+                register_worker_activity(
+                    WORKER_ACTIVITY, msgids, args.run_id, time.time())
+            except Exception as e:
+                print(f"warning: worker registration failed ({e})",
+                      file=sys.stderr)
         print(json.dumps({"heartbeat_started": msgids}, ensure_ascii=False))
+    elif args.cmd == "worker-activity":
+        if safe_child_name(args.msgid) is None:
+            print("refusing msgid that is not a single path segment",
+                  file=sys.stderr)
+            return 2
+        modes = sum(bool(x) for x in (
+            args.register, args.beat or args.progress is not None,
+            args.hold_secs is not None))
+        if modes != 1:
+            print("give exactly one of --register, --beat/--progress, "
+                  "--hold-secs", file=sys.stderr)
+            return 2
+        try:
+            if args.register:
+                if not args.run_id:
+                    print("--register needs --run-id", file=sys.stderr)
+                    return 2
+                rec = register_worker_activity(
+                    WORKER_ACTIVITY, [args.msgid], args.run_id,
+                    time.time())
+            else:
+                rec = update_worker_activity(
+                    WORKER_ACTIVITY, args.msgid, time.time(),
+                    progress=args.progress, hold_secs=args.hold_secs)
+        except Exception as e:
+            print(f"worker-activity write failed ({e})", file=sys.stderr)
+            return 1
+        print(json.dumps({"worker_activity": rec.get(args.msgid, {})},
+                         ensure_ascii=False))
     elif args.cmd == "heartbeat-stop":
         msgids = [m.strip() for m in args.msgids.split(",") if m.strip()]
         if any(safe_child_name(m) is None for m in msgids):
