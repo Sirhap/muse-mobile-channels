@@ -103,6 +103,16 @@ def rewrite_hook(src: str, spec: dict[str, str], bot_state: Path, cli: Path) -> 
         str(REPO_ROOT / "death_watch_activity.py"),
     )
     rewritten = rewritten.replace(
+        "/home/hatch/workspace/channel_common.py",
+        str(REPO_ROOT / "channel_common.py"),
+    )
+    # hook-heal.sh is a production self-heal. The sandbox must not
+    # execute it, and the rewrite gate rejects any leftover hatch path.
+    rewritten = rewritten.replace(
+        "/home/hatch/workspace/channel-restore/hook-heal.sh",
+        str(bot_state / "hook-heal-not-in-sandbox.sh"),
+    )
+    rewritten = rewritten.replace(
         "/home/hatch/workspace/native-bridge/state.json",
         str(bridge_state),
     )

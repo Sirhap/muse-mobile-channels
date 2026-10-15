@@ -523,6 +523,73 @@ def _covered_by_followup(ids, since, last_act):
     return None
 
 
+_pending_answers_mod = None
+_pending_answers_tried = False
+
+
+def _pending_channel():
+    """weixin / wecom, from this hook's own state directory name."""
+    name = os.path.basename(os.path.dirname(pending_path))
+    if name.endswith("-bot"):
+        name = name[: -len("-bot")]
+    return name or "unknown"
+
+
+def _load_pending_answers():
+    """channel_common, or None. A missing module must not stop the poll."""
+    global _pending_answers_mod, _pending_answers_tried
+    if _pending_answers_tried:
+        return _pending_answers_mod
+    _pending_answers_tried = True
+    path = (os.environ.get("PENDING_ANSWERS_PY")
+            or "/home/hatch/workspace/channel_common.py")
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "pending_answers_channel_common", path)
+        if spec is None or spec.loader is None:
+            return None
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _pending_answers_mod = mod
+    except Exception:
+        _pending_answers_mod = None
+    return _pending_answers_mod
+
+
+def _record_pending(ids, source):
+    """Best-effort row on the shared pending-answers ledger.
+
+    Fail-silent. covered_drops.jsonl, cancel, and the wake path do
+    not depend on this write. The file sits next to the per-channel
+    hook state directories so both channels and the bridge share it.
+    """
+    mod = _load_pending_answers()
+    if mod is None:
+        return
+    rows = []
+    for mid in ids:
+        key = str(mid or "")
+        if not key:
+            continue
+        entry = _inbox_by_id.get(key) or {}
+        rows.append({
+            "channel": _pending_channel(),
+            "msgid": key,
+            "source": source,
+            "ts": now,
+            "summary": entry.get("text") or "",
+        })
+    if not rows:
+        return
+    path = os.environ.get("PENDING_ANSWERS_PATH") or os.path.join(
+        os.path.dirname(os.path.dirname(pending_path)),
+        "pending_answers.json")
+    try:
+        mod.record_pending_answers(path, rows)
+    except Exception:
+        pass
+
+
 def _log_covered(ids, since, last_act, covering):
     try:
         with open(os.path.join(os.path.dirname(batch_path),
@@ -534,6 +601,7 @@ def _log_covered(ids, since, last_act, covering):
                  "ts": now}, ensure_ascii=False) + "\n")
     except OSError:
         pass
+    _record_pending(ids, "covered-drop")
 
 
 _resume_attempts_path = os.path.join(os.path.dirname(pending_path),
@@ -1245,6 +1313,8 @@ if not dry:
         # Same-poll guard: later sections (starvation, reconciliation)
         # consult the in-memory cancelled set loaded at poll start.
         _cancelled_ids.update(str(e["msgid"]) for e in failed_entries)
+        _record_pending((e.get("msgid") for e in failed_entries),
+                        "fail-stop")
         _parts = []
         for e in failed_entries[:3]:
             _t = (e.get("text") or "").strip() or "（无文字消息）"
