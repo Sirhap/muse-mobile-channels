@@ -260,6 +260,126 @@ def test_weixin(wx):
           and any("stale session; probe" in line for line in stale["logs"])
           and not _exhausted_logs(stale["logs"], "weixin-gateway"))
 
+    poison = asyncio.run(_drive_weixin_poison_batch(wx))
+    check("weixin I-1 poison batch: [good, poison, good] processes both good messages",
+          [r.get("msgid") for r in poison["inbox"]] == ["m-good-1", "m-good-2"]
+          and [r.get("text") for r in poison["inbox"]] == ["第一条正常消息", "第二条正常消息"])
+    check("weixin I-1 poison batch: quarantines poison message with error field and advances cursor",
+          len(poison["quarantine"]) == 1
+          and poison["quarantine"][0].get("message_id") == "m-poison-1"
+          and "error" in poison["quarantine"][0]
+          and poison["sync_buf"] == "buf-after-poison-batch"
+          and poison["saved_sync"].get("buf") == "buf-after-poison-batch"
+          and any("m-poison-1" in line for line in poison["logs"]))
+
+
+async def _drive_weixin_poison_batch(wx):
+    """I-1 regression: a getupdates batch [good, poison, good] in run_session
+    isolates the failing message, writes it to state/poison_messages.jsonl
+    with an error field, processes both good messages, and advances sync_buf."""
+    sbx = SBX / "wx-poison-batch"
+    if sbx.exists():
+        for child in sbx.iterdir():
+            if child.is_file():
+                child.unlink()
+    _bind_weixin(wx, sbx)
+    wx.POISON_MESSAGES = sbx / "poison_messages.jsonl"
+    wx.HOOK_STATE_DIR = sbx / "hookstate"
+    wx.HOOK_STATE_DIR.mkdir(parents=True, exist_ok=True)
+    wx.load_credentials = lambda: {
+        "token": "test-token",
+        "bot_id": "bot",
+        "user_id": "owner-u1",
+        "base_url": "https://example.invalid",
+    }
+    logs = []
+    wx.log = logs.append
+    g = wx.Gateway()
+
+    async def noop(*_a, **_k):
+        return None
+
+    g.outbox_loop = noop
+    g.feedback_watch_loop = noop
+    g._send_typing = noop
+    g._maybe_arrival_feedback = lambda *_a, **_k: None
+
+    real_handle_inbound = g.handle_inbound
+
+    async def wrapped_handle_inbound(client, creds, msg):
+        if isinstance(msg, dict) and msg.get("message_id") == "m-poison-1":
+            raise ValueError("simulated deterministic malformed payload crash")
+        return await real_handle_inbound(client, creds, msg)
+
+    g.handle_inbound = wrapped_handle_inbound
+
+    polls = {"n": 0}
+    batch_msgs = [
+        {
+            "message_id": "m-good-1",
+            "message_type": 1,
+            "from_user_id": "owner-u1",
+            "context_token": "ctx-1",
+            "item_list": [{"type": 1, "text_item": {"text": "第一条正常消息"}}],
+        },
+        {
+            "message_id": "m-poison-1",
+            "message_type": 1,
+            "from_user_id": "owner-u1",
+            "context_token": "ctx-poison",
+            "item_list": "not-a-list-and-deterministic-failure",
+        },
+        {
+            "message_id": "m-good-2",
+            "message_type": 1,
+            "from_user_id": "owner-u1",
+            "context_token": "ctx-2",
+            "item_list": [{"type": 1, "text_item": {"text": "第二条正常消息"}}],
+        },
+    ]
+
+    async def fake_post(_client, _base, endpoint, _body, _token, _timeout):
+        if "notifystart" in endpoint:
+            return {}
+        if "getupdates" not in endpoint:
+            return {"ret": 0}
+        polls["n"] += 1
+        if polls["n"] == 1:
+            return {
+                "errcode": 0,
+                "ret": 0,
+                "msgs": batch_msgs,
+                "get_updates_buf": "buf-after-poison-batch",
+            }
+        raise StopLoop()
+
+    g._post = fake_post
+    try:
+        try:
+            await g.run_session(None, wx.load_credentials())
+        except StopLoop:
+            pass
+    finally:
+        if g._lock_fd is not None:
+            g._lock_fd.close()
+            g._lock_fd = None
+
+    def _read_jsonl(p):
+        if not p.exists():
+            return []
+        return [json.loads(line) for line in p.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+    saved_sync = {}
+    if wx.SYNC_FILE.exists():
+        saved_sync = json.loads(wx.SYNC_FILE.read_text(encoding="utf-8"))
+    return {
+        "inbox": _read_jsonl(wx.INBOX),
+        "quarantine": _read_jsonl(sbx / "poison_messages.jsonl"),
+        "sync_buf": g.sync_buf,
+        "saved_sync": saved_sync,
+        "logs": logs,
+    }
+
 
 # ---------------------------------------------------------------- wecom
 
