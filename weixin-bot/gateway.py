@@ -202,6 +202,14 @@ CLIENT_VERSION = str((2 << 16) | (4 << 8) | 9)  # 0x00MMNNPP encoding of 2.4.9
 BOT_AGENT = "Muse/1.0"
 CHUNK_LIMIT = 4000
 STALE_TOKEN_ERRCODE = -14
+# Consecutive failed connection-establishment episodes before the
+# long-poll loop parks. One episode is run_session returning a
+# failure reason: the getupdates loop gave up, or the session
+# raised. A getupdates round that returns messages or an empty
+# batch with a normal errcode resets the count. The in-session
+# threshold of 5 transport errors, the stale-token probe, and
+# needs_relogin are unchanged.
+RECONNECT_MAX_ATTEMPTS = 3
 
 
 def log(msg: str) -> None:
@@ -1650,6 +1658,10 @@ class Gateway:
         self.msgs_sent = 0
         self.last_error = ""
         self.state = "starting"
+        # See RECONNECT_MAX_ATTEMPTS. Reset by a normal getupdates
+        # round; run() increments it when the session returns a
+        # failure reason. Process restart starts it over at 0.
+        self.reconnect_failures = 0
         self.seen_msgids: set[str] = set()
         self.context: dict[str, dict] = {}
         self.typing_tickets: dict[str, tuple[str, float]] = {}
@@ -3973,7 +3985,6 @@ class Gateway:
                         return f"getupdates failed repeatedly: {e}"
                     await asyncio.sleep(min(2 * failures, 10))
                     continue
-                failures = 0
                 errcode = resp.get("errcode")
                 ret = resp.get("ret")
                 if (errcode not in (None, 0)) or (ret not in (None, 0)):
@@ -3988,12 +3999,25 @@ class Gateway:
                         self.write_status()
                         log("session stale (-14); handing back for probe-retry")
                         return "stale_token"
+                    # Same streak as a transport error. Clearing it on
+                    # any HTTP response made this branch always see
+                    # failures == 1, so a bad errcode retried forever
+                    # inside one session and never became an episode
+                    # the outer cap can stop.
                     failures += 1
                     log(f"getupdates ret={ret} errcode={errcode} errmsg={resp.get('errmsg')} ({failures})")
                     if failures >= 5:
                         return f"getupdates failed repeatedly: ret={ret} errcode={errcode}"
                     await asyncio.sleep(min(2 * failures, 10))
                     continue
+                # Normal getupdates round: messages, or an empty batch,
+                # with a successful errcode. The connection is up, so
+                # both the in-session streak and the consecutive
+                # failed-episode counter reset. A long-poll
+                # TimeoutException is neither (the session simply
+                # polls again, as before).
+                failures = 0
+                self.reconnect_failures = 0
                 new_buf = resp.get("get_updates_buf")
                 msgs = resp.get("msgs") or []
                 try:
@@ -4015,9 +4039,35 @@ class Gateway:
             watch_task.cancel()
             self.connected = False
 
+    async def _park_reconnect_exhausted(self, reason: str) -> None:
+        """Stop reconnecting and leave state ``reconnect_exhausted``.
+
+        Called once, after ``RECONNECT_MAX_ATTEMPTS`` consecutive
+        failed episodes. The process stays in this coroutine so
+        systemd does not restart-loop an exit. A new process is what
+        tries again: startup reloads the credential file. This wait
+        is not another connection attempt.
+        """
+        self.state = "reconnect_exhausted"
+        self.connected = False
+        detail = " ".join((reason or "").split())[:160]
+        self.last_error = (
+            f"reconnect exhausted after {RECONNECT_MAX_ATTEMPTS} "
+            "consecutive failed connection attempts")
+        if detail:
+            self.last_error = f"{self.last_error}: {detail}"
+        self.write_status()
+        log(
+            "weixin-gateway reconnect exhausted after "
+            f"{RECONNECT_MAX_ATTEMPTS} consecutive failed connection "
+            "attempts; state=reconnect_exhausted")
+        while self.state == "reconnect_exhausted":
+            await asyncio.sleep(30)
+
     async def run(self) -> None:
         backoff = 5
         stale_hits = 0
+        self.reconnect_failures = 0
         # Explicit proxy from env: httpx trust_env parsing chokes on the
         # bracketed IPv6 entries in NO_PROXY here ("Invalid port ':1]'").
         proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or None
@@ -4068,6 +4118,15 @@ class Gateway:
                             pass
                     self.state = "reconnecting"
                     backoff = 5
+                    continue
+                # Failed episode: the getupdates loop returned a
+                # failure reason, or run_session raised. stale_token
+                # and needs_relogin already continued above and do
+                # not count. A normal getupdates round inside the
+                # session reset reconnect_failures.
+                self.reconnect_failures += 1
+                if self.reconnect_failures >= RECONNECT_MAX_ATTEMPTS:
+                    await self._park_reconnect_exhausted(reason)
                     continue
                 self.state = "reconnecting"
                 self.write_status()
