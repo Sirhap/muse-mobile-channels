@@ -1,4 +1,4 @@
-"""Inbound media streaming, the shared 1GiB cap, and decrypt equivalence.
+"""Inbound media streaming, the shared 1GiB cap, decrypt equivalence, and retry.
 
 Downloads are fake response objects and in-process httpx mocks. Nothing
 in this file opens a socket.
@@ -17,6 +17,7 @@ import sys
 import tempfile
 import tracemalloc
 import unittest
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from urllib.parse import quote
 
@@ -158,6 +159,94 @@ class FakeClient:
         if not self._responses:
             raise AssertionError("no fake response left")
         return self._responses.pop(0)
+
+
+def inbound_temp_names(directory: Path) -> list[str]:
+    """``.inbound-*`` names still in ``directory``."""
+    if not directory.exists():
+        return []
+    return sorted(
+        path.name for path in directory.iterdir() if path.name.startswith(".inbound-")
+    )
+
+
+class BodyErrorResponse(FakeResponse):
+    """Yields ``chunks``, then raises ``error`` from the body iterator."""
+
+    def __init__(self, chunks, error: BaseException, status_code: int = 200, headers=None) -> None:
+        super().__init__(chunks, status_code=status_code, headers=headers)
+        self.error = error
+
+    def aiter_bytes(self, chunk_size: int | None = None):
+        self.aiter_calls.append(chunk_size)
+
+        async def _iterate():
+            for chunk in self._chunks:
+                self.pulled += 1
+                yield chunk
+            raise self.error
+
+        return _iterate()
+
+
+class NotingBody(FakeResponse):
+    """Records ``.inbound-*`` names once the cipher file has been opened."""
+
+    def __init__(
+        self,
+        chunks,
+        directory: Path,
+        seen: list,
+        error: BaseException | None = None,
+        status_code: int = 200,
+    ) -> None:
+        super().__init__(chunks, status_code=status_code)
+        self.directory = directory
+        self.seen = seen
+        self.error = error
+
+    def aiter_bytes(self, chunk_size: int | None = None):
+        self.aiter_calls.append(chunk_size)
+
+        async def _iterate():
+            self.seen.append(inbound_temp_names(self.directory))
+            for chunk in self._chunks:
+                self.pulled += 1
+                yield chunk
+            if self.error is not None:
+                raise self.error
+
+        return _iterate()
+
+
+class DirectoryClient(FakeClient):
+    """Records leftover temp names at the start of each ``stream`` call."""
+
+    def __init__(self, responses, directory: Path) -> None:
+        super().__init__(responses)
+        self.directory = directory
+        self.temps_at_start: list[list[str]] = []
+
+    def stream(self, method, url, timeout=None):
+        self.temps_at_start.append(inbound_temp_names(self.directory))
+        return super().stream(method, url, timeout)
+
+
+class ScriptedClient:
+    """``stream`` raises a scripted exception or returns a scripted response."""
+
+    def __init__(self, steps) -> None:
+        self._steps = list(steps)
+        self.calls: list[dict] = []
+
+    def stream(self, method, url, timeout=None):
+        self.calls.append({"method": method, "url": url, "timeout": timeout})
+        if not self._steps:
+            raise AssertionError("no scripted step left")
+        step = self._steps.pop(0)
+        if isinstance(step, BaseException):
+            raise step
+        return step
 
 
 def _split(data: bytes, size: int) -> list[bytes]:
@@ -488,6 +577,16 @@ class _GatewaySandbox(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.media_dir = Path(self.tmp.name) / "media"
         self.module.MEDIA_DIR = self.media_dir
+        self.download_sleeps: list[float] = []
+        self.temps_during_backoff: list[list[str]] = []
+        self._saved_download_sleep = im.inbound_download_sleep
+
+        async def _record_backoff(seconds: float) -> None:
+            self.download_sleeps.append(seconds)
+            self.temps_during_backoff.append(inbound_temp_names(self.media_dir))
+
+        im.inbound_download_sleep = _record_backoff
+        self.addCleanup(setattr, im, "inbound_download_sleep", self._saved_download_sleep)
         self.addCleanup(self._restore)
 
     def _restore(self) -> None:
@@ -501,12 +600,250 @@ class _GatewaySandbox(unittest.TestCase):
         return sorted(path.name for path in self.media_dir.iterdir())
 
 
-class WeixinDownloadTests(_GatewaySandbox):
+class _RetryDownloadMixin:
+    """Retry cases shared by the Weixin and WeCom download paths."""
+
+    def _invoke_download(self, client, media: list[dict], msgid: str) -> None:
+        raise NotImplementedError
+
+    def _media_and_cipher(self, plain: bytes) -> tuple[dict, bytes]:
+        raise NotImplementedError
+
+    def _spy_decrypt(self) -> list[bytes]:
+        raise NotImplementedError
+
+    def _assert_no_inbound_temps(self) -> None:
+        self.assertEqual(inbound_temp_names(self.media_dir), [])
+        self.assertTrue(all(names == [] for names in self.temps_during_backoff))
+
+    def test_transport_drop_retries_then_publishes(self) -> None:
+        plain = b"\x89PNG\r\n\x1a\n" + b"retry-body"
+        media, cipher = self._media_and_cipher(plain)
+        message = (
+            "peer closed connection without sending complete message body "
+            f"(received 8 bytes, expected {len(cipher)})"
+        )
+        seen_names: list[list[str]] = []
+        partial = cipher[:8]
+        responses = [
+            NotingBody(
+                [partial],
+                self.media_dir,
+                seen_names,
+                error=httpx.RemoteProtocolError(message),
+            ),
+            NotingBody(
+                [partial],
+                self.media_dir,
+                seen_names,
+                error=httpx.RemoteProtocolError(message),
+            ),
+            NotingBody(_split(cipher, 5), self.media_dir, seen_names),
+        ]
+        client = DirectoryClient(responses, self.media_dir)
+        decrypted = self._spy_decrypt()
+        self._invoke_download(client, [media], "drop")
+        path = Path(media["local_path"])
+        names = [group[0] for group in seen_names]
+        self.assertEqual(len(client.calls), 3)
+        self.assertEqual(decrypted, [cipher])
+        self.assertEqual(path.read_bytes(), plain)
+        self.assertEqual(path.name, media_filename("drop", 0, "png"))
+        self.assertEqual(self._names(), [path.name])
+        self.assertEqual(self.download_sleeps, [2.0, 5.0])
+        self.assertEqual(client.temps_at_start, [[], [], []])
+        self.assertEqual(self.temps_during_backoff, [[], []])
+        self.assertEqual([len(group) for group in seen_names], [1, 1, 1])
+        self.assertEqual(len(names), 3)
+        self.assertEqual(len(set(names)), 3)
+        for name in names:
+            self.assertTrue(name.startswith(".inbound-") and name.endswith(".cipher"))
+        self.assertGreater(responses[0].pulled, 0)
+        self.assertGreater(responses[1].pulled, 0)
+        self.assertIn(
+            f"media drop/0: download attempt 1/3 failed ({message}); retrying",
+            self.logs,
+        )
+        self.assertIn(
+            f"media drop/0: download attempt 2/3 failed ({message}); retrying",
+            self.logs,
+        )
+        self.assertFalse(any("attempt 3/3" in line for line in self.logs))
+        self.assertFalse(any("download/decrypt failed" in line for line in self.logs))
+        self.assertTrue(any(f"saved {path} ({len(plain)} bytes)" in line for line in self.logs))
+        self._assert_no_inbound_temps()
+
+    def test_truncated_stream_stops_after_three_attempts(self) -> None:
+        media, cipher = self._media_and_cipher(b"\x89PNG\r\n\x1a\n" + b"never")
+        message = (
+            "peer closed connection without sending complete message body "
+            f"(received 8 bytes, expected {len(cipher)})"
+        )
+        seen_names: list[list[str]] = []
+        responses = [
+            NotingBody(
+                [cipher[:8]],
+                self.media_dir,
+                seen_names,
+                error=httpx.RemoteProtocolError(message),
+            )
+            for _ in range(3)
+        ]
+        client = DirectoryClient(responses, self.media_dir)
+        decrypted = self._spy_decrypt()
+        self._invoke_download(client, [media], "trunc")
+        self.assertEqual(len(client.calls), 3)
+        self.assertEqual(decrypted, [])
+        self.assertNotIn("local_path", media)
+        self.assertEqual(self._names(), [])
+        self.assertEqual(self.download_sleeps, [2.0, 5.0])
+        self.assertEqual(client.temps_at_start, [[], [], []])
+        self.assertEqual([len(group) for group in seen_names], [1, 1, 1])
+        self.assertEqual(len({group[0] for group in seen_names}), 3)
+        self.assertTrue(all(response.pulled > 0 for response in responses))
+        self.assertIn(
+            f"media trunc/0: download attempt 1/3 failed ({message}); retrying",
+            self.logs,
+        )
+        self.assertIn(
+            f"media trunc/0: download attempt 2/3 failed ({message}); retrying",
+            self.logs,
+        )
+        self.assertFalse(any("attempt 3/3" in line for line in self.logs))
+        self.assertIn(f"media trunc/0: download/decrypt failed: {message}", self.logs)
+        self._assert_no_inbound_temps()
+
+    def test_too_large_is_not_retried(self) -> None:
+        media, cipher = self._media_and_cipher(b"\x89PNG\r\n\x1a\n" + b"big")
+        self.module.INBOUND_MEDIA_MAX_BYTES = 8
+        self.assertGreater(len(cipher), 8)
+        client = DirectoryClient(
+            [FakeResponse([cipher]), FakeResponse([cipher])],
+            self.media_dir,
+        )
+        decrypted = self._spy_decrypt()
+        self._invoke_download(client, [media], "cap")
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(decrypted, [])
+        self.assertNotIn("local_path", media)
+        self.assertEqual(self._names(), [])
+        self.assertEqual(self.download_sleeps, [])
+        self.assertFalse(any("retrying" in line for line in self.logs))
+        self.assertFalse(any("download/decrypt failed" in line for line in self.logs))
+        self.assertTrue(any("too large" in line and "skipped" in line for line in self.logs))
+        self._assert_no_inbound_temps()
+
+    def test_http_404_is_not_retried(self) -> None:
+        media, cipher = self._media_and_cipher(b"\x89PNG\r\n\x1a\n" + b"missing")
+        missing = FakeResponse([b"missing"], status_code=404)
+        client = DirectoryClient(
+            [missing, FakeResponse([cipher])],
+            self.media_dir,
+        )
+        self._invoke_download(client, [media], "e404")
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(missing.aiter_calls, [])
+        self.assertEqual(missing.entered, 1)
+        self.assertEqual(missing.exited, 1)
+        self.assertNotIn("local_path", media)
+        self.assertEqual(self._names(), [])
+        self.assertEqual(self.download_sleeps, [])
+        self.assertFalse(any("retrying" in line for line in self.logs))
+        self.assertIn("media e404/0: download/decrypt failed: http 404", self.logs)
+        self._assert_no_inbound_temps()
+
+    def test_http_503_second_attempt_publishes(self) -> None:
+        plain = b"\x89PNG\r\n\x1a\n" + b"503-ok"
+        media, cipher = self._media_and_cipher(plain)
+        client = DirectoryClient(
+            [
+                FakeResponse([b"busy"], status_code=503),
+                FakeResponse(_split(cipher, 4)),
+            ],
+            self.media_dir,
+        )
+        self._invoke_download(client, [media], "s503")
+        path = Path(media["local_path"])
+        self.assertEqual(len(client.calls), 2)
+        self.assertEqual(path.read_bytes(), plain)
+        self.assertEqual(path.name, media_filename("s503", 0, "png"))
+        self.assertEqual(self.download_sleeps, [2.0])
+        self.assertEqual(client.temps_at_start, [[], []])
+        self.assertIn(
+            "media s503/0: download attempt 1/3 failed (http 503); retrying",
+            self.logs,
+        )
+        self.assertFalse(any("download/decrypt failed" in line for line in self.logs))
+        self._assert_no_inbound_temps()
+
+    def test_http_503_stops_after_three_attempts(self) -> None:
+        media, _cipher = self._media_and_cipher(b"\x89PNG\r\n\x1a\n" + b"still-busy")
+        failures = [FakeResponse([b"x"], status_code=503) for _ in range(4)]
+        client = DirectoryClient(failures, self.media_dir)
+        self._invoke_download(client, [media], "e503")
+        self.assertEqual(len(client.calls), 3)
+        self.assertEqual(failures[3].entered, 0)
+        self.assertNotIn("local_path", media)
+        self.assertEqual(self._names(), [])
+        self.assertEqual(self.download_sleeps, [2.0, 5.0])
+        self.assertEqual([item.aiter_calls for item in failures[:3]], [[], [], []])
+        self.assertIn(
+            "media e503/0: download attempt 1/3 failed (http 503); retrying",
+            self.logs,
+        )
+        self.assertIn(
+            "media e503/0: download attempt 2/3 failed (http 503); retrying",
+            self.logs,
+        )
+        self.assertFalse(any("attempt 3/3" in line for line in self.logs))
+        self.assertIn("media e503/0: download/decrypt failed: http 503", self.logs)
+        self._assert_no_inbound_temps()
+
+    def test_decrypt_failure_of_a_complete_body_is_not_retried(self) -> None:
+        media, _cipher = self._media_and_cipher(b"complete-body")
+        bad = b"abc"
+        decrypted = self._spy_decrypt()
+        client = DirectoryClient(
+            [FakeResponse([bad]), FakeResponse([bad]), FakeResponse([bad])],
+            self.media_dir,
+        )
+        self._invoke_download(client, [media], "bad")
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(decrypted, [bad])
+        self.assertNotIn("local_path", media)
+        self.assertEqual(self._names(), [])
+        self.assertEqual(self.download_sleeps, [])
+        self.assertFalse(any("retrying" in line for line in self.logs))
+        self.assertTrue(any(
+            line.startswith("media bad/0: download/decrypt failed:") for line in self.logs
+        ))
+        self._assert_no_inbound_temps()
+
+
+class WeixinDownloadTests(_RetryDownloadMixin, _GatewaySandbox):
     module = None
 
     @classmethod
     def setUpClass(cls) -> None:
         cls.module = wx
+
+    def _invoke_download(self, client, media: list[dict], msgid: str) -> None:
+        _run(self.module.Gateway.__new__(self.module.Gateway)._download_media(client, media, msgid))
+
+    def _media_and_cipher(self, plain: bytes) -> tuple[dict, bytes]:
+        return self._image(ECB_KEY), self.module.aes_ecb_encrypt(plain, ECB_KEY)
+
+    def _spy_decrypt(self) -> list[bytes]:
+        seen: list[bytes] = []
+        original = self.module.aes_ecb_decrypt_file
+
+        def spy(src: Path, dst: Path, key: bytes) -> None:
+            seen.append(src.read_bytes())
+            original(src, dst, key)
+
+        self.module.aes_ecb_decrypt_file = spy
+        self.addCleanup(setattr, self.module, "aes_ecb_decrypt_file", original)
+        return seen
 
     def _image(self, key: bytes, url: str = WX_URL, extra: dict | None = None) -> dict:
         item = {"aeskey": key.hex(), "media": {"full_url": url}}
@@ -641,14 +978,18 @@ class WeixinDownloadTests(_GatewaySandbox):
         self.assertEqual(Path(media[0]["local_path"]).read_bytes(), plain)
         self.assertTrue(Path(media[0]["local_path"]).name.endswith(".zip"))
 
-    def test_http_error_is_not_retried(self) -> None:
-        response = FakeResponse([b"x"], status_code=502)
-        client = FakeClient(response)
+    def test_http_502_is_retried_and_keeps_the_final_log_line(self) -> None:
+        client = FakeClient([FakeResponse([b"x"], status_code=502) for _ in range(3)])
         media = [self._image(ECB_KEY)]
         _run(wx.Gateway.__new__(wx.Gateway)._download_media(client, media, "err"))
-        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(len(client.calls), 3)
         self.assertNotIn("local_path", media[0])
         self.assertEqual(self._names(), [])
+        self.assertEqual(self.download_sleeps, [2.0, 5.0])
+        self.assertEqual(inbound_temp_names(self.media_dir), [])
+        self.assertIn("media err/0: download attempt 1/3 failed (http 502); retrying", self.logs)
+        self.assertIn("media err/0: download attempt 2/3 failed (http 502); retrying", self.logs)
+        self.assertFalse(any("attempt 3/3" in line for line in self.logs))
         self.assertTrue(any("download/decrypt failed: http 502" in line for line in self.logs))
 
     def test_real_httpx_stream_saves_the_plaintext(self) -> None:
@@ -714,22 +1055,30 @@ class WeixinDownloadTests(_GatewaySandbox):
         self.assertEqual(self._names(), [])
 
 
-class WecomDownloadTests(_GatewaySandbox):
+class WecomDownloadTests(_RetryDownloadMixin, _GatewaySandbox):
     module = None
 
     @classmethod
     def setUpClass(cls) -> None:
         cls.module = wc
 
-    def setUp(self) -> None:
-        super().setUp()
-        self._sleep = wc.asyncio.sleep
+    def _invoke_download(self, client, media: list[dict], msgid: str) -> None:
+        _run(self._gateway(client)._download_media(media, msgid))
 
-        async def _no_sleep(_seconds):
-            return None
+    def _media_and_cipher(self, plain: bytes) -> tuple[dict, bytes]:
+        return self._item(plain)
 
-        wc.asyncio.sleep = _no_sleep
-        self.addCleanup(setattr, wc.asyncio, "sleep", self._sleep)
+    def _spy_decrypt(self) -> list[bytes]:
+        seen: list[bytes] = []
+        original = self.module.decrypt_wecom_media_file
+
+        def spy(src: Path, dst: Path, aeskey: str) -> None:
+            seen.append(src.read_bytes())
+            original(src, dst, aeskey)
+
+        self.module.decrypt_wecom_media_file = spy
+        self.addCleanup(setattr, self.module, "decrypt_wecom_media_file", original)
+        return seen
 
     def _item(self, plain: bytes, pad_size: int = 32) -> tuple[dict, bytes]:
         cipher = _encrypt_cbc(plain, CBC_KEY, pad_size)
@@ -774,7 +1123,7 @@ class WecomDownloadTests(_GatewaySandbox):
         )
         self.assertFalse(any("download/decrypt failed" in line for line in self.logs))
 
-    def test_http_error_retries_then_bad_ciphertext_leaves_no_partial(self) -> None:
+    def test_http_500_retries_and_bad_ciphertext_does_not(self) -> None:
         item, _cipher = self._item(b"retry-me")
         failures = [FakeResponse([b"nope"], status_code=500) for _ in range(3)]
         client = FakeClient(failures)
@@ -782,17 +1131,23 @@ class WecomDownloadTests(_GatewaySandbox):
         _run(self._gateway(client)._download_media(media, "wc-http"))
         self.assertEqual(len(client.calls), 3)
         self.assertNotIn("local_path", media[0])
-        self.assertTrue(any("download/decrypt failed:" in line for line in self.logs))
+        self.assertEqual(self.download_sleeps, [2.0, 5.0])
+        self.assertTrue(any("download/decrypt failed: http 500" in line for line in self.logs))
         self.assertEqual(self._names(), [])
 
         self.logs.clear()
+        self.download_sleeps.clear()
+        self.temps_during_backoff.clear()
         bad = [FakeResponse([b"abc"]) for _ in range(3)]
         client = FakeClient(bad)
         media = [dict(item)]
         _run(self._gateway(client)._download_media(media, "wc-bad"))
-        self.assertEqual(len(client.calls), 3)
+        self.assertEqual(len(client.calls), 1)
         self.assertNotIn("local_path", media[0])
         self.assertEqual(self._names(), [])
+        self.assertEqual(self.download_sleeps, [])
+        self.assertFalse(any("retrying" in line for line in self.logs))
+        self.assertTrue(any("download/decrypt failed:" in line for line in self.logs))
 
     def test_second_attempt_saves_after_a_transport_error(self) -> None:
         plain = b"\xff\xd8\xff" + b"second"
@@ -804,6 +1159,8 @@ class WecomDownloadTests(_GatewaySandbox):
         media = [item]
         _run(self._gateway(client)._download_media(media, "wc-retry"))
         self.assertEqual(len(client.calls), 2)
+        self.assertEqual(self.download_sleeps, [2.0])
+        self.assertEqual(self.temps_during_backoff, [[]])
         self.assertEqual(Path(media[0]["local_path"]).read_bytes(), plain)
         self.assertTrue(Path(media[0]["local_path"]).name.endswith(".jpg"))
         self.assertEqual(self._names(), [Path(media[0]["local_path"]).name])
@@ -872,6 +1229,286 @@ class WecomDownloadTests(_GatewaySandbox):
             self.logs,
         )
         self.assertEqual(self._names(), [])
+
+
+def _http_status_error(status: int) -> httpx.HTTPStatusError:
+    request = httpx.Request("GET", "https://example.test/obj")
+    response = httpx.Response(status, request=request)
+    return httpx.HTTPStatusError(f"http {status}", request=request, response=response)
+
+
+class InboundDownloadRetryTests(unittest.TestCase):
+    """The shared retry helper, with no gateway around it."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.directory = Path(self.tmp.name)
+        self.logs: list[str] = []
+
+    def _recorder(self) -> tuple[list[float], Callable[[float], Awaitable[None]]]:
+        slept: list[float] = []
+
+        async def _sleep(seconds: float) -> None:
+            slept.append(seconds)
+            self.assertEqual(inbound_temp_names(self.directory), [])
+
+        return slept, _sleep
+
+    async def _download(self, client, **kwargs):
+        pause = kwargs.pop("sleep", None)
+        return await im.download_inbound_cipher(
+            client,
+            "https://example.test/obj",
+            self.directory,
+            kwargs.pop("max_bytes", im.INBOUND_MEDIA_MAX_BYTES),
+            timeout=kwargs.pop("timeout", httpx.Timeout(5.0)),
+            log=self.logs.append,
+            label=kwargs.pop("label", "h/0"),
+            sleep=pause,
+            **kwargs,
+        )
+
+    def test_retry_budget_constants(self) -> None:
+        self.assertEqual(im.INBOUND_DOWNLOAD_MAX_ATTEMPTS, 3)
+        self.assertEqual(im.INBOUND_DOWNLOAD_BACKOFF_SECONDS, (2.0, 5.0))
+
+    def test_classifier_matches_the_transport_policy(self) -> None:
+        transport = (
+            httpx.RemoteProtocolError,
+            httpx.ConnectError,
+            httpx.ConnectTimeout,
+            httpx.ReadTimeout,
+            httpx.WriteTimeout,
+            httpx.PoolTimeout,
+            httpx.NetworkError,
+            httpx.ReadError,
+            httpx.ProtocolError,
+        )
+        for cls in transport:
+            with self.subTest(error=cls.__name__):
+                self.assertTrue(im.is_retryable_inbound_download_error(cls("net")))
+        for exc in (ConnectionResetError("reset"), TimeoutError("timed out"), OSError("os")):
+            with self.subTest(error=type(exc).__name__):
+                self.assertTrue(im.is_retryable_inbound_download_error(exc))
+        self.assertTrue(
+            im.is_retryable_inbound_download_error(httpx.RemoteProtocolError("peer"), 200)
+        )
+        self.assertFalse(im.is_retryable_inbound_download_error(im.InboundMediaTooLarge(9)))
+        self.assertFalse(im.is_retryable_inbound_download_error(im.InboundMediaTooLarge(9), 503))
+        self.assertFalse(im.is_retryable_inbound_download_error(ValueError("pad")))
+        self.assertFalse(im.is_retryable_inbound_download_error(RuntimeError("http 503")))
+        for status in (408, 429, 500, 502, 503, 599):
+            with self.subTest(status=status):
+                self.assertTrue(im.is_retryable_inbound_download_error(_http_status_error(status)))
+                self.assertTrue(
+                    im.is_retryable_inbound_download_error(RuntimeError("http"), status)
+                )
+        for status in (400, 401, 403, 404, 409, 422):
+            with self.subTest(status=status):
+                self.assertFalse(im.is_retryable_inbound_download_error(_http_status_error(status)))
+                self.assertFalse(
+                    im.is_retryable_inbound_download_error(RuntimeError("http"), status)
+                )
+
+    def test_backoff_parameter_can_be_zero(self) -> None:
+        slept, pause = self._recorder()
+        client = ScriptedClient([
+            httpx.ConnectError("connect"),
+            httpx.ReadTimeout("read"),
+            FakeResponse([b"abc"]),
+        ])
+        path = _run(self._download(client, backoff_seconds=(0, 0), sleep=pause))
+        self.assertEqual(path.read_bytes(), b"abc")
+        self.assertEqual(slept, [0.0, 0.0])
+        self.assertEqual(len(client.calls), 3)
+        self.assertEqual(inbound_temp_names(self.directory), [path.name])
+        self.assertTrue(path.name.startswith(".inbound-") and path.name.endswith(".cipher"))
+
+    def test_default_backoff_is_two_then_five(self) -> None:
+        slept, pause = self._recorder()
+        client = ScriptedClient([
+            httpx.PoolTimeout("pool"),
+            httpx.ConnectTimeout("connect"),
+            FakeResponse([b"zz"]),
+        ])
+        path = _run(self._download(client, sleep=pause))
+        self.assertEqual(path.read_bytes(), b"zz")
+        self.assertEqual(slept, [2.0, 5.0])
+        self.assertIn("media h/0: download attempt 1/3 failed (pool); retrying", self.logs)
+        self.assertIn("media h/0: download attempt 2/3 failed (connect); retrying", self.logs)
+        self.assertFalse(any("attempt 3/3" in line for line in self.logs))
+
+    def test_attempts_parameter_of_one_does_not_retry(self) -> None:
+        slept, pause = self._recorder()
+        client = ScriptedClient([
+            httpx.ConnectError("connect"),
+            FakeResponse([b"later"]),
+        ])
+        with self.assertRaises(httpx.ConnectError):
+            _run(self._download(client, attempts=1, backoff_seconds=(0, 0), sleep=pause))
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(slept, [])
+        self.assertEqual(self.logs, [])
+        self.assertEqual(inbound_temp_names(self.directory), [])
+
+    def test_attempts_must_be_positive(self) -> None:
+        client = FakeClient([])
+        with self.assertRaises(ValueError):
+            _run(self._download(client, attempts=0))
+        self.assertEqual(client.calls, [])
+
+    def test_non_transport_body_error_is_not_retried(self) -> None:
+        slept, pause = self._recorder()
+        client = FakeClient([
+            BodyErrorResponse([b"partial"], RuntimeError("boom")),
+            FakeResponse([b"later"]),
+        ])
+        with self.assertRaisesRegex(RuntimeError, "boom"):
+            _run(self._download(client, backoff_seconds=(0, 0), sleep=pause))
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(slept, [])
+        self.assertEqual(self.logs, [])
+        self.assertEqual(inbound_temp_names(self.directory), [])
+
+    def test_oserror_mid_body_is_retried(self) -> None:
+        slept, pause = self._recorder()
+        client = FakeClient([
+            BodyErrorResponse([b"part"], ConnectionResetError("reset")),
+            FakeResponse([b"os-ok"]),
+        ])
+        path = _run(self._download(client, backoff_seconds=(0, 0), sleep=pause))
+        self.assertEqual(path.read_bytes(), b"os-ok")
+        self.assertEqual(len(client.calls), 2)
+        self.assertEqual(slept, [0.0])
+        self.assertIn("media h/0: download attempt 1/3 failed (reset); retrying", self.logs)
+        self.assertEqual(inbound_temp_names(self.directory), [path.name])
+
+    def test_too_large_stops_on_the_first_attempt(self) -> None:
+        slept, pause = self._recorder()
+        first = FakeResponse([b"abcdef"])
+        client = FakeClient([first, FakeResponse([b"ok"])])
+        with self.assertRaises(im.InboundMediaTooLarge) as caught:
+            _run(self._download(client, max_bytes=3, backoff_seconds=(0, 0), sleep=pause))
+        self.assertEqual(caught.exception.nbytes, 6)
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(first.pulled, 1)
+        self.assertEqual(slept, [])
+        self.assertEqual(self.logs, [])
+        self.assertEqual(inbound_temp_names(self.directory), [])
+
+    def test_declared_length_over_the_cap_is_not_retried(self) -> None:
+        slept, pause = self._recorder()
+        response = FakeResponse([b"unused"], headers={"content-length": "1000"})
+        client = FakeClient([response, FakeResponse([b"ok"])])
+        with self.assertRaises(im.InboundMediaTooLarge) as caught:
+            _run(self._download(client, max_bytes=10, backoff_seconds=(0, 0), sleep=pause))
+        self.assertEqual(caught.exception.nbytes, 1000)
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(response.aiter_calls, [])
+        self.assertEqual(slept, [])
+        self.assertEqual(inbound_temp_names(self.directory), [])
+
+    def test_http_408_and_429_are_retried(self) -> None:
+        for status in (408, 429):
+            with self.subTest(status=status):
+                self.logs.clear()
+                slept, pause = self._recorder()
+                client = FakeClient([
+                    FakeResponse([b"wait"], status_code=status),
+                    FakeResponse([b"done"]),
+                ])
+                path = _run(self._download(
+                    client,
+                    backoff_seconds=(0, 0),
+                    sleep=pause,
+                    label=f"s{status}/0",
+                ))
+                self.assertEqual(path.read_bytes(), b"done")
+                self.assertEqual(len(client.calls), 2)
+                self.assertEqual(slept, [0.0])
+                self.assertIn(
+                    f"media s{status}/0: download attempt 1/3 failed (http {status}); retrying",
+                    self.logs,
+                )
+                self.assertEqual(inbound_temp_names(self.directory), [path.name])
+                path.unlink()
+
+    def test_cancelled_attempt_leaves_no_temp(self) -> None:
+        client = FakeClient([BodyErrorResponse([b"abcdef"], asyncio.CancelledError())])
+        with self.assertRaises(asyncio.CancelledError):
+            _run(self._download(client, backoff_seconds=(0, 0)))
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(self.logs, [])
+        self.assertEqual(inbound_temp_names(self.directory), [])
+
+    def test_real_httpx_503_is_retried_and_404_is_not(self) -> None:
+        body = b"from-httpx"
+        calls = {"n": 0}
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            calls["n"] += 1
+            if calls["n"] < 3:
+                return httpx.Response(503)
+            return httpx.Response(200, content=body)
+
+        async def _success():
+            slept: list[float] = []
+
+            async def _sleep(seconds: float) -> None:
+                slept.append(seconds)
+                self.assertEqual(inbound_temp_names(self.directory), [])
+
+            transport = httpx.MockTransport(handler)
+            async with httpx.AsyncClient(transport=transport) as client:
+                path = await im.download_inbound_cipher(
+                    client,
+                    "https://cdn.example.test/obj",
+                    self.directory,
+                    im.INBOUND_MEDIA_MAX_BYTES,
+                    timeout=httpx.Timeout(5.0),
+                    log=self.logs.append,
+                    label="real/0",
+                    sleep=_sleep,
+                )
+                data = path.read_bytes()
+                path.unlink()
+                return data, slept
+
+        data, slept = _run(_success())
+        self.assertEqual(data, body)
+        self.assertEqual(calls["n"], 3)
+        self.assertEqual(slept, [2.0, 5.0])
+        self.assertEqual(sum("retrying" in line for line in self.logs), 2)
+        self.assertTrue(any("attempt 1/3" in line for line in self.logs))
+        self.assertTrue(any("attempt 2/3" in line for line in self.logs))
+        self.assertEqual(inbound_temp_names(self.directory), [])
+
+        calls["n"] = 0
+        self.logs.clear()
+
+        def missing(_request: httpx.Request) -> httpx.Response:
+            calls["n"] += 1
+            return httpx.Response(404)
+
+        async def _missing():
+            transport = httpx.MockTransport(missing)
+            async with httpx.AsyncClient(transport=transport) as client:
+                await im.download_inbound_cipher(
+                    client,
+                    "https://cdn.example.test/missing",
+                    self.directory,
+                    im.INBOUND_MEDIA_MAX_BYTES,
+                    timeout=httpx.Timeout(5.0),
+                    log=self.logs.append,
+                    label="miss/0",
+                )
+
+        with self.assertRaises(httpx.HTTPStatusError):
+            _run(_missing())
+        self.assertEqual(calls["n"], 1)
+        self.assertEqual(self.logs, [])
+        self.assertEqual(inbound_temp_names(self.directory), [])
 
 
 if __name__ == "__main__":
