@@ -313,6 +313,19 @@ async def _drive_weixin_poison_batch(wx):
 
     g.handle_inbound = wrapped_handle_inbound
 
+    # Environment isolation (2026-10-17): the production host carries the
+    # native-bridge divert flag file, which would route the good plain-text
+    # messages to the bridge spool instead of the inbox this scenario
+    # asserts on. Scope-hide exactly that one path for this scenario.
+    _real_exists = os.path.exists
+
+    def _exists_no_divert(path, *a, **k):
+        if str(path).endswith("native-bridge/divert-weixin"):
+            return False
+        return _real_exists(path, *a, **k)
+
+    os.path.exists = _exists_no_divert
+
     polls = {"n": 0}
     batch_msgs = [
         {
@@ -360,6 +373,7 @@ async def _drive_weixin_poison_batch(wx):
         except StopLoop:
             pass
     finally:
+        os.path.exists = _real_exists
         if g._lock_fd is not None:
             g._lock_fd.close()
             g._lock_fd = None
