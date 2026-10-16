@@ -167,6 +167,13 @@ CRED_FILE = Path(
 )
 
 HEARTBEAT_SECS = 30
+# Consecutive failed connection-establishment episodes before run()
+# parks. A failed episode is a session that raised before subscribe,
+# or a subscribed session that ended having lived < 60s. A
+# subscribed session that lived >= 60s resets the count. The
+# auth_failed branch keeps its 300s pause and does not consume
+# this cap.
+RECONNECT_MAX_ATTEMPTS = 3
 # Outbound text chunk size (chars), aligned with the OpenClaw plugin's
 # TEXT_CHUNK_LIMIT: longer replies are split, first chunk closes the stream,
 # the rest follow as active send_msg frames.
@@ -1730,6 +1737,11 @@ class Gateway:
         self._coalesce_pending: dict[str, dict] = {}
         self._lock_fd = None
         self._kicked = False
+        # See RECONNECT_MAX_ATTEMPTS. _subscribed is set by run_session
+        # only after aibot_subscribe succeeds. Process restart starts
+        # the counter over at 0 (credentials reload on startup).
+        self.reconnect_failures = 0
+        self._subscribed = False
         self._acquire_instance_lock()
         self._load_persisted()
 
@@ -4060,7 +4072,14 @@ class Gateway:
     # ---------- connection lifecycle ----------
 
     async def run_session(self, bot_id: str, secret: str) -> str:
-        """Returns a short reason string when the session ends."""
+        """Returns a short reason string when the session ends.
+
+        ``_subscribed`` stays false until ``aibot_subscribe`` succeeds.
+        ``run()`` counts an attempt that never gets there, or a
+        subscribed session that dies before 60s, as one failed
+        connection-establishment episode.
+        """
+        self._subscribed = False
         async with websockets.connect(
             WS_URL, open_timeout=15, close_timeout=5, max_size=10 * 1024 * 1024, ping_interval=None
         ) as ws:
@@ -4084,6 +4103,7 @@ class Gateway:
                 self.connected = False
                 self.write_status()
                 return self.state
+            self._subscribed = True
             self.connected = True
             self.state = "connected"
             self.last_error = ""
@@ -4108,8 +4128,35 @@ class Gateway:
                 self.connected = False
                 self.ws = None
 
+    async def _park_reconnect_exhausted(self, reason: str) -> None:
+        """Stop reconnecting and leave state ``reconnect_exhausted``.
+
+        Called once, after ``RECONNECT_MAX_ATTEMPTS`` consecutive
+        failed episodes. The process stays in this coroutine so
+        systemd does not restart-loop an exit. A new process is what
+        tries again: startup reloads the credential file. This wait
+        is not another connection attempt. ``auth_failed`` does not
+        come through here.
+        """
+        self.state = "reconnect_exhausted"
+        self.connected = False
+        detail = " ".join((reason or "").split())[:160]
+        self.last_error = (
+            f"reconnect exhausted after {RECONNECT_MAX_ATTEMPTS} "
+            "consecutive failed connection attempts")
+        if detail:
+            self.last_error = f"{self.last_error}: {detail}"
+        self.write_status()
+        log(
+            "wecom-gateway reconnect exhausted after "
+            f"{RECONNECT_MAX_ATTEMPTS} consecutive failed connection "
+            "attempts; state=reconnect_exhausted")
+        while self.state == "reconnect_exhausted":
+            await asyncio.sleep(30)
+
     async def run(self) -> None:
         backoff = 5
+        self.reconnect_failures = 0
         while True:
             bot_id, secret, allow_users = load_credentials()
             self.allow_users = allow_users
@@ -4120,6 +4167,8 @@ class Gateway:
                     self.write_status()
                 await asyncio.sleep(30)
                 continue
+            # run_session sets this only after subscribe succeeds.
+            self._subscribed = False
             started = time.time()
             try:
                 reason = await self.run_session(bot_id, secret)
@@ -4137,6 +4186,18 @@ class Gateway:
                 await asyncio.sleep(300)
                 self.state = "reconnecting"
                 continue
+            # Success: subscribed and the session lived >= 60s. That
+            # resets the consecutive-failure counter and falls through
+            # to the same backoff the loop used before. Anything else
+            # (raised before subscribe, or ended before 60s) is one
+            # failed connection-establishment episode.
+            if self._subscribed and lived >= 60:
+                self.reconnect_failures = 0
+            else:
+                self.reconnect_failures += 1
+                if self.reconnect_failures >= RECONNECT_MAX_ATTEMPTS:
+                    await self._park_reconnect_exhausted(reason)
+                    continue
             self.state = "reconnecting"
             self.write_status()
             if self._kicked:
