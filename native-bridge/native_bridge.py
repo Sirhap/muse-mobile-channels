@@ -95,6 +95,14 @@ IDLE_ALERT_MIN_SECS = 3600    # LT2: min gap between idle-scan alerts
 # AUTH_FAIL_BACKOFF_SECS (a changed credential file retries at once),
 # and alert ONCE per credential set instead of hourly forever.
 AUTH_FAIL_BACKOFF_SECS = 600
+# Consecutive failed connect() attempts on one channel before that
+# channel parks. A failed episode is connect() raising, including a
+# refused WSS upgrade. connect() returning resets the count.
+# Credential-class failures still pause AUTH_FAIL_BACKOFF_SECS and
+# still retry at once when the credential files change; they share
+# this same cap. After the cap, only a cred-file change or a
+# process restart tries again.
+RECONNECT_MAX_ATTEMPTS = 3
 MERGE_CHANNELS = {"weixin", "test", "wecom"}
 # Channels in MERGE_CHANNELS fold a queued message into the running
 # turn (official-client steering) while that turn's reply has not
@@ -200,6 +208,7 @@ def ch_state(st, ch):
         "idle_push_seq": 0, "idle_pushed_ids": [],
         "idle_scan_fail_streak": 0, "idle_scan_last_alert": 0,
         "idle_auth_alert_stamp": None,
+        "reconnect_failures": 0, "reconnect_exhausted": False,
         "queue_snapshot": {"active": [], "queued": []}}
     c = st["channels"].setdefault(ch, {})
     for k, v in defaults.items():
@@ -823,9 +832,122 @@ class ChannelWorker(threading.Thread):
         self._session_from_stored = False   # LT2: last session_for reused sid
         self._auth_blocked_until = 0.0   # credential-class backoff (2026-10-14)
         self._auth_blocked_stamp = None
+        # See RECONNECT_MAX_ATTEMPTS. In-memory so a process restart
+        # tries connect() again; a parked flag left in state.json is
+        # cleared below for the same reason.
+        self._reconnect_failures = 0
+        self._reconnect_exhausted = False
+        self._reconnect_exhausted_stamp = None
+        self._drop_persisted_reconnect_park()
 
     def log(self, *a):
         print(f"[{self.ch}]", *a, flush=True)
+
+    def _drop_persisted_reconnect_park(self):
+        """A new worker is a process restart: clear a parked flag.
+
+        The cap is per process. Startup must try ``connect()`` again.
+        While the process is up, a credential-file change is the
+        other way out of ``reconnect_exhausted`` (see
+        ``_reconnect_exhausted_now``).
+        """
+        try:
+            if self.cs().get("reconnect_exhausted"):
+                self.update_cs(reconnect_exhausted=False,
+                               reconnect_failures=0)
+        except Exception:
+            self.log("reconnect park clear failed; will still retry")
+
+    def _note_reconnect_success(self):
+        """``connect()`` returned. The consecutive-failure count is 0."""
+        dirty = self._reconnect_failures or self._reconnect_exhausted
+        self._reconnect_failures = 0
+        self._reconnect_exhausted = False
+        self._reconnect_exhausted_stamp = None
+        self._clear_auth_block()
+        if not dirty:
+            return
+        try:
+            self.update_cs(reconnect_failures=0, reconnect_exhausted=False)
+        except Exception as e:
+            self.log("reconnect counter save failed:", str(e)[:80])
+
+    def _note_reconnect_failure(self, exc):
+        """Count one failed ``connect()`` episode toward the cap.
+
+        Failed episode: ``connect()`` raised, including a refused WSS
+        upgrade. Credential-class failures still take the 600s pause
+        and a cred-file change still retries at once; they use this
+        same counter. The third consecutive failure parks the channel
+        so a dead credential cannot spin. Returns nothing.
+        """
+        if self._reconnect_exhausted:
+            return
+        self._note_connect_failure(exc)
+        self._reconnect_failures += 1
+        if self._reconnect_failures >= RECONNECT_MAX_ATTEMPTS:
+            self._reconnect_exhausted = True
+            self._reconnect_exhausted_stamp = cred_stamp()
+            self.log(
+                "native-bridge reconnect exhausted after "
+                f"{RECONNECT_MAX_ATTEMPTS} consecutive failed "
+                "connection attempts; state=reconnect_exhausted")
+        try:
+            self.update_cs(
+                reconnect_failures=self._reconnect_failures,
+                reconnect_exhausted=self._reconnect_exhausted)
+        except Exception as e:
+            self.log("reconnect counter save failed:", str(e)[:80])
+
+    def _reconnect_exhausted_now(self):
+        """True when this channel must not call ``connect()``.
+
+        A credential-file change clears the park and returns False so
+        the caller tries immediately. The 600s auth pause is cleared
+        with it; the new credential gets a fresh count.
+        """
+        if not self._reconnect_exhausted:
+            return False
+        if self._reconnect_exhausted_stamp != cred_stamp():
+            self._reconnect_failures = 0
+            self._reconnect_exhausted = False
+            self._reconnect_exhausted_stamp = None
+            self._clear_auth_block()
+            try:
+                self.update_cs(reconnect_failures=0,
+                               reconnect_exhausted=False)
+            except Exception as e:
+                self.log("reconnect revive save failed:", str(e)[:80])
+            self.log(
+                "native-bridge reconnect revived after credential "
+                "file change; state=reconnecting")
+            return False
+        return True
+
+    def _acquire_connection(self):
+        """One ``connect()`` attempt, or no attempt when parked.
+
+        Returns ``(gw, None)`` on success and ``(None, exc)`` when
+        ``connect()`` raised. ``(None, None)`` means the attempt was
+        not made (auth backoff, or ``reconnect_exhausted`` with
+        unchanged credential files) and must not be counted again.
+
+        Failed episode: ``connect()`` raised or the WSS upgrade
+        failed. Success: ``connect()`` returned, which resets the
+        consecutive counter.
+        """
+        if self._reconnect_exhausted_now():
+            return None, None
+        if self._auth_connect_blocked():
+            return None, None
+        self.last_connect_try = time.time()
+        try:
+            gw = connect()
+        except Exception as e:
+            self._note_reconnect_failure(e)
+            return None, e
+        self._note_reconnect_success()
+        return gw, None
 
     def cs(self):
         with _state_lock:
@@ -866,19 +988,14 @@ class ChannelWorker(threading.Thread):
     def ensure_gw(self):
         if self.gw is not None:
             return True
-        if self._auth_connect_blocked():
+        gw, exc = self._acquire_connection()
+        if gw is None:
+            if exc is not None:
+                self.log("connect failed:", type(exc).__name__, str(exc)[:140])
             return False
-        self.last_connect_try = time.time()
-        try:
-            self.gw = connect()
-            self._clear_auth_block()
-            self.log("connected")
-            return True
-        except Exception as e:
-            self.log("connect failed:", type(e).__name__, str(e)[:140])
-            self._note_connect_failure(e)
-            self.gw = None
-            return False
+        self.gw = gw
+        self.log("connected")
+        return True
 
     def drop_gw(self):
         """Close the current connection, if any. Connections are
@@ -1585,18 +1702,15 @@ class ChannelWorker(threading.Thread):
             return
         gated = longtask_mode(self.ch)
         if self.gw is None:
-            if self._auth_connect_blocked():
+            gw, exc = self._acquire_connection()
+            if gw is None:
+                if exc is not None:
+                    self.log("idle scan connect failed:",
+                             type(exc).__name__, str(exc)[:100])
+                    if gated:
+                        self._note_idle_scan_failure(cs, exc)
                 return
-            try:
-                self.gw = connect()
-                self._clear_auth_block()
-            except Exception as e:
-                self.log("idle scan connect failed:",
-                         type(e).__name__, str(e)[:100])
-                self._note_connect_failure(e)
-                if gated:
-                    self._note_idle_scan_failure(cs, e)
-                return
+            self.gw = gw
         try:
             evs = self.history_events(sid, limit=40)
         except Exception as e:
