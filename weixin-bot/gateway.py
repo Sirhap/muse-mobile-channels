@@ -67,6 +67,7 @@ from inbound_media import (  # noqa: E402
 BASE = Path(__file__).resolve().parent
 STATE = BASE / "state"
 INBOX = STATE / "inbox.jsonl"
+POISON_MESSAGES = STATE / "poison_messages.jsonl"
 # Raw retention for bridge-diverted messages (2026-10-11): diverted
 # messages skip INBOX, so without this their original payload —
 # including the ref_msg structure needed to debug quote parsing —
@@ -1971,6 +1972,8 @@ class Gateway:
         item / item_list[0] / the ref itself); the id key is
         msg_id / message_id / id, whichever a shape carries.
         """
+        if not isinstance(ref, dict):
+            return ""
         cands = []
         for cand in (ref.get("message_item"), ref.get("item")):
             if isinstance(cand, dict) and cand:
@@ -2004,7 +2007,8 @@ class Gateway:
             if not isinstance(msg, dict):
                 return ""
             refs = []
-            for item in msg.get("item_list") or []:
+            raw_items = msg.get("item_list")
+            for item in (raw_items if isinstance(raw_items, list) else []):
                 if isinstance(item, dict):
                     r = item.get("ref_msg")
                     if isinstance(r, dict) and r:
@@ -2024,17 +2028,24 @@ class Gateway:
     def _extract_text(msg: dict) -> tuple[str, list[dict]]:
         parts: list[str] = []
         media: list[dict] = []
+        if not isinstance(msg, dict):
+            return "", media
         quoted = False
-        for item in msg.get("item_list") or []:
+        raw_items = msg.get("item_list")
+        for item in (raw_items if isinstance(raw_items, list) else []):
+            if not isinstance(item, dict):
+                continue
             itype = item.get("type")
             if itype == 1:
-                t = (item.get("text_item") or {}).get("text", "")
-                if t:
+                ti = item.get("text_item")
+                t = ti.get("text", "") if isinstance(ti, dict) else ""
+                if isinstance(t, str) and t:
                     parts.append(t)
             elif itype == 3:
-                v = item.get("voice_item") or {}
+                v = item.get("voice_item")
+                v = v if isinstance(v, dict) else {}
                 t = v.get("text", "")
-                if t:
+                if isinstance(t, str) and t:
                     parts.append(t)
                 else:
                     parts.append("[语音]")
@@ -2045,23 +2056,30 @@ class Gateway:
                 # copy of the audio existing / being intercepted.
                 pass
             elif itype == 2:
-                media.append({"kind": "image", "item": item.get("image_item") or {}})
+                img = item.get("image_item")
+                media.append({"kind": "image", "item": img if isinstance(img, dict) else {}})
                 parts.append("[图片]")
             elif itype == 4:
-                f = item.get("file_item") or {}
+                f = item.get("file_item")
+                f = f if isinstance(f, dict) else {}
                 media.append({"kind": "file", "item": f})
-                parts.append(f"[文件 {f.get('file_name', '')}]".rstrip())
+                fname = f.get("file_name", "")
+                fname = fname if isinstance(fname, str) else ""
+                parts.append(f"[文件 {fname}]".rstrip())
             elif itype == 5:
-                media.append({"kind": "video", "item": item.get("video_item") or {}})
+                vid = item.get("video_item")
+                media.append({"kind": "video", "item": vid if isinstance(vid, dict) else {}})
                 parts.append("[视频]")
-            ann = Gateway._ref_annotation(item.get("ref_msg") or {})
+            item_ref = item.get("ref_msg")
+            ann = Gateway._ref_annotation(item_ref if isinstance(item_ref, dict) else {})
             if ann:
                 parts.append(ann)
                 quoted = True
         if not quoted:
             # iLink shape variant: the reference hangs off the
             # message itself rather than an item.
-            ann = Gateway._ref_annotation(msg.get("ref_msg") or {})
+            msg_ref = msg.get("ref_msg")
+            ann = Gateway._ref_annotation(msg_ref if isinstance(msg_ref, dict) else {})
             if ann:
                 parts.append(ann)
         return "\n".join(parts), media
@@ -2179,10 +2197,14 @@ class Gateway:
         import copy
 
         raw = copy.deepcopy(msg)
-        for item in raw.get("item_list") or []:
-            if item.get("type") == 3:
-                v = item.get("voice_item") or {}
-                v.pop("media", None)
+        if not isinstance(raw, dict):
+            return {}
+        raw_items = raw.get("item_list")
+        for item in (raw_items if isinstance(raw_items, list) else []):
+            if isinstance(item, dict) and item.get("type") == 3:
+                v = item.get("voice_item")
+                if isinstance(v, dict):
+                    v.pop("media", None)
         return raw
 
     # ---------- slash commands ----------
@@ -2663,11 +2685,6 @@ class Gateway:
             b_pos = {m: i + 1 for i, m in enumerate(b_queued)}
             sent = 0
             for mid, rec in list(self.feedback_track.items()):
-                if not rec.get("queued"):
-                    continue
-                user = rec.get("user", "")
-                if not user:
-                    continue
                 if rec.get("via_bridge") and \
                         mid in self._bridge_fallback_ids():
                     # The bridge fell back: this message is cold now —
@@ -2676,6 +2693,11 @@ class Gateway:
                     rec["queued"] = True
                     if not rec.get("queued_at"):
                         rec["queued_at"] = now
+                if not rec.get("queued"):
+                    continue
+                user = rec.get("user", "")
+                if not user:
+                    continue
                 if rec.get("via_bridge"):
                     # Bridge-lane transitions come from the bridge
                     # snapshot, not the hook state.
@@ -2937,13 +2959,17 @@ class Gateway:
     async def _download_media(self, client: httpx.AsyncClient, media: list[dict], msgid: str) -> None:
         MEDIA_DIR.mkdir(parents=True, exist_ok=True)
         for i, m in enumerate(media):
+            if not isinstance(m, dict):
+                continue
             if m.get("kind") == "voice":
                 # Defense in depth: never download voice audio even if
                 # a caller still passes it in (see _extract_text).
                 log(f"media {msgid}/{i}: voice audio skipped (not received by policy)")
                 continue
-            item = m.get("item") or {}
-            node = item.get("media") or {}
+            raw_item = m.get("item")
+            item = raw_item if isinstance(raw_item, dict) else {}
+            raw_node = item.get("media")
+            node = raw_node if isinstance(raw_node, dict) else {}
             url = node.get("full_url", "")
             param = node.get("encrypt_query_param", "")
             if not url and param:
@@ -4029,17 +4055,31 @@ class Gateway:
                 self.reconnect_failures = 0
                 new_buf = resp.get("get_updates_buf")
                 msgs = resp.get("msgs") or []
-                try:
-                    for msg in msgs:
+                for msg in msgs:
+                    try:
                         await self.handle_inbound(client, creds, msg)
-                except Exception as e:
-                    # Do NOT advance the sync cursor: this batch will be
-                    # redelivered on the next poll / after restart. Messages
-                    # already written to inbox are deduped via seen_msgids
-                    # (reloaded from inbox at startup), so no duplicates.
-                    log(f"handle_inbound failed, sync cursor NOT advanced: {e}")
-                    await asyncio.sleep(3)
-                    continue
+                    except Exception as e:
+                        # Isolate per-message failures so a deterministically
+                        # malformed message cannot wedge the sync cursor and
+                        # block all subsequent inbound traffic. Messages
+                        # written to inbox before a failure remain deduped via
+                        # seen_msgids; poison payloads are quarantined to
+                        # state/poison_messages.jsonl.
+                        msgid = ""
+                        if isinstance(msg, dict):
+                            msgid = str(msg.get("message_id", "") or msg.get("msgid", "") or "")
+                        log(f"handle_inbound failed for msgid={msgid or '<unknown>'}: {e}")
+                        record = dict(msg) if isinstance(msg, dict) else {"raw": msg}
+                        record["error"] = f"{type(e).__name__}: {e}"
+                        poison_path = (
+                            POISON_MESSAGES
+                            if POISON_MESSAGES != BASE / "state" / "poison_messages.jsonl"
+                            else STATE / "poison_messages.jsonl"
+                        )
+                        try:
+                            self.append_jsonl(poison_path, record)
+                        except Exception as qe:
+                            log(f"poison quarantine write failed for msgid={msgid or '<unknown>'}: {qe}")
                 if new_buf is not None:
                     self.sync_buf = new_buf
                     self._save_sync()

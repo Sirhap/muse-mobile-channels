@@ -2149,7 +2149,20 @@ class Gateway:
     def new_req_id(prefix: str) -> str:
         return f"{prefix}_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
 
+    @staticmethod
+    def _is_respond_lock_idle(lock: asyncio.Lock) -> bool:
+        return (
+            getattr(lock, "_users", 0) <= 0
+            and not lock.locked()
+            and all(w.cancelled() for w in (getattr(lock, "_waiters", None) or ()))
+        )
+
     def _respond_lock(self, req_id: str) -> asyncio.Lock:
+        # Opportunistically prune any idle entries left by direct
+        # _respond_lock callers without touching held or awaited locks.
+        for k, existing in list(self.respond_locks.items()):
+            if k != req_id and self._is_respond_lock_idle(existing):
+                self.respond_locks.pop(k, None)
         lock = self.respond_locks.get(req_id)
         if lock is None:
             lock = asyncio.Lock()
@@ -2160,12 +2173,35 @@ class Gateway:
         # All responds for one callback req_id are serialized, mirroring the
         # official SDK's per-req_id reply queue: send one, wait for its ack,
         # then send the next.
-        async with self._respond_lock(req_id):
-            return await self.send_frame(
-                {"cmd": "aibot_respond_msg", "headers": {"req_id": req_id}, "body": body},
-                wait_response=True,
-                timeout=timeout,
-            )
+        #
+        # Safety of lock removal (R-1):
+        # 1. `lock = self._respond_lock(req_id)` and `lock._users += 1` run
+        #    synchronously on the single-threaded asyncio event loop before
+        #    the first `await` (`async with lock:`), and `lock._users -= 1`
+        #    runs in `finally:` after `async with lock:` has exited (after
+        #    `lock.release()` or cancellation).
+        # 2. In CPython, `asyncio.Lock.release()` sets `_locked = False`
+        #    before the next queued waiter coroutine resumes to set
+        #    `_locked = True`. Checking `_users <= 0`, `not lock.locked()`,
+        #    and no uncancelled `_waiters` guarantees that a lock is never
+        #    deleted while held, awaited, or in the release-to-waiter
+        #    handoff window.
+        # 3. Once the last user exits `finally:`, no holder or waiter exists;
+        #    any later `respond(req_id, ...)` call creates a fresh unlocked
+        #    Lock, which is observationally identical to an idle Lock.
+        lock = self._respond_lock(req_id)
+        lock._users = getattr(lock, "_users", 0) + 1
+        try:
+            async with lock:
+                return await self.send_frame(
+                    {"cmd": "aibot_respond_msg", "headers": {"req_id": req_id}, "body": body},
+                    wait_response=True,
+                    timeout=timeout,
+                )
+        finally:
+            lock._users = max(0, getattr(lock, "_users", 1) - 1)
+            if self._is_respond_lock_idle(lock) and self.respond_locks.get(req_id) is lock:
+                self.respond_locks.pop(req_id, None)
 
     def reqinfo(self, msgid: str) -> dict:
         v = self.reqmap.get(msgid)

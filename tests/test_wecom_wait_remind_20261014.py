@@ -394,6 +394,140 @@ def scenario_s9():
           and g.feedback_track["M-S"].get("started_notice") is True)
 
 
+def scenario_c2_weixin_fallback_handoff():
+    """C-2 regression: Weixin feedback record registered while bridge was idle
+    (queued=False, via_bridge=True) whose mid appears in bridge_fallback.jsonl
+    is converted to cold (queued=True, via_bridge=False) and receives its
+    cold-lane started notice in a single scan."""
+    spec_wx = importlib.util.spec_from_file_location(
+        "wxgw_c2_handoff", ROOT / "weixin-bot" / "gateway.py")
+    wx = importlib.util.module_from_spec(spec_wx)
+    spec_wx.loader.exec_module(wx)
+
+    d = SBX / "wx_c2"
+    shutil.rmtree(d, ignore_errors=True)
+    d.mkdir(parents=True)
+    hook_d = d / "hookstate"
+    hook_d.mkdir(parents=True)
+    wx.STATE = d
+    wx.OUTBOX = d / "outbox.jsonl"
+    wx.HOOK_STATE_DIR = hook_d
+    wx._bridge_snapshot = lambda channel: ([], [])
+
+    gw = wx.Gateway.__new__(wx.Gateway)
+    gw.feedback_track = {}
+    gw.thinking_notice_at = {}
+    gw.merged_notice_at = {}
+    gw._fb_clear_off = 0
+    gw._fb_fallback_off = 0
+    gw._fb_ids = set()
+
+    # Register while bridge is idle -> queued=False, via_bridge=True, queued_at=0.0
+    gw._maybe_arrival_feedback(
+        from_user="u-owner",
+        text="桥空闲时进入但随后回退冷通道的消息",
+        msgid="M-FALLBACK-IDLE",
+        diverted=True,
+    )
+    rec = gw.feedback_track["M-FALLBACK-IDLE"]
+    check("C-2 setup: idle bridge record starts with queued=False, via_bridge=True",
+          rec.get("queued") is False and rec.get("via_bridge") is True
+          and rec.get("queued_at") == 0.0)
+
+    # Bridge fails before sending turn and writes bridge_fallback.jsonl;
+    # cold hook picks up M-FALLBACK-IDLE in active_batch.json.
+    (d / "bridge_fallback.jsonl").write_text(
+        json.dumps({"msgid": "M-FALLBACK-IDLE", "ts": 1000}) + "\n",
+        encoding="utf-8",
+    )
+    (hook_d / "active_batch.json").write_text(
+        json.dumps({"msgids": ["M-FALLBACK-IDLE"], "since": 1001, "detached": []}),
+        encoding="utf-8",
+    )
+    (hook_d / "pending.json").write_text("{}", encoding="utf-8")
+
+    scan_now = 1005.0
+    n = gw._feedback_scan_once(now=scan_now)
+    out_rows = read_jsonl(d / "outbox.jsonl")
+    started_rows = [r for r in out_rows
+                    if str(r.get("id", "")).startswith("started-")
+                    and r.get("content") == wx.STARTED_NOTICE_TEMPLATE.format(
+                        excerpt=rec.get("excerpt", ""))]
+    check("C-2 handoff: single scan converts record and queues started notice",
+          n == 1
+          and rec.get("via_bridge") is False
+          and rec.get("queued") is True
+          and rec.get("queued_at") == scan_now
+          and rec.get("started_notice") is True
+          and len(started_rows) == 1)
+
+
+async def scenario_r1_respond_locks_cleanup():
+    """R-1 regression: WeCom respond_locks does not retain entries after
+    responds complete, while preserving per-req_id serialization across
+    concurrent callers."""
+    d = fresh_state("r1_locks")
+    g = make_gateway()
+    events = []
+    gate = asyncio.Event()
+
+    async def fake_send_frame(frame, wait_response=True, timeout=10.0):
+        req_id = frame["headers"]["req_id"]
+        seq = frame["body"]["seq"]
+        events.append(("enter", req_id, seq, req_id in g.respond_locks))
+        if seq == 1:
+            await gate.wait()
+        else:
+            await asyncio.sleep(0)
+        events.append(("exit", req_id, seq))
+        return {"errcode": 0, "seq": seq}
+
+    g.send_frame = fake_send_frame
+
+    # 1. Single respond lifecycle: lock present during send_frame, removed after.
+    gate.set()
+    await g.respond("req-single", {"seq": 1})
+    check("R-1 single respond: lock held during send_frame and removed on completion",
+          ("enter", "req-single", 1, True) in events
+          and "req-single" not in g.respond_locks
+          and len(g.respond_locks) == 0)
+
+    # 2. Concurrent responds on the same req_id serialize and clean up only
+    # after the last waiter finishes.
+    events.clear()
+    gate.clear()
+    t1 = asyncio.create_task(g.respond("req-shared", {"seq": 1}))
+    await asyncio.sleep(0)
+    t2 = asyncio.create_task(g.respond("req-shared", {"seq": 2}))
+    await asyncio.sleep(0)
+    locked_while_active = (
+        "req-shared" in g.respond_locks
+        and len(events) == 1
+        and events[0][:3] == ("enter", "req-shared", 1)
+    )
+    gate.set()
+    await asyncio.gather(t1, t2)
+    order = [(kind, seq) for kind, _r, seq, *_ in events]
+    check("R-1 concurrent responds: serialized in order and lock removed after last finishes",
+          locked_while_active
+          and order == [("enter", 1), ("exit", 1), ("enter", 2), ("exit", 2)]
+          and "req-shared" not in g.respond_locks
+          and len(g.respond_locks) == 0)
+
+    # 3. Exception inside send_frame still cleans up the lock.
+    async def failing_send_frame(frame, wait_response=True, timeout=10.0):
+        raise RuntimeError("boom")
+
+    g.send_frame = failing_send_frame
+    caught = False
+    try:
+        await g.respond("req-fail", {"seq": 99})
+    except RuntimeError:
+        caught = True
+    check("R-1 failing respond: lock removed in finally on exception",
+          caught and "req-fail" not in g.respond_locks and len(g.respond_locks) == 0)
+
+
 async def main():
     scenario_s1()
     scenario_s2()
@@ -404,6 +538,8 @@ async def main():
     scenario_s7()
     scenario_s8()
     scenario_s9()
+    scenario_c2_weixin_fallback_handoff()
+    await scenario_r1_respond_locks_cleanup()
 
 
 asyncio.run(main())
