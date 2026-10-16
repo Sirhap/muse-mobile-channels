@@ -73,10 +73,10 @@ from channel_common import (  # noqa: E402
 from inbound_media import (  # noqa: E402
     INBOUND_MEDIA_MAX_BYTES,
     InboundMediaTooLarge,
+    download_inbound_cipher,
     inbound_temp_path,
     publish_inbound_plaintext,
     remove_file_quietly,
-    save_inbound_body,
     stream_pkcs7_decrypt_to_file,
 )
 
@@ -3132,38 +3132,36 @@ class Gateway:
             url, aeskey = m.get("url", ""), m.get("aeskey", "")
             if not url or not aeskey:
                 continue
-            last_error: Exception | None = None
-            for _attempt in range(3):
-                # Stream onto a temp file and count bytes as they arrive.
-                # Over the cap is not a retry: log, delete the partial,
-                # leave local_path unset. The caller still records the row.
-                cipher_path = inbound_temp_path(MEDIA_DIR, "cipher")
+            # Transport drops retry from byte 0 inside the helper.
+            # Decrypt runs once on a completed cipher. Over the cap:
+            # log, delete the partial, leave local_path unset. The
+            # caller still records the row.
+            cipher_path: Path | None = None
+            plain_path: Path | None = None
+            try:
+                cipher_path = await download_inbound_cipher(
+                    client,
+                    url,
+                    MEDIA_DIR,
+                    INBOUND_MEDIA_MAX_BYTES,
+                    timeout=httpx.Timeout(20.0, connect=10.0),
+                    log=log,
+                    label=f"{msgid}/{i}",
+                )
                 plain_path = inbound_temp_path(MEDIA_DIR, "plain")
-                try:
-                    async with client.stream(
-                        "GET", url, timeout=httpx.Timeout(20.0, connect=10.0),
-                    ) as response:
-                        await save_inbound_body(
-                            response, cipher_path, INBOUND_MEDIA_MAX_BYTES,
-                        )
-                    decrypt_wecom_media_file(cipher_path, plain_path, aeskey)
-                    path = publish_inbound_plaintext(plain_path, msgid, i, sniff_ext)
-                    m["local_path"] = str(path)
-                    log(f"media {msgid}/{i}: saved {path} ({path.stat().st_size} bytes)")
-                    last_error = None
-                    break
-                except InboundMediaTooLarge as exc:
-                    log(f"media {msgid}/{i}: too large ({exc.nbytes} bytes), skipped")
-                    last_error = None
-                    break
-                except Exception as e:
-                    last_error = e
-                    await asyncio.sleep(1)
-                finally:
+                decrypt_wecom_media_file(cipher_path, plain_path, aeskey)
+                path = publish_inbound_plaintext(plain_path, msgid, i, sniff_ext)
+                m["local_path"] = str(path)
+                log(f"media {msgid}/{i}: saved {path} ({path.stat().st_size} bytes)")
+            except InboundMediaTooLarge as exc:
+                log(f"media {msgid}/{i}: too large ({exc.nbytes} bytes), skipped")
+            except Exception as e:
+                log(f"media {msgid}/{i}: download/decrypt failed: {e}")
+            finally:
+                if cipher_path is not None:
                     remove_file_quietly(cipher_path)
+                if plain_path is not None:
                     remove_file_quietly(plain_path)
-            if last_error is not None:
-                log(f"media {msgid}/{i}: download/decrypt failed: {last_error!r}")
 
     async def _outbound_media_bytes(self, file_path: Path) -> tuple[bytes, str, str]:
         """Bytes, WeCom media type, and upload filename for one outbound file.
