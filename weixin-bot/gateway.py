@@ -57,10 +57,10 @@ from channel_common import (  # noqa: E402
 from inbound_media import (  # noqa: E402
     INBOUND_MEDIA_MAX_BYTES,
     InboundMediaTooLarge,
+    download_inbound_cipher,
     inbound_temp_path,
     publish_inbound_plaintext,
     remove_file_quietly,
-    save_inbound_body,
     stream_pkcs7_decrypt_to_file,
 )
 
@@ -2949,16 +2949,23 @@ class Gateway:
             if not media_url_allowed(url):
                 log(f"media {msgid}/{i}: refused non-Tencent url host")
                 continue
-            # Stream onto a temp file and count bytes as they arrive.
-            # Over the cap: log, delete the partial, leave local_path
-            # unset. The caller still records the inbox row.
-            cipher_path = inbound_temp_path(MEDIA_DIR, "cipher")
-            plain_path = inbound_temp_path(MEDIA_DIR, "plain")
+            # Transport drops retry from byte 0 inside the helper.
+            # Decrypt runs once on a completed cipher. Over the cap:
+            # log, delete the partial, leave local_path unset. The
+            # caller still records the inbox row.
+            cipher_path: Path | None = None
+            plain_path: Path | None = None
             try:
-                async with client.stream(
-                    "GET", url, timeout=httpx.Timeout(30.0, connect=10.0),
-                ) as response:
-                    await save_inbound_body(response, cipher_path, INBOUND_MEDIA_MAX_BYTES)
+                cipher_path = await download_inbound_cipher(
+                    client,
+                    url,
+                    MEDIA_DIR,
+                    INBOUND_MEDIA_MAX_BYTES,
+                    timeout=httpx.Timeout(30.0, connect=10.0),
+                    log=log,
+                    label=f"{msgid}/{i}",
+                )
+                plain_path = inbound_temp_path(MEDIA_DIR, "plain")
                 aes_ecb_decrypt_file(cipher_path, plain_path, key)
                 path = publish_inbound_plaintext(plain_path, msgid, i, sniff_ext)
                 m["local_path"] = str(path)
@@ -2973,8 +2980,10 @@ class Gateway:
             except Exception as e:
                 log(f"media {msgid}/{i}: download/decrypt failed: {e}")
             finally:
-                remove_file_quietly(cipher_path)
-                remove_file_quietly(plain_path)
+                if cipher_path is not None:
+                    remove_file_quietly(cipher_path)
+                if plain_path is not None:
+                    remove_file_quietly(plain_path)
 
     async def _get_typing_ticket(self, client: httpx.AsyncClient, creds: dict,
                                  user_id: str, context_token: str) -> str:
