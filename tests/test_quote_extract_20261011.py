@@ -448,6 +448,33 @@ async def wecom_all():
 
 asyncio.run(wecom_all())
 
+# I-1 extraction isinstance guards: malformed non-dict nested fields in
+# Weixin payloads are treated as absent instead of raising AttributeError.
+_malformed_msg = {
+    "message_id": "m-malformed-nested",
+    "item_list": [
+        "not-a-dict-item",
+        123,
+        {"type": 1, "text_item": "not-a-dict", "ref_msg": "bad-ref"},
+        {"type": 2, "image_item": ["not-a-dict"]},
+        {"type": 3, "voice_item": 456},
+        {"type": 4, "file_item": "not-a-dict"},
+        {"type": 5, "video_item": 789},
+        {"type": 1, "text_item": {"text": "有效文本"}, "ref_msg": {"title": "引用标题"}},
+    ],
+    "ref_msg": "non-dict-top-ref",
+}
+_m_text, _m_media = wx.Gateway._extract_text(_malformed_msg)
+_m_sanitized = wx.Gateway._sanitize_raw(_malformed_msg)
+_m_qid = wx.Gateway._find_ref_qid(_malformed_msg)
+check("weixin I-1 isinstance guards: malformed nested non-dict fields do not raise",
+      "有效文本" in _m_text
+      and "（引用：引用标题）" in _m_text
+      and len(_m_media) == 3
+      and isinstance(_m_sanitized, dict)
+      and _m_qid == ""
+      and wx.Gateway._extract_text({"item_list": "not-a-list"}) == ("", []))
+
 failed = [n for n, ok in RESULTS if not ok]
 print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} passed")
 if failed:
