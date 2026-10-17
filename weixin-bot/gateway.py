@@ -21,9 +21,11 @@ import hashlib
 import json
 import os
 import random
+import re
 import subprocess
 import sys
 import time
+import unicodedata
 import uuid
 from pathlib import Path
 from urllib.parse import quote
@@ -217,6 +219,48 @@ def log(msg: str) -> None:
     print(f"[weixin-gateway {time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
 
 
+def jsonl_text_lines(text: str) -> list[str]:
+    """Split JSONL text on ``\\n`` only.
+
+    ``str.splitlines`` also breaks on U+2028, U+2029 and U+0085.
+    ``json.dumps(..., ensure_ascii=False)`` keeps those characters
+    inside string values, so a splitlines read cuts one record into
+    two fragments and the row is skipped. A trailing CR from CRLF
+    is stripped so each line matches what ``splitlines`` returned
+    for ordinary newlines.
+    """
+    if not text:
+        return []
+    parts = text.split("\n")
+    if parts and parts[-1] == "":
+        parts.pop()
+    return [part[:-1] if part.endswith("\r") else part for part in parts]
+
+
+def _discard_partial(path: Path | None) -> None:
+    """Delete a compression output that did not finish."""
+    if path is None:
+        return
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+def file_send_roots() -> list[Path]:
+    """Directories a Weixin outbound file is allowed to read."""
+    return [muse_home(), STATE, BASE, Path("/tmp")]
+
+
+def file_send_allowed(fpath: str) -> bool:
+    """Same allowlist ``_deliver_file`` enforces.
+
+    Dispatch runs this before any caption so a refused file does not
+    announce itself and then vanish.
+    """
+    return outbound_file_allowed(Path(fpath), CRED_FILE, file_send_roots())
+
+
 # ---------- slash commands (gateway-intercepted) ----------
 # The user can send /ping, /status, /stop, /new, /check,
 # /queue, /help, /subagent and the approval commands in chat.
@@ -398,7 +442,7 @@ def _spool_texts(channel):
             f.seek(max(0, size - 524288))
             data = f.read().decode("utf-8", "replace")
         out = {}
-        for line in data.splitlines():
+        for line in jsonl_text_lines(data):
             try:
                 r = json.loads(line)
             except ValueError:
@@ -567,7 +611,7 @@ def _last_outbound_ts(state_dir, msgids):
             f.seek(max(0, size - 524288))
             data = f.read().decode("utf-8", "replace")
         best = None
-        for line in data.splitlines():
+        for line in jsonl_text_lines(data):
             try:
                 row = json.loads(line)
             except ValueError:
@@ -599,7 +643,7 @@ def _bridge_queued_rows(channel):
         texts = {}
         spool = Path(f"/home/hatch/workspace/native-bridge/"
                      f"spool/{channel}.jsonl")
-        for line in spool.read_text(encoding="utf-8").splitlines():
+        for line in jsonl_text_lines(spool.read_text(encoding="utf-8")):
             try:
                 r = json.loads(line)
             except ValueError:
@@ -1305,8 +1349,10 @@ def slash_subagent_stop_ack(hook_state_dir, job_id):
     st = rec.get("status")
     if st in _JOB_ENDED_LABELS:
         return f"副助手 #{job_id} {_JOB_ENDED_LABELS[st]}，无需再停。"
-    _append_jsonl_file(hook_state_dir / "subagent_cmd.jsonl",
-                       {"type": "stop", "job_id": job_id, "ts": time.time()})
+    if not _append_jsonl_file(hook_state_dir / "subagent_cmd.jsonl",
+                              {"type": "stop", "job_id": job_id, "ts": time.time()}):
+        return (f"停止失败：暂时写不了停止指令，副助手 #{job_id} "
+                "仍按原状态继续。请稍后再试。")
     if st == "queued":
         return (f"已提交停止 #{job_id}。这条还在排队，下一轮会直接退出，"
                 "不再开工，也不会另发一条结果。")
@@ -1359,8 +1405,12 @@ def parse_approval_slash(name, arg):
     is allow_always with no second word.
     """
     toks = (arg or "").split()
-    num = toks[0] if toks else ""
-    if not num.isdigit():
+    num = unicodedata.normalize("NFKC", toks[0] if toks else "")
+    # isdigit() is true for fullwidth digits and superscripts. Lookup
+    # keys are ASCII, and int() on the original token raises. NFKC
+    # folds the compatible forms; anything still non-ASCII is rejected
+    # with the same missing-token result as a non-digit.
+    if not num.isascii() or not num.isdigit():
         return None
     if name in APPROVAL_LETTER_DECISIONS:
         return (num, APPROVAL_LETTER_DECISIONS[name])
@@ -1404,18 +1454,19 @@ def _approval_pending_submission(num):
         with open(APPROVAL_RELAY_DIR / "decisions.jsonl",
                   encoding="utf-8") as f:
             f.seek(off)
-            lines = f.read().splitlines()
+            lines = jsonl_text_lines(f.read())
     except OSError:
         return None
-    found = None
     for line in lines:
         try:
             row = json.loads(line)
         except ValueError:
             continue
+        if not isinstance(row, dict):
+            continue
         if str(row.get("num")) == str(num) and row.get("decision"):
-            found = row["decision"]
-    return found
+            return row["decision"]
+    return None
 
 
 def slash_approval_decide_ack(num, decision, channel):
@@ -1625,13 +1676,44 @@ def weixin_media_type(path: str) -> int:
     return 3  # file
 
 
+_FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
+_INLINE_CODE_RE = re.compile(r"`[^`\n]+`")
+
+
+def _code_spans(text: str) -> list[tuple[int, int]]:
+    """Character ranges of fenced blocks and inline backtick spans."""
+    spans = [(m.start(), m.end()) for m in _FENCE_RE.finditer(text)]
+    for match in _INLINE_CODE_RE.finditer(text):
+        if any(match.start() >= start and match.end() <= end for start, end in spans):
+            continue
+        spans.append((match.start(), match.end()))
+    return spans
+
+
+def _sub_outside_code(pattern: re.Pattern, repl, text: str) -> str:
+    """Apply repl to matches that do not overlap a code span."""
+    spans = _code_spans(text)
+
+    def guard(match: re.Match) -> str:
+        for start, end in spans:
+            if match.start() < end and match.end() > start:
+                return match.group(0)
+        return repl(match)
+
+    return pattern.sub(guard, text)
+
+
 def filter_markdown_weixin(text: str) -> str:
     """Light markdown adaptation for the WeChat client, which renders only
     a subset of markdown: drop heading markers, unwrap images to links,
-    flatten tables and rules, strip raw HTML tags."""
-    import re
+    flatten tables and rules, strip raw HTML tags.
 
+    Heading markers, raw HTML, and ``[text](url)`` rewrites skip fenced
+    blocks and inline backtick spans. Table flattening, rules, and the
+    per-line trim stay in force everywhere.
+    """
     out_lines = []
+    in_fence = False
     for line in text.split("\n"):
         s = line.rstrip()
         if re.match(r"^\s*\|?[\s:|-]+\|[\s:|-]*$", s) and "-" in s:
@@ -1641,12 +1723,30 @@ def filter_markdown_weixin(text: str) -> str:
             s = " ｜ ".join(c for c in cells if c)
         if re.match(r"^\s*(-{3,}|\*{3,}|_{3,})\s*$", s):
             continue  # horizontal rule
-        s = re.sub(r"^#{1,6}\s+", "", s)
+        # A line that is inside a fence keeps its leading '#'.
+        # The heading pattern only matches at column 0, so an inline
+        # span cannot hide it; fence interiors are the case that can.
+        if not in_fence:
+            s = re.sub(r"^#{1,6}\s+", "", s)
         out_lines.append(s)
+        if s.count("```") % 2 == 1:
+            in_fence = not in_fence
     text = "\n".join(out_lines)
-    text = re.sub(r"!\[([^\]]*)\]\(([^)]+)\)", lambda m: f"{m.group(1)}：{m.group(2)}" if m.group(1) else m.group(2), text)
-    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", lambda m: m.group(1) if m.group(1) == m.group(2) else f"{m.group(1)}（{m.group(2)}）", text)
-    text = re.sub(r"<[^>]{1,80}>", "", text)
+    text = _sub_outside_code(
+        re.compile(r"!\[([^\]]*)\]\(([^)]+)\)"),
+        lambda m: f"{m.group(1)}：{m.group(2)}" if m.group(1) else m.group(2),
+        text,
+    )
+    text = _sub_outside_code(
+        re.compile(r"\[([^\]]+)\]\(([^)]+)\)"),
+        lambda m: m.group(1) if m.group(1) == m.group(2) else f"{m.group(1)}（{m.group(2)}）",
+        text,
+    )
+    text = _sub_outside_code(
+        re.compile(r"<[^>]{1,80}>"),
+        lambda _m: "",
+        text,
+    )
     return text
 
 
@@ -1715,38 +1815,51 @@ class Gateway:
                 pass
 
 
+    @staticmethod
+    def _msgids_in_jsonl(path: Path) -> set[str]:
+        """Msgids from one JSONL file.
+
+        A torn trailing byte and a non-object line are skipped. Decode
+        errors do not drop the complete lines ahead of them.
+        """
+        found: set[str] = set()
+        if not path.exists():
+            return found
+        try:
+            text = path.read_bytes().decode("utf-8", errors="replace")
+        except OSError:
+            return found
+        for line in jsonl_text_lines(text):
+            try:
+                entry = json.loads(line)
+            except (json.JSONDecodeError, UnicodeError, ValueError):
+                continue
+            if isinstance(entry, dict) and entry.get("msgid"):
+                found.add(str(entry["msgid"]))
+        return found
+
     def _load_persisted(self) -> None:
-        if INBOX.exists():
-            try:
-                for line in INBOX.read_text(encoding="utf-8").splitlines():
-                    try:
-                        entry = json.loads(line)
-                        if entry.get("msgid"):
-                            self.seen_msgids.add(str(entry["msgid"]))
-                    except json.JSONDecodeError:
-                        continue
-            except OSError:
-                pass
-        if SEEN_FILE.exists():
-            try:
-                for line in SEEN_FILE.read_text(encoding="utf-8").splitlines():
-                    try:
-                        entry = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if isinstance(entry, dict) and entry.get("msgid"):
-                        self.seen_msgids.add(str(entry["msgid"]))
-            except OSError:
-                pass
+        """Load dedupe ids and session files without crashing startup."""
+        self.seen_msgids.update(self._msgids_in_jsonl(INBOX))
+        self.seen_msgids.update(self._msgids_in_jsonl(SEEN_FILE))
+        self.sync_buf = ""
         if SYNC_FILE.exists():
             try:
-                self.sync_buf = json.loads(SYNC_FILE.read_text(encoding="utf-8")).get("buf", "")
-            except (OSError, json.JSONDecodeError):
+                raw = SYNC_FILE.read_bytes().decode("utf-8", errors="replace")
+                loaded = json.loads(raw)
+                if isinstance(loaded, dict):
+                    buf = loaded.get("buf", "")
+                    self.sync_buf = buf if isinstance(buf, str) else ""
+            except (OSError, json.JSONDecodeError, UnicodeError, ValueError):
                 self.sync_buf = ""
+        self.context = {}
         if CONTEXT_FILE.exists():
             try:
-                self.context = json.loads(CONTEXT_FILE.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
+                raw = CONTEXT_FILE.read_bytes().decode("utf-8", errors="replace")
+                loaded = json.loads(raw)
+                if isinstance(loaded, dict):
+                    self.context = loaded
+            except (OSError, json.JSONDecodeError, UnicodeError, ValueError):
                 self.context = {}
 
     def _save_sync(self) -> None:
@@ -1774,7 +1887,7 @@ class Gateway:
         if not INBOX.exists():
             return info
         try:
-            lines = INBOX.read_text(encoding="utf-8").splitlines()[-500:]
+            lines = jsonl_text_lines(INBOX.read_text(encoding="utf-8"))[-500:]
         except OSError:
             return info
         for line in reversed(lines):
@@ -2100,7 +2213,7 @@ class Gateway:
                 if size > window:
                     f.seek(size - window)
                 data = f.read()
-            lines = data.decode("utf-8", errors="replace").splitlines()
+            lines = jsonl_text_lines(data.decode("utf-8", errors="replace"))
             if size > window and lines:
                 lines = lines[1:]  # first line may be cut mid-row
             rows = []
@@ -2380,7 +2493,13 @@ class Gateway:
                     num, decision = decided
                     ack = slash_approval_decide_ack(num, decision, "weixin")
             if ack is not None:
-                await self._send_slash_ack(client, creds, msg, from_user, ack)
+                try:
+                    await self._send_slash_ack(client, creds, msg, from_user, ack)
+                except Exception as ack_err:
+                    # Side effects above are already committed. Falling
+                    # back to the ordinary flow would run /subagent or
+                    # /a a second time.
+                    log(f"slash ack send failed (command already handled): {ack_err!r}")
             log(f"slash /{name} handled for {from_user}")
             return "handled"
         except Exception as e:  # never let a command break the inbound flow
@@ -2620,7 +2739,7 @@ class Gateway:
             ids = []
             try:
                 raw = tmp.read_bytes().decode("utf-8", "replace")
-                for line in raw.splitlines():
+                for line in jsonl_text_lines(raw):
                     msgid = parse_feedback_clear_line(line)
                     if msgid:
                         ids.append(msgid)
@@ -2645,7 +2764,7 @@ class Gateway:
             if getattr(self, "_fb_mtime", None) == mt:
                 return self._fb_ids
             ids = set()
-            for line in p.read_text(encoding="utf-8").splitlines():
+            for line in jsonl_text_lines(p.read_text(encoding="utf-8")):
                 try:
                     r = json.loads(line)
                 except ValueError:
@@ -2784,7 +2903,8 @@ class Gateway:
         owner_id = creds["user_id"]
         if msg.get("message_type") not in (None, 1):
             return  # only user messages
-        msgid = str(msg.get("message_id", ""))
+        raw_msgid = msg.get("message_id", "")
+        msgid = raw_msgid if isinstance(raw_msgid, str) else ""
         if msgid and msgid in self.seen_msgids:
             return
         from_user = msg.get("from_user_id", "")
@@ -3138,7 +3258,7 @@ class Gateway:
     async def _deliver_file(self, client: httpx.AsyncClient, creds: dict,
                             to_user_id: str, fpath: str, context_token: str = "") -> dict:
         path = Path(fpath)
-        if not outbound_file_allowed(path, CRED_FILE, [muse_home(), STATE, BASE, Path("/tmp")]):
+        if not file_send_allowed(fpath):
             raise PermissionError(f"refusing to send file outside allowed directories: {fpath}")
         data = path.read_bytes()
         mtype = weixin_media_type(fpath)
@@ -3211,23 +3331,20 @@ class Gateway:
 
     @staticmethod
     def _delivered_reply_before(item: dict) -> bool:
-        """Sending-layer late suppression (fix, 2026-10-04 evening):
-        True when an outbox row queued BEFORE this item is a formal
-        reply or reply_file for the same msgid whose delivery result
-        is ok. Dispatch uses this to drop a late progress update —
-        and, since the 2026-10-15 fencing fix, a second formal
-        reply — from a racing orphan-takeover worker. It does not
-        drop reply_file:
-        the bridge queues the media row after the text reply for the
-        same msgid, and that file is part of the answer (2026-10-09
-        LT2: text delivered, then the mp4 was swallowed). Only rows
-        before this item count, so an update queued before its reply
-        (normal progress order) is never suppressed. Fail-open."""
+        """Sending-layer late suppression.
+
+        True when any formal reply or reply_file for this msgid
+        already has an ok result, regardless of outbox order. A parked
+        text row can be retried after a later file row for the same
+        msgid was delivered; scanning only earlier rows missed that
+        delivery and sent the text again. The current row is skipped.
+        Dispatch does not pass reply_file here: those media rows
+        belong with the answer. Fail-open."""
         try:
             item_id = item.get("id", "")
             results: dict[str, dict] = {}
             if OUTBOX_RESULTS.exists():
-                for line in OUTBOX_RESULTS.read_text(encoding="utf-8").splitlines():
+                for line in jsonl_text_lines(OUTBOX_RESULTS.read_text(encoding="utf-8")):
                     try:
                         r = json.loads(line)
                     except json.JSONDecodeError:
@@ -3236,13 +3353,13 @@ class Gateway:
                         results[r["id"]] = r
             if not OUTBOX.exists():
                 return False
-            for line in OUTBOX.read_text(encoding="utf-8").splitlines():
+            for line in jsonl_text_lines(OUTBOX.read_text(encoding="utf-8")):
                 try:
                     o = json.loads(line)
                 except json.JSONDecodeError:
                     continue
                 if o.get("id") == item_id:
-                    break
+                    continue
                 if o.get("mode") not in ("reply", "reply_file") or str(o.get("msgid")) != str(item.get("msgid")):
                     continue
                 res = results.get(o.get("id"))
@@ -3266,7 +3383,7 @@ class Gateway:
                 return False
             results: dict[str, dict] = {}
             if OUTBOX_RESULTS.exists():
-                for line in OUTBOX_RESULTS.read_text(encoding="utf-8").splitlines():
+                for line in jsonl_text_lines(OUTBOX_RESULTS.read_text(encoding="utf-8")):
                     try:
                         r = json.loads(line)
                     except json.JSONDecodeError:
@@ -3274,7 +3391,7 @@ class Gateway:
                     if r.get("id"):
                         results[r["id"]] = r
             msgid = str(item.get("msgid", "") or "")
-            for line in OUTBOX.read_text(encoding="utf-8").splitlines():
+            for line in jsonl_text_lines(OUTBOX.read_text(encoding="utf-8")):
                 try:
                     o = json.loads(line)
                 except json.JSONDecodeError:
@@ -3319,7 +3436,10 @@ class Gateway:
         dispatch_outbox_item just appended). Tail-scans the results
         file; failure paths are rare, so the scan is cheap enough."""
         try:
-            lines = OUTBOX_RESULTS.read_bytes().splitlines()[-400:]
+            raw_lines = OUTBOX_RESULTS.read_bytes().split(b"\n")
+            if raw_lines and raw_lines[-1] == b"":
+                raw_lines.pop()
+            lines = raw_lines[-400:]
             for raw in reversed(lines):
                 try:
                     row = json.loads(raw)
@@ -3375,6 +3495,11 @@ class Gateway:
                 rec["cdn_streak"] = int(rec.get("cdn_streak") or 0) + 1
             if is_cdn500 or UPLOAD_STAGE_MARKER in err:
                 rec["upload_fail"] = int(rec.get("upload_fail") or 0) + 1
+            else:
+                # The threshold is consecutive upload-stage failures.
+                # A send-stage failure in between starts the count over.
+                # Success drops the parked record, which clears it too.
+                rec["upload_fail"] = 0
         notify = (mode in FORMAL_MODES
                   and n >= FORMAL_STUCK_NOTIFY_ATTEMPTS
                   and not rec.get("notified"))
@@ -3438,6 +3563,53 @@ class Gateway:
         self._save_retry(retry)
         return action, notify
 
+    async def _notify_permanent_failure(self, client, creds, item: dict,
+                                        errmsg: str) -> None:
+        """Tell the user a formal or file row was consumed undelivered.
+
+        Direct in-channel send when a recipient is known, plus a text
+        row on the WeCom outbox when that file exists. The file itself
+        is not diverted: this path is a refusal or a missing route,
+        not the upload-failure reroute. Best-effort.
+        """
+        try:
+            err = errmsg or ""
+            name = Path(str(item.get("file_path") or "")).name or "文件"
+            if "no context stored" in err:
+                text = ("⚠️ 这条正式回复没能发出：找不到原消息的回复路径，"
+                        "所以没有投递。需要的话告诉我再发。")
+            elif "file not found" in err or "No such file" in err:
+                text = (f"⚠️ 文件「{name}」没能发出：原文件已经不在，"
+                        "这条已停止，没有另发说明。")
+            elif "refusing to send" in err or "allowed directories" in err:
+                text = (f"⚠️ 文件「{name}」没能发出：路径不在允许发送的目录里，"
+                        "已拒绝发送，说明文字也没有发出。")
+            else:
+                text = f"⚠️ 有一条消息没能发出：{err[:160]}"
+            info: dict = {}
+            try:
+                routed = self._route_for(str(item.get("msgid", "") or ""))
+                if isinstance(routed, dict):
+                    info = routed
+            except Exception:
+                info = {}
+            to = info.get("from_user_id", "") or str(item.get("to_user_id", "") or "")
+            if to:
+                await self.send_text(
+                    client, creds, to, text,
+                    info.get("context_token", ""), "", 2)
+            if STUCK_NOTICE_WECOM_OUTBOX.exists():
+                self.append_jsonl(STUCK_NOTICE_WECOM_OUTBOX, {
+                    "mode": "send",
+                    "chatid": STUCK_NOTICE_WECOM_CHATID,
+                    "chat_type": 1,
+                    "content": "【微信通道提醒】" + text,
+                    "id": uuid.uuid4().hex[:12],
+                    "queued_at": int(time.time()),
+                })
+        except Exception as e:
+            log(f"permanent-failure notice failed: {e}")
+
     def _cleanup_item(self, item_id: str) -> None:
         """A row reached a terminal state (delivered): drop its
         retry mirror, parked record and chunk-partial state."""
@@ -3452,8 +3624,13 @@ class Gateway:
             parked.pop(item_id, None)
             self._save_parked(parked)
         partial = self._load_partial()
-        if item_id in partial:
-            partial.pop(item_id, None)
+        removed = False
+        for key in (item_id, f"{item_id}:update", f"{item_id}:caption",
+                    f"{item_id}:levelup"):
+            if key in partial:
+                partial.pop(key, None)
+                removed = True
+        if removed:
             self._save_partial(partial)
 
     async def _notify_stuck_formal(self, client: httpx.AsyncClient,
@@ -3470,31 +3647,64 @@ class Gateway:
         fpath = str(item.get("file_path") or "")
         is_file = item.get("mode") in ("reply_file", "send_file") \
             and fpath and Path(fpath).exists()
+        # Divert first. The WeChat sentence may claim the file was
+        # handed to WeCom only when this append actually landed.
+        diverted = False
+        if is_file:
+            try:
+                if STUCK_NOTICE_WECOM_OUTBOX.exists():
+                    self.append_jsonl(STUCK_NOTICE_WECOM_OUTBOX, {
+                        "mode": "send_file",
+                        "chatid": STUCK_NOTICE_WECOM_CHATID,
+                        "chat_type": 1, "file_path": fpath,
+                        "id": uuid.uuid4().hex[:12],
+                        "queued_at": int(time.time())})
+                    diverted = True
+                    log(f"stuck formal {item.get('id')}: file rerouted "
+                        f"via WeCom: {fpath}")
+            except Exception as e:
+                log(f"stuck-formal divert failed: {e}")
+                diverted = False
         if is_file:
             # File rows fail on the CDN upload leg (slow/timeout —
             # see _upload_media), NOT on the text leg, so the old
             # "send a message to help recovery" advice was wrong for
             # them, and a bare notice left the user empty-handed.
-            # Reroute the file itself via WeCom (below) and say so.
             # Wording follows the three-tier rule (2026-10-08):
             # state what the server did / did not accept, what was
             # rerouted, and what still awaits the user's own
             # confirmation — a server-side ret=0 is never phrased
-            # as "delivered".
+            # as "delivered". Tier 2 names a divert only after the
+            # WeCom append above succeeded.
             if item.get("mode") == "send_file":
                 # Terminal reroute: the wedge guard consumed the
                 # row after repeated upload-stage failures.
-                text = (f"⚠️ 文件「{Path(fpath).name}」发送状态："
-                        f"① 服务端：微信上传连续失败 {attempts} 次，"
-                        "微信服务端尚未接受这个文件；"
-                        "② 转投：已把原文件转投到你的企微；"
-                        "③ 待确认：请在企微确认收到——微信这边已停止"
-                        "重试，原文件在 VM 上，需要时告诉我再发。")
-            else:
+                if diverted:
+                    text = (f"⚠️ 文件「{Path(fpath).name}」发送状态："
+                            f"① 服务端：微信上传连续失败 {attempts} 次，"
+                            "微信服务端尚未接受这个文件；"
+                            "② 转投：已把原文件转投到你的企微；"
+                            "③ 待确认：请在企微确认收到——微信这边已停止"
+                            "重试，原文件在 VM 上，需要时告诉我再发。")
+                else:
+                    text = (f"⚠️ 文件「{Path(fpath).name}」发送状态："
+                            f"① 服务端：微信上传连续失败 {attempts} 次，"
+                            "微信服务端尚未接受这个文件；"
+                            "② 转投：原文件没有写入企微队列，没有转投出去；"
+                            "③ 待确认：微信这边已停止重试，原文件在 VM 上，"
+                            "需要时告诉我再发。")
+            elif diverted:
                 text = (f"⚠️ 文件「{Path(fpath).name}」发送状态："
                         f"① 服务端：微信上传连续失败 {attempts} 次，"
                         "微信服务端尚未接受这个文件；"
                         "② 转投：已把原文件转投到你的企微应急；"
+                        "③ 微信这边仍在继续重试、不会丢弃，最终以你"
+                        "在微信实际收到为准。")
+            else:
+                text = (f"⚠️ 文件「{Path(fpath).name}」发送状态："
+                        f"① 服务端：微信上传连续失败 {attempts} 次，"
+                        "微信服务端尚未接受这个文件；"
+                        "② 转投：原文件没有写入企微队列，没有转投出去；"
                         "③ 微信这边仍在继续重试、不会丢弃，最终以你"
                         "在微信实际收到为准。")
         else:
@@ -3518,15 +3728,6 @@ class Gateway:
                     "chat_type": 1, "content": "【微信通道提醒】" + text,
                     "id": uuid.uuid4().hex[:12],
                     "queued_at": int(time.time())})
-                if is_file:
-                    self.append_jsonl(STUCK_NOTICE_WECOM_OUTBOX, {
-                        "mode": "send_file",
-                        "chatid": STUCK_NOTICE_WECOM_CHATID,
-                        "chat_type": 1, "file_path": fpath,
-                        "id": uuid.uuid4().hex[:12],
-                        "queued_at": int(time.time())})
-                    log(f"stuck formal {item.get('id')}: file rerouted "
-                        f"via WeCom: {fpath}")
         except Exception as e:
             log(f"stuck-formal notice (wecom leg) failed: {e}")
         log(f"stuck formal {item.get('mode')} {item.get('id')}: "
@@ -3539,7 +3740,10 @@ class Gateway:
         <=1600px q80; L1 = 640px CRF36 / 1280px q65; L2 = 480px
         CRF42 / 1024px q55. The cache key carries the level so
         rungs never pollute each other. Never modifies the
-        original."""
+        original. A failed ffmpeg run or a timeout deletes the partial
+        output so a later call cannot treat it as a finished cache hit."""
+        out: Path | None = None
+        discard_on_error = False
         try:
             level = max(0, min(2, int(level)))
             vwidth, vcrf, imax, iq = (
@@ -3556,6 +3760,7 @@ class Gateway:
             if ext in VIDEO_EXTS:
                 out = COMPRESSED_DIR / f"{key}.mp4"
                 if not (out.exists() and out.stat().st_size > 0):
+                    discard_on_error = True
                     r = subprocess.run(
                         ["ffmpeg", "-y", "-i", str(src),
                          "-vf", f"scale='min({vwidth},iw)':-2",
@@ -3564,18 +3769,22 @@ class Gateway:
                          "-c:a", "aac", "-b:a", "96k",
                          "-movflags", "+faststart", str(out)],
                         capture_output=True, timeout=180)
-                    if r.returncode != 0:
+                    if r.returncode != 0 or not out.exists() or out.stat().st_size <= 0:
                         log(f"ffmpeg compress failed for {src.name}: "
                             f"{r.stderr.decode('utf-8', 'replace')[-200:]}")
+                        _discard_partial(out)
                         return None
+                    discard_on_error = False
             elif ext in IMAGE_EXTS:
                 out = COMPRESSED_DIR / f"{key}.jpg"
                 if not (out.exists() and out.stat().st_size > 0):
+                    discard_on_error = True
                     from PIL import Image
                     with Image.open(src) as im:
                         im = im.convert("RGB")
                         im.thumbnail((imax, imax))
                         im.save(out, "JPEG", quality=iq)
+                    discard_on_error = False
             else:
                 return None
             if out.exists() and 0 < out.stat().st_size < size:
@@ -3583,6 +3792,8 @@ class Gateway:
             return None
         except Exception as e:
             log(f"compression failed for {src}: {e}")
+            if discard_on_error:
+                _discard_partial(out)
             return None
 
     @staticmethod
@@ -3732,6 +3943,8 @@ class Gateway:
                     result["errmsg"] = f"no context stored for msgid {item.get('msgid')}"
                     self.append_jsonl(OUTBOX_RESULTS, result)
                     log(f"outbox reply {item_id}: {result['errmsg']}")
+                    await self._notify_permanent_failure(
+                        client, creds, item, result["errmsg"])
                     return True
                 resp = await self.send_text(
                     client, creds, to, content, token_ctx,
@@ -3760,18 +3973,31 @@ class Gateway:
                     result["errmsg"] = f"no context stored for msgid {item.get('msgid')}"
                     self.append_jsonl(OUTBOX_RESULTS, result)
                     log(f"outbox reply_file {item_id}: {result['errmsg']}")
+                    await self._notify_permanent_failure(
+                        client, creds, item, result["errmsg"])
                     return True
                 fpath = item.get("file_path", "")
                 if not Path(fpath).exists():
                     result["errmsg"] = f"file not found: {fpath}"
                     self.append_jsonl(OUTBOX_RESULTS, result)
                     log(f"outbox reply_file {item_id}: {result['errmsg']}")
+                    await self._notify_permanent_failure(
+                        client, creds, item, result["errmsg"])
                     return True
                 orig_name = Path(fpath).name
                 pn = self._parked_n(item_id)
                 lvl = self._compress_level_for(pn)
                 fpath, was_compressed = \
                     await self._prepare_file_for_send(fpath, lvl, pn)
+                if not file_send_allowed(fpath):
+                    result["errmsg"] = (
+                        "exception: refusing to send file outside "
+                        f"allowed directories: {fpath}")
+                    self.append_jsonl(OUTBOX_RESULTS, result)
+                    log(f"outbox {mode} {item_id}: ok=False err={result['errmsg']}")
+                    await self._notify_permanent_failure(
+                        client, creds, item, result["errmsg"])
+                    return True
                 result.update(self._file_result_meta(
                     fpath, lvl if was_compressed else 0))
                 if was_compressed and lvl > 0:
@@ -3819,12 +4045,24 @@ class Gateway:
                 if fpath and not Path(fpath).exists():
                     result["errmsg"] = f"file not found: {fpath}"
                     self.append_jsonl(OUTBOX_RESULTS, result)
+                    log(f"outbox send_file {item_id}: {result['errmsg']}")
+                    await self._notify_permanent_failure(
+                        client, creds, item, result["errmsg"])
                     return True
                 if fpath:
                     pn = self._parked_n(item_id)
                     lvl = self._compress_level_for(pn)
                     fpath, was_compressed = \
                         await self._prepare_file_for_send(fpath, lvl, pn)
+                    if not file_send_allowed(fpath):
+                        result["errmsg"] = (
+                            "exception: refusing to send file outside "
+                            f"allowed directories: {fpath}")
+                        self.append_jsonl(OUTBOX_RESULTS, result)
+                        log(f"outbox {mode} {item_id}: ok=False err={result['errmsg']}")
+                        await self._notify_permanent_failure(
+                            client, creds, item, result["errmsg"])
+                        return True
                     result.update(self._file_result_meta(
                         fpath, lvl if was_compressed else 0))
                     if was_compressed:
@@ -3860,6 +4098,9 @@ class Gateway:
             result["errmsg"] = f"exception: {e}"
             self.append_jsonl(OUTBOX_RESULTS, result)
             log(f"outbox {mode} {item_id}: ok=False err={result['errmsg']}")
+            if mode in FORMAL_MODES or mode == "send_file":
+                await self._notify_permanent_failure(
+                    client, creds, item, result["errmsg"])
             return True
         except Exception as e:
             result["errmsg"] = f"exception: {e}"
@@ -3906,59 +4147,62 @@ class Gateway:
         while True:
             await asyncio.sleep(1.0)
             # ---- main queue pass ----
-            if OUTBOX.exists():
-                offset = self._outbox_offset()
-                size = OUTBOX.stat().st_size
-                if offset > size:
-                    offset = 0
-                if offset < size:
-                    with OUTBOX.open("rb") as f:
-                        f.seek(offset)
-                        data = f.read()
-                    consumed = 0
-                    parked_ids = set(self._load_parked().keys())
-                    for raw_line in complete_jsonl_lines(data):
-                        parsed = parse_jsonl_line(raw_line)
-                        if parsed is None or parsed.get("__invalid__"):
-                            if parsed and parsed.get("__invalid__"):
-                                log(f"outbox: skipping bad line at offset {offset + consumed}")
+            try:
+                if OUTBOX.exists():
+                    offset = self._outbox_offset()
+                    size = OUTBOX.stat().st_size
+                    if offset > size:
+                        offset = 0
+                    if offset < size:
+                        with OUTBOX.open("rb") as f:
+                            f.seek(offset)
+                            data = f.read()
+                        consumed = 0
+                        parked_ids = set(self._load_parked().keys())
+                        for raw_line in complete_jsonl_lines(data):
+                            parsed = parse_jsonl_line(raw_line)
+                            if parsed is None or parsed.get("__invalid__"):
+                                if parsed and parsed.get("__invalid__"):
+                                    log(f"outbox: skipping bad line at offset {offset + consumed}")
+                                consumed += len(raw_line) + 1
+                                try:
+                                    write_offset(OUTBOX_OFFSET, offset + consumed)
+                                except OSError:
+                                    pass
+                                continue
+                            item = parsed
+                            item_id = str(item.get("id") or "")
+                            if item_id and item_id in parked_ids:
+                                # Duplicate row for an already-parked id:
+                                # the lane owns it; just consume this copy.
+                                consumed += len(raw_line) + 1
+                                try:
+                                    write_offset(OUTBOX_OFFSET, offset + consumed)
+                                except OSError:
+                                    pass
+                                continue
+                            consumed_ok = await self.dispatch_outbox_item(
+                                client, creds, item)
+                            if consumed_ok:
+                                self._cleanup_item(item_id)
+                            else:
+                                _action, notify = self._note_failure(
+                                    item, self._last_errmsg(item_id))
+                                if notify:
+                                    asyncio.create_task(
+                                        self._notify_stuck_formal(
+                                            client, creds, item,
+                                            FORMAL_STUCK_NOTIFY_ATTEMPTS))
+                            # Success, park, drop and dead-letter ALL
+                            # advance the offset: the main queue moves on
+                            # in the same cycle either way.
                             consumed += len(raw_line) + 1
                             try:
                                 write_offset(OUTBOX_OFFSET, offset + consumed)
                             except OSError:
                                 pass
-                            continue
-                        item = parsed
-                        item_id = str(item.get("id") or "")
-                        if item_id and item_id in parked_ids:
-                            # Duplicate row for an already-parked id:
-                            # the lane owns it; just consume this copy.
-                            consumed += len(raw_line) + 1
-                            try:
-                                write_offset(OUTBOX_OFFSET, offset + consumed)
-                            except OSError:
-                                pass
-                            continue
-                        consumed_ok = await self.dispatch_outbox_item(
-                            client, creds, item)
-                        if consumed_ok:
-                            self._cleanup_item(item_id)
-                        else:
-                            _action, notify = self._note_failure(
-                                item, self._last_errmsg(item_id))
-                            if notify:
-                                asyncio.create_task(
-                                    self._notify_stuck_formal(
-                                        client, creds, item,
-                                        FORMAL_STUCK_NOTIFY_ATTEMPTS))
-                        # Success, park, drop and dead-letter ALL
-                        # advance the offset: the main queue moves on
-                        # in the same cycle either way.
-                        consumed += len(raw_line) + 1
-                        try:
-                            write_offset(OUTBOX_OFFSET, offset + consumed)
-                        except OSError:
-                            pass
+            except Exception as e:
+                log(f"main queue pass failed (continuing): {e}")
             # ---- retry lane pass ----
             try:
                 parked = self._load_parked()
@@ -4050,9 +4294,13 @@ class Gateway:
                 # both the in-session streak and the consecutive
                 # failed-episode counter reset. A long-poll
                 # TimeoutException is neither (the session simply
-                # polls again, as before).
+                # polls again, as before). A healthy round also breaks
+                # the consecutive stale-episode streak: sessions that
+                # later end with errcode -14 must not accumulate hits
+                # across healthy cycles.
                 failures = 0
                 self.reconnect_failures = 0
+                self._stale_hits = 0
                 new_buf = resp.get("get_updates_buf")
                 msgs = resp.get("msgs") or []
                 for msg in msgs:
@@ -4115,7 +4363,7 @@ class Gateway:
 
     async def run(self) -> None:
         backoff = 5
-        stale_hits = 0
+        self._stale_hits = 0
         self.reconnect_failures = 0
         # Explicit proxy from env: httpx trust_env parsing chokes on the
         # bracketed IPv6 entries in NO_PROXY here ("Invalid port ':1]'").
@@ -4141,15 +4389,15 @@ class Gateway:
                     # official plugin's pause-and-retry). A message from the
                     # user to the bot usually revives the session server-side,
                     # and queued messages arrive on the next successful poll.
-                    stale_hits += 1
-                    if stale_hits < 6:
+                    self._stale_hits += 1
+                    if self._stale_hits < 6:
                         self.state = "session_stale"
                         self.write_status()
-                        log(f"stale session; probe {stale_hits}/6 in 600s")
+                        log(f"stale session; probe {self._stale_hits}/6 in 600s")
                         await asyncio.sleep(600)
                         continue
                     reason = "needs_relogin"
-                stale_hits = 0
+                self._stale_hits = 0
                 if reason == "needs_relogin":
                     self.state = "needs_relogin"
                     self.write_status()
