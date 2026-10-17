@@ -41,6 +41,7 @@ import os
 import subprocess
 import sys
 import time
+import unicodedata
 import uuid
 from pathlib import Path
 
@@ -57,12 +58,16 @@ from channel_common import (  # noqa: E402
     allocate_subagent_id,
     append_jsonl as append_jsonl_line,
     complete_jsonl_lines,
+    exclusive_file_lock,
     load_json_dict,
+    media_url_allowed,
     merge_queue_admin,
     muse_home,
     outbound_file_allowed,
     parse_jsonl_line,
+    pid_alive,
     read_offset,
+    read_pid_file,
     retry_backoff_secs,
     subagent_outcome_default,
     trim_mapping,
@@ -415,6 +420,60 @@ def media_type_for_path(path: str) -> str:
     if ext in ("amr",):
         return "voice"
     return "file"
+
+
+class WeComUploadTooLarge(ValueError):
+    """Permanent failure: WeCom accepts at most 100 upload chunks (~50MiB)."""
+
+    def __init__(self, filename: str, nbytes: int) -> None:
+        self.filename = filename
+        self.nbytes = nbytes
+        super().__init__("file too large for WeCom upload (>100 chunks)")
+
+    @property
+    def user_text(self) -> str:
+        """Chat notice for a file that cannot be uploaded in 100 chunks."""
+        return (
+            f"⚠️ 文件「{self.filename}」超过企业微信上传上限"
+            f"（{self.nbytes} 字节，超过 100 个分片），这次没有发出，也不会再重试。"
+        )
+
+
+def _frame_headers(frame: dict) -> dict:
+    """Header dict from a frame. An explicit null is an empty dict."""
+    if not isinstance(frame, dict):
+        return {}
+    headers = frame.get("headers")
+    if isinstance(headers, dict):
+        return headers
+    return {}
+
+
+def _approval_ascii_number(token: str) -> str | None:
+    """Unsigned ASCII integer, after NFKC.
+
+    ``str.isdigit`` is true for fullwidth and superscript digits, and
+    those characters miss the ASCII-keyed approval lookup. NFKC folds
+    them to ASCII; anything that is still not an ASCII digit is rejected.
+    """
+    norm = unicodedata.normalize("NFKC", str(token or "")).strip()
+    if not norm or not norm.isascii() or not norm.isdigit():
+        return None
+    return norm
+
+
+def _gateway_process_alive(status: dict, state_dir: Path) -> bool:
+    """True when the status payload or the gateway lock names a live pid.
+
+    Status is written on events, so an idle long-poll can be older than
+    the /check freshness window while the process is still healthy.
+    """
+    pid = status.get("pid") if isinstance(status, dict) else None
+    if isinstance(pid, bool) or not isinstance(pid, int):
+        pid = read_pid_file(Path(state_dir) / "gateway.lock")
+    if isinstance(pid, bool) or not isinstance(pid, int):
+        return False
+    return pid_alive(pid)
 
 
 def log(msg: str) -> None:
@@ -1078,11 +1137,22 @@ def slash_run_check(chan_label, state_dir, hook_state_dir):
         items.append(("网关状态文件", False, "status.json 缺失或不可解析"))
     else:
         upd = st.get("updated_at")
-        fresh = isinstance(upd, (int, float)) and (now - float(upd) <= 90)
-        ok = bool(fresh and st.get("connected") and not st.get("last_error"))
+        fresh = (
+            isinstance(upd, (int, float))
+            and not isinstance(upd, bool)
+            and (now - float(upd) <= 90)
+        )
+        # Idle gateways only rewrite status on an event, so a healthy
+        # long-poll is older than 90s. A live pid keeps that from
+        # reading as a dead process. A stale file with no live pid
+        # is still a failure.
+        alive = _gateway_process_alive(st, state_dir)
+        ok = bool(st.get("connected") and not st.get("last_error") and (fresh or alive))
         detail = f"状态 {st.get('state')}，更新于 {_fmt_hm(upd)}"
-        if not fresh:
+        if not fresh and not alive:
             detail += "（已超 90 秒未刷新）"
+        elif not fresh and alive:
+            detail += "（进程仍在，状态文件随事件刷新）"
         if st.get("last_error"):
             detail += f"，last_error={st.get('last_error')}"
         items.append(("网关状态文件", ok, detail))
@@ -1484,8 +1554,8 @@ def parse_approval_slash(name, arg):
     is allow_always with no second word.
     """
     toks = (arg or "").split()
-    num = toks[0] if toks else ""
-    if not num.isdigit():
+    num = _approval_ascii_number(toks[0] if toks else "")
+    if num is None:
         return None
     if name in APPROVAL_LETTER_DECISIONS:
         return (num, APPROVAL_LETTER_DECISIONS[name])
@@ -1554,16 +1624,24 @@ def slash_approval_decide_ack(num, decision, channel):
         return f"审批 #{num} 已经处理过了。"
     label = {"allow_once": "批准（仅这次）", "allow_always": "批准（永久）",
              "deny": "拒绝"}[decision]
-    prev = _approval_pending_submission(num)
-    if prev is not None:
-        prev_label = {"allow_once": "批准（仅这次）",
-                      "allow_always": "批准（永久）",
-                      "deny": "拒绝"}.get(prev, prev)
-        return (f"审批 #{num} 已提交过（{prev_label}），"
-                f"等执行结果就行，不用重复提交。")
-    if _append_jsonl_file(APPROVAL_RELAY_DIR / "decisions.jsonl",
-                          {"num": str(num), "decision": decision,
-                           "channel": channel, "ts": time.time()}):
+    # Check and append share one lock. Two channels can both observe
+    # "pending" and both append if this stays check-then-append.
+    try:
+        with exclusive_file_lock(APPROVAL_RELAY_DIR / "decisions.lock"):
+            prev = _approval_pending_submission(num)
+            if prev is not None:
+                prev_label = {"allow_once": "批准（仅这次）",
+                              "allow_always": "批准（永久）",
+                              "deny": "拒绝"}.get(prev, prev)
+                return (f"审批 #{num} 已提交过（{prev_label}），"
+                        f"等执行结果就行，不用重复提交。")
+            wrote = _append_jsonl_file(
+                APPROVAL_RELAY_DIR / "decisions.jsonl",
+                {"num": str(num), "decision": decision,
+                 "channel": channel, "ts": time.time()})
+    except OSError:
+        wrote = False
+    if wrote:
         return f"已提交{label} #{num}：{it.get('who', '')}。执行结果马上发你。"
     return "提交失败：暂时写不了审批指令，请稍后再试。"
 
@@ -1846,6 +1924,7 @@ class Gateway:
             "connected": self.connected,
             "started_at": self.started_at,
             "updated_at": int(time.time()),
+            "pid": os.getpid(),
             "msgs_received": self.msgs_received,
             "msgs_sent": self.msgs_sent,
             "last_error": self.last_error,
@@ -1861,14 +1940,32 @@ class Gateway:
     def append_jsonl(path: Path, obj: dict) -> None:
         append_jsonl_line(path, obj)
 
-    def _event_allowed(self, userid: str) -> bool:
-        """Same allowlist as ordinary messages. Empty allowlist allows all."""
+    def _log_allowlist_closed(self) -> None:
+        """One log line per minute when the allowlist is empty."""
+        now = time.monotonic()
+        last = float(getattr(self, "_allowlist_closed_log_at", 0.0) or 0.0)
+        if now - last < 60.0:
+            return
+        self._allowlist_closed_log_at = now
+        log("WECOM_ALLOW_USERS is empty; denying inbound")
+
+    def _sender_allowed(self, userid: str, kind: str) -> bool:
+        """False when the allowlist is empty or userid is not on it.
+
+        An empty allowlist fails closed, matching the Weixin gateway
+        when its owner id is unset. The empty-list log is throttled.
+        """
         if not self.allow_users:
-            return True
+            self._log_allowlist_closed()
+            return False
         if userid and userid in self.allow_users:
             return True
-        log(f"ignored event from non-allowlisted user {userid}")
+        log(f"ignored {kind} from non-allowlisted user {userid}")
         return False
+
+    def _event_allowed(self, userid: str) -> bool:
+        """Same allowlist as ordinary messages. Empty allowlist denies all."""
+        return self._sender_allowed(userid, "event")
 
     @staticmethod
     def _cancelled_ids() -> set:
@@ -1928,11 +2025,17 @@ class Gateway:
         return load_json_dict(OUTBOX_PARKED)
 
     @staticmethod
-    def _save_parked(data: dict) -> None:
+    def _save_parked(data: dict) -> bool:
+        """Persist parked rows. False when the replace fails.
+
+        Callers that notify the user must treat False as "not saved"
+        and must not record the notice as already sent.
+        """
         try:
             atomic_write_text(OUTBOX_PARKED, json.dumps(data, ensure_ascii=False))
         except OSError:
-            pass
+            return False
+        return True
 
     def _note_failure(self, item: dict) -> str:
         """Register one failed dispatch and decide the row's fate:
@@ -1954,11 +2057,9 @@ class Gateway:
         rec["n"] = int(rec.get("n") or 0) + 1
         n = rec["n"]
         rec["next"] = time.time() + retry_backoff_secs(n)
-        if (mode in FORMAL_MODES
-                and n >= FORMAL_STUCK_NOTIFY_ATTEMPTS
-                and not rec.get("notified")):
-            rec["notified"] = True
-            self._notify_stuck_formal(item, n)
+        should_notify = (mode in FORMAL_MODES
+                         and n >= FORMAL_STUCK_NOTIFY_ATTEMPTS
+                         and not rec.get("notified"))
         action = "park"
         if (mode not in FORMAL_MODES and not item.get("proactive")
                 and n >= SEND_MAX_ATTEMPTS):
@@ -1986,8 +2087,24 @@ class Gateway:
         else:
             parked.pop(item_id, None)
             retry.pop(item_id, None)
-        self._save_parked(parked)
+        saved = self._save_parked(parked)
         self._save_retry(retry)
+        if not saved:
+            log(f"outbox {mode} {item_id}: parked save failed; stuck notice withheld")
+            return action
+        if should_notify and action == "park":
+            rec["notified"] = True
+            mirror = retry.get(item_id)
+            if isinstance(mirror, dict):
+                mirror["notified"] = True
+            if not self._save_parked(parked):
+                rec["notified"] = False
+                if isinstance(mirror, dict):
+                    mirror.pop("notified", None)
+                log(f"outbox {mode} {item_id}: parked save failed; stuck notice withheld")
+                return action
+            self._save_retry(retry)
+            self._notify_stuck_formal(item, n)
         return action
 
     def _notify_stuck_formal(self, item: dict, attempts: int) -> None:
@@ -2090,39 +2207,51 @@ class Gateway:
 
     @staticmethod
     def _delivered_reply_before(item: dict) -> bool:
-        """Sending-layer late suppression (fix, 2026-10-04 evening,
-        mirroring the weixin channel): True when an outbox row queued
-        BEFORE this item is a formal reply or reply_file for the same
-        msgid whose delivery result is ok. Dispatch uses this to drop
-        a late progress update — and, since the 2026-10-15 fencing
-        fix, a second formal reply. It does not drop reply_file: the
-        bridge queues the media row after the text reply for the same
-        msgid, and that file is part of the answer. Only rows before
-        this item count, so an update queued before its reply (normal
-        progress order) is never suppressed. Fail-open."""
+        """Sending-layer late suppression.
+
+        True when any other outbox row for this msgid is a formal
+        reply or reply_file whose delivery result is ok. Row order
+        does not matter: a parked text reply that sits above an
+        already-delivered file reply is still a duplicate formal
+        answer. Dispatch uses this to drop a late progress update
+        and a second formal text reply. It does not drop reply_file:
+        the bridge queues the media row for the same msgid, and that
+        file is part of the answer. Fail-open.
+        """
         try:
-            item_id = item.get("id", "")
+            item_id = str(item.get("id") or "")
+            msgid = str(item.get("msgid") or "")
+            if not msgid:
+                return False
             results: dict[str, dict] = {}
             if OUTBOX_RESULTS.exists():
-                for line in OUTBOX_RESULTS.read_text(encoding="utf-8").splitlines():
+                text = OUTBOX_RESULTS.read_text(encoding="utf-8")
+                for line in text.split("\n"):
+                    line = line.strip()
+                    if not line:
+                        continue
                     try:
-                        r = json.loads(line)
+                        row = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    if r.get("id"):
-                        results[r["id"]] = r
+                    if row.get("id"):
+                        results[row["id"]] = row
             if not OUTBOX.exists():
                 return False
-            for line in OUTBOX.read_text(encoding="utf-8").splitlines():
+            text = OUTBOX.read_text(encoding="utf-8")
+            for line in text.split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
                 try:
-                    o = json.loads(line)
+                    row = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if o.get("id") == item_id:
-                    break
-                if o.get("mode") not in ("reply", "reply_file") or str(o.get("msgid")) != str(item.get("msgid")):
+                if str(row.get("id") or "") == item_id:
                     continue
-                res = results.get(o.get("id"))
+                if row.get("mode") not in ("reply", "reply_file") or str(row.get("msgid")) != msgid:
+                    continue
+                res = results.get(row.get("id"))
                 if res is not None and res.get("ok") is True:
                     return True
             return False
@@ -2132,18 +2261,22 @@ class Gateway:
     # ---------- low-level send / response tracking ----------
 
     async def send_frame(self, frame: dict, wait_response: bool = False, timeout: float = 10.0):
-        req_id = frame.get("headers", {}).get("req_id", "")
+        req_id = _frame_headers(frame).get("req_id", "")
         fut = None
         if wait_response and req_id:
             fut = asyncio.get_running_loop().create_future()
             self.pending_responses[req_id] = fut
-        await self.ws.send(json.dumps(frame, ensure_ascii=False))
-        if fut is not None:
+        try:
+            await self.ws.send(json.dumps(frame, ensure_ascii=False))
+            if fut is None:
+                return None
             try:
                 return await asyncio.wait_for(fut, timeout=timeout)
             except asyncio.TimeoutError:
-                self.pending_responses.pop(req_id, None)
                 return {"errcode": -1, "errmsg": "response timeout"}
+        finally:
+            if fut is not None:
+                self.pending_responses.pop(req_id, None)
 
     @staticmethod
     def new_req_id(prefix: str) -> str:
@@ -2245,9 +2378,12 @@ class Gateway:
     async def _slash_dispatch(self, text, chatid, chattype, msgid="", req_id=""):
         """Handle a slash command. Returns:
         - None: not a command — caller proceeds with the normal flow.
-        - "handled": command done, ack sent — caller returns early.
-        Never raises: on an unexpected error it logs and returns None so
-        the message falls back to the ordinary worker flow."""
+        - "handled": command done — caller returns early.
+        Never raises. An error before the command's side effects are
+        committed logs and returns None so the message falls back to
+        the worker. Once those side effects are committed, an ack
+        failure is logged and still returns "handled".
+        """
         try:
             parsed = parse_slash_command(text)
             if parsed is None:
@@ -2409,13 +2545,18 @@ class Gateway:
                 else:
                     num, decision = decided
                     ack = slash_approval_decide_ack(num, decision, "wecom")
-            if ack is not None:
-                await self._send_slash_ack(chatid, chattype, ack, req_id)
-            log(f"slash /{name} handled for chat {chatid}")
-            return "handled"
-        except Exception as e:  # never let a command break the inbound flow
+        except Exception as e:  # a failed command falls back to the worker
             log(f"slash dispatch error: {e!r}")
             return None
+        try:
+            if ack is not None:
+                await self._send_slash_ack(chatid, chattype, ack, req_id)
+        except Exception as e:
+            # Side effects already committed. Falling through would run
+            # the command a second time on the ordinary inbound path.
+            log(f"slash ack failed after /{name} committed: {e!r}")
+        log(f"slash /{name} handled for chat {chatid}")
+        return "handled"
 
     def _maybe_soft_ack(self, chatid, chattype, text):
         """Queue the busy soft ack as an unbound outbox "send" row.
@@ -2640,9 +2781,9 @@ class Gateway:
 
     async def handle_message_callback(self, frame: dict) -> None:
         body = frame.get("body", {}) or {}
-        req_id = frame.get("headers", {}).get("req_id", "")
+        req_id = _frame_headers(frame).get("req_id", "")
         msgid = body.get("msgid", "")
-        if msgid and msgid in self.seen_msgids:
+        if msgid and str(msgid) in self.seen_msgids:
             log(f"duplicate msgid {msgid}, skipped")
             return
         msgtype = body.get("msgtype", "")
@@ -2710,9 +2851,13 @@ class Gateway:
         chattype = body.get("chattype", "")
         from_userid = (body.get("from") or {}).get("userid", "")
         chatid = body.get("chatid") or from_userid
-        if self.allow_users and from_userid not in self.allow_users:
-            log(f"ignored message from non-allowlisted user {from_userid}")
+        if not self._sender_allowed(str(from_userid or ""), "message"):
             return
+        # Mark before any await. Callbacks run as concurrent tasks, so
+        # a second frame with this msgid can pass the check above while
+        # the first is inside slash handling or a media download.
+        if msgid:
+            self._mark_seen(str(msgid))
         if msgtype == "text" and not media:
             # Slash commands: intercepted after allowlist + dedupe,
             # before the inbox write — they never wake a worker.
@@ -2842,7 +2987,7 @@ class Gateway:
 
     async def handle_event_callback(self, frame: dict) -> None:
         body = frame.get("body", {}) or {}
-        req_id = frame.get("headers", {}).get("req_id", "")
+        req_id = _frame_headers(frame).get("req_id", "")
         event = body.get("event", {}) or {}
         etype = event.get("eventtype", "")
         from_userid = (body.get("from") or {}).get("userid", "")
@@ -3117,6 +3262,36 @@ class Gateway:
                 },
             )
 
+    def _spawn_callback(self, frame: dict, handler) -> None:
+        """Run a callback task and log its failure with message context.
+
+        A bare create_task drops the exception when the handler raises,
+        and nothing redelivers the frame. The task stays referenced
+        until the done callback runs.
+        """
+        task = asyncio.create_task(handler(frame))
+        tasks = getattr(self, "_callback_tasks", None)
+        if tasks is None:
+            tasks = set()
+            self._callback_tasks = tasks
+        tasks.add(task)
+
+        def _done(done: asyncio.Task) -> None:
+            tasks.discard(done)
+            if done.cancelled():
+                return
+            exc = done.exception()
+            if exc is None:
+                return
+            body = frame.get("body") if isinstance(frame, dict) else None
+            msgid = ""
+            if isinstance(body, dict):
+                msgid = str(body.get("msgid") or "")
+            cmd = frame.get("cmd") if isinstance(frame, dict) else ""
+            log(f"callback task failed cmd={cmd} msgid={msgid}: {exc!r}")
+
+        task.add_done_callback(_done)
+
     async def reader_loop(self) -> None:
         async for raw in self.ws:
             try:
@@ -3124,16 +3299,19 @@ class Gateway:
             except (json.JSONDecodeError, TypeError):
                 log(f"unparsable frame: {str(raw)[:200]}")
                 continue
+            if not isinstance(frame, dict):
+                log(f"unparsable frame: {str(raw)[:200]}")
+                continue
             cmd = frame.get("cmd")
             if cmd == "aibot_msg_callback":
                 # Spawn as a task: handlers send respond frames and await their
                 # responses, which only this loop can read. Awaiting inline
                 # deadlocks every respond until timeout.
-                asyncio.create_task(self.handle_message_callback(frame))
+                self._spawn_callback(frame, self.handle_message_callback)
             elif cmd == "aibot_event_callback":
-                asyncio.create_task(self.handle_event_callback(frame))
+                self._spawn_callback(frame, self.handle_event_callback)
             else:
-                req_id = frame.get("headers", {}).get("req_id", "")
+                req_id = _frame_headers(frame).get("req_id", "")
                 fut = self.pending_responses.pop(req_id, None)
                 if fut is not None and not fut.done():
                     fut.set_result(frame)
@@ -3170,7 +3348,7 @@ class Gateway:
     def _http_client(self) -> httpx.AsyncClient:
         if self._http is None:
             proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or None
-            self._http = httpx.AsyncClient(proxy=proxy, trust_env=False, follow_redirects=True)
+            self._http = httpx.AsyncClient(proxy=proxy, trust_env=False, follow_redirects=False)
         return self._http
 
     async def _download_media(self, media: list[dict], msgid: str) -> None:
@@ -3179,6 +3357,9 @@ class Gateway:
         for i, m in enumerate(media):
             url, aeskey = m.get("url", ""), m.get("aeskey", "")
             if not url or not aeskey:
+                continue
+            if not media_url_allowed(url):
+                log(f"media {msgid}/{i}: refused non-Tencent url host")
                 continue
             # Transport drops retry from byte 0 inside the helper.
             # Decrypt runs once on a completed cipher. Over the cap:
@@ -3289,7 +3470,7 @@ class Gateway:
         chunk_size = 512 * 1024
         total_chunks = max(1, (len(data) + chunk_size - 1) // chunk_size)
         if total_chunks > 100:
-            raise ValueError("file too large for WeCom upload (>100 chunks)")
+            raise WeComUploadTooLarge(filename, len(data))
         resp = await self.send_frame(
             {
                 "cmd": "aibot_upload_media_init",
@@ -3379,10 +3560,10 @@ class Gateway:
     # is fed through the coalescer; only unbound "send" rows buffer
     # (idle-gap / max-wait flush via due() once per tick), every
     # other mode is a barrier that flushes pending buffers first and
-    # then dispatches itself, preserving order. Accounting choice
-    # (conservative): a buffered send row is CONSUMED from the main
-    # queue when fed — its payload lives in _coalesce_pending — and
-    # the merged dispatch accounts per ORIGINAL row id (one result
+    # then dispatches itself, preserving order. A buffered send stays
+    # in the outbox file until a flush actually dispatches it: the
+    # cursor does not pass a line that is still only in the coalescer.
+    # The merged dispatch accounts per ORIGINAL row id (one result
     # row each; on failure each original is parked individually via
     # _note_failure, so the retry lane re-dispatches it on its own,
     # unmerged). The retry lane itself is NOT coalesced: parked rows
@@ -3465,6 +3646,38 @@ class Gateway:
                 self._note_failure(orig)
         return ok
 
+    def _buffered_send_ids(self) -> set[str]:
+        """Ids sitting in the coalescer, not yet flushed."""
+        coalescer = getattr(self, "_coalescer", None)
+        found: set[str] = set()
+        if coalescer is None:
+            return found
+        pending = getattr(coalescer, "_pending", None) or {}
+        for bucket in pending.values():
+            for mid in getattr(bucket, "ids", ()) or ():
+                if mid:
+                    found.add(str(mid))
+        return found
+
+    def _awaiting_offset_ids(self) -> set[str]:
+        """Ids dispatched whose outbox lines the cursor has not passed."""
+        held = getattr(self, "_offset_pending_ids", None)
+        if not isinstance(held, set):
+            held = set()
+            self._offset_pending_ids = held
+        return held
+
+    def _remember_dispatched_ids(self, ready: dict) -> None:
+        """Remember ids a flush already handed to dispatch."""
+        if not isinstance(ready, dict):
+            return
+        ids = [str(mid) for mid in (ready.get("merged_ids") or []) if str(mid)]
+        if not ids:
+            row_id = str(ready.get("id") or "")
+            if row_id:
+                ids = [row_id]
+        self._awaiting_offset_ids().update(ids)
+
     async def outbox_loop(self) -> None:
         """Park-and-continue outbox (2026-10-06): the main queue
         NEVER waits behind a failing row. Each cycle: (1) drain the
@@ -3492,6 +3705,7 @@ class Gateway:
                     _due_rows = []
                 for _ready in _due_rows:
                     await self._dispatch_outbox_ready(_ready)
+                    self._remember_dispatched_ids(_ready)
             # ---- main queue pass ----
             if OUTBOX.exists():
                 offset = self._outbox_offset()
@@ -3508,44 +3722,46 @@ class Gateway:
                     log(f"outbox read error: {e}")
                     data = b""
                 if data:
-                    consumed = 0
                     parked_ids = set(self._load_parked().keys())
-                    for raw_line in complete_jsonl_lines(data):
+                    already_buffered = self._buffered_send_ids()
+                    awaiting = self._awaiting_offset_ids()
+                    lines = list(complete_jsonl_lines(data))
+                    # Feed the whole read so a barrier still flushes
+                    # the sends ahead of it in this pass. Lines already
+                    # dispatched or still buffered are not fed again.
+                    for raw_line in lines:
+                        parsed = parse_jsonl_line(raw_line)
+                        if parsed is None or parsed.get("__invalid__"):
+                            continue
+                        item = parsed
+                        item_id = str(item.get("id") or "")
+                        if item_id and (
+                            item_id in awaiting
+                            or item_id in parked_ids
+                            or item_id in already_buffered
+                        ):
+                            continue
+                        for ready in self._coalesce_feed(item):
+                            await self._dispatch_outbox_ready(ready)
+                            self._remember_dispatched_ids(ready)
+                    buffered_now = self._buffered_send_ids()
+                    consumed = 0
+                    for raw_line in lines:
                         parsed = parse_jsonl_line(raw_line)
                         if parsed is None or parsed.get("__invalid__"):
                             if parsed and parsed.get("__invalid__"):
                                 log(f"outbox: skipping bad line at offset {offset + consumed}")
                             consumed += len(raw_line) + 1
-                            try:
-                                write_offset(OUTBOX_OFFSET, offset + consumed)
-                            except OSError:
-                                pass
                             continue
-                        item = parsed
-                        item_id = str(item.get("id") or "")
-                        if item_id and item_id in parked_ids:
-                            # Duplicate row for an already-parked
-                            # id: the lane owns it; consume the copy.
-                            consumed += len(raw_line) + 1
-                            try:
-                                write_offset(OUTBOX_OFFSET, offset + consumed)
-                            except OSError:
-                                pass
-                            continue
-                        # Coalescer (2026-10-09): the row is fed
-                        # first; whatever comes back ready (flushed
-                        # merged sends, then the row itself when it
-                        # is a barrier) is dispatched in order, each
-                        # with per-original-id accounting inside
-                        # _dispatch_outbox_ready. A buffered send
-                        # returns nothing here and is dispatched by
-                        # a later due() pass — it still counts as
-                        # consumed below.
-                        for _ready in self._coalesce_feed(item):
-                            await self._dispatch_outbox_ready(_ready)
-                        # Success, park and dead-letter ALL advance
-                        # the offset: the main queue moves on.
+                        item_id = str(parsed.get("id") or "")
+                        if item_id and item_id in buffered_now:
+                            break
+                        if item_id and item_id not in awaiting and item_id not in parked_ids:
+                            break
                         consumed += len(raw_line) + 1
+                        if item_id:
+                            awaiting.discard(item_id)
+                    if consumed:
                         try:
                             write_offset(OUTBOX_OFFSET, offset + consumed)
                         except OSError:
@@ -3912,6 +4128,31 @@ class Gateway:
                     orig_req_id,
                     {"msgtype": mtype, mtype: {"media_id": media_id}},
                 )
+                if isinstance(resp, dict) and resp.get("errcode") not in (0, -1):
+                    # The callback req_id is dead. Same proactive path a
+                    # text reply uses, carrying the uploaded media.
+                    target_chatid = str(info.get("chatid") or item.get("chatid") or "")
+                    if target_chatid:
+                        chat_type = item.get("chat_type")
+                        if chat_type is None:
+                            chat_type = 2 if info.get("chattype") == "group" else 1
+                        resp2 = await self.send_frame(
+                            {
+                                "cmd": "aibot_send_msg",
+                                "headers": {"req_id": self.new_req_id("send")},
+                                "body": {
+                                    "chatid": target_chatid,
+                                    "chat_type": int(chat_type),
+                                    "msgtype": mtype,
+                                    mtype: {"media_id": media_id},
+                                },
+                            },
+                            wait_response=True,
+                        )
+                        if isinstance(resp2, dict) and resp2.get("errcode") == 0:
+                            resp = resp2
+                            log(f"outbox reply_file {item_id}: delivered via "
+                                f"proactive fallback (req_id dead)")
             elif mode in ("send_text_notice", "send_news_notice", "send_vote", "send_multiple", "send_card"):
                 chatid = item.get("chatid", "")
                 chat_type = int(item.get("chat_type", 1))
@@ -4028,24 +4269,10 @@ class Gateway:
                     self.open_streams.pop(str(item.get("msgid", "")), None)
             elif mode == "send":
                 chatid = item.get("chatid", "")
-                chat_type = int(item.get("chat_type", 1))
-                resp = {"errcode": 0}
-                for part in split_chunks(content):
-                    resp = await self.send_frame(
-                        {
-                            "cmd": "aibot_send_msg",
-                            "headers": {"req_id": self.new_req_id("send")},
-                            "body": {
-                                "chatid": chatid,
-                                "chat_type": chat_type,
-                                "msgtype": "markdown",
-                                "markdown": {"content": part},
-                            },
-                        },
-                        wait_response=True,
-                    )
-                    if resp.get("errcode") != 0:
-                        break
+                chat_type = int(item.get("chat_type", 1) or 1)
+                resp = await self._send_markdown_chunks(
+                    item_id, chatid, chat_type, split_chunks(content) or [""],
+                )
             elif mode == "send_file":
                 chatid = item.get("chatid", "")
                 chat_type = int(item.get("chat_type", 1))
@@ -4089,6 +4316,17 @@ class Gateway:
             # forever, after the user has been told why.
             result["errmsg"] = str(e)
             result["ok"] = False
+            await self._notify_wecom_video_limit(item, mode, e)
+            self.append_jsonl(OUTBOX_RESULTS, result)
+            log(f"outbox {mode} {item_id}: {result['errmsg']}")
+            return True
+        except WeComUploadTooLarge as e:
+            # Same permanent fate as the 10MB video cap. The generic
+            # exception path would park a reply_file and re-read the
+            # file on every retry round.
+            result["errmsg"] = str(e)
+            result["ok"] = False
+            result["deadletter"] = True
             await self._notify_wecom_video_limit(item, mode, e)
             self.append_jsonl(OUTBOX_RESULTS, result)
             log(f"outbox {mode} {item_id}: {result['errmsg']}")
