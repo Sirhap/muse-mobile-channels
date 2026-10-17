@@ -65,6 +65,8 @@ def sandbox_outbox(directory: Path) -> None:
     wc.OUTBOX_PARKED = directory / "outbox_parked.json"
     wc.CANCELLED_FILE = directory / "cancelled.json"
     wc.STATUS = directory / "status.json"
+    wc.INBOX = directory / "inbox.jsonl"
+    wc.CARDS = directory / "cards.json"
     wc.SEEN_FILE = directory / "seen_ids.jsonl"
     wc.MEDIA_DIR = directory / "media"
     wc.REQMAP = directory / "reqmap.json"
@@ -119,6 +121,10 @@ def _result_rows() -> list[dict]:
 
 async def check_c1_reader() -> None:
     """Null headers must not kill the reader; handler errors must be logged."""
+    # This case drives reader_loop, which persists the normalized frame
+    # to INBOX: sandbox first, or the frame lands in production state
+    # (todo 30 — leaked m-c1/alice into the live WeCom inbox 2026-10-17).
+    sandbox_outbox(Path(tempfile.mkdtemp(prefix="c1-")))
     gateway = bare_gateway()
     gateway.ws = _FrameStream([
         json.dumps({"cmd": "aibot_pong", "headers": None, "errcode": 0}),

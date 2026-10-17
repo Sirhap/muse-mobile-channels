@@ -83,6 +83,20 @@ def sandbox(mod, directory: Path) -> None:
     mod.STATE = directory
     if hasattr(mod, "COMPRESSED_DIR"):
         mod.COMPRESSED_DIR = directory / "compressed"
+    # Cross-channel and auxiliary paths are absolute (HOME-derived) in
+    # the gateways, so the STATE redirect above does not cover them:
+    # an unrebound STUCK_NOTICE_*_OUTBOX writes into the OTHER bot's
+    # production outbox (todo 30).
+    for attr, name in (("STUCK_NOTICE_WECOM_OUTBOX", "wecom-outbox.jsonl"),
+                       ("STUCK_NOTICE_WEIXIN_OUTBOX", "weixin-outbox.jsonl"),
+                       ("QUOTE_SPOOL", "quote-spool"),
+                       ("CARDS", "cards.json"),
+                       ("MEDIA_DIR", "media"),
+                       ("DIVERTED_RAW", "diverted_raw.jsonl"),
+                       ("POISON_MESSAGES", "poison_messages.jsonl"),
+                       ("SENT_INDEX", "sent_index.jsonl")):
+        if hasattr(mod, attr):
+            setattr(mod, attr, directory / name)
 
 
 def read_rows(path: Path) -> list[dict]:
