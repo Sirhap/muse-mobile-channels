@@ -441,6 +441,31 @@ async def check_c7_media_policy() -> None:
         redirects is False and fetched == [],
         f"follow_redirects={redirects} fetched={fetched}",
     )
+    # Production shape (deep-review 2026-10-17): real WeCom aibot media
+    # lives on the platform's COS buckets, not on qq.com hosts. The
+    # allowlist must let the genuine host through while still refusing
+    # arbitrary COS buckets and foreign hosts.
+    prod_url = ("https://ww-aibot-img-1258476243.cos.ap-guangzhou."
+                "myqcloud.com/media/abc?sign=deadbeef")
+    fetched.clear()
+    await gateway._download_media(
+        [{"url": prod_url, "aeskey": "abcd"}], "m-c7-prod")
+    check(
+        "C7 production aibot COS host is allowed through",
+        fetched == [prod_url],
+        f"fetched={fetched}",
+    )
+    fetched.clear()
+    await gateway._download_media(
+        [{"url": "https://attacker-123.cos.ap-guangzhou.myqcloud.com/x",
+          "aeskey": "abcd"}],
+        "m-c7-cos",
+    )
+    check(
+        "C7 arbitrary COS bucket is still refused",
+        fetched == [],
+        f"fetched={fetched}",
+    )
     shutil.rmtree(directory, ignore_errors=True)
 
 
