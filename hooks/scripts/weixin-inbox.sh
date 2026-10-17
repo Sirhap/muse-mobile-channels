@@ -1073,9 +1073,14 @@ if detached:
                 continue
             for mid in d.get("msgids") or []:
                 e = by_id.get(mid)
-                if (e is not None and e not in failed_entries
-                        and _route_death(e, _dwindow) == "fail"):
+                if e is None or e in failed_entries:
+                    continue
+                _verdict = _route_death(e, _dwindow)
+                if _verdict == "fail":
                     failed_entries.append(e)
+                elif (_verdict == "resume"
+                        and d not in detached_orphan_sources):
+                    detached_orphan_sources.append(d)
             continue
         if now - dlast >= EARLY_PLATFORM_MIN_SILENCE_SECS:
             # Suspicious zone (todo 21): same throttled platform
@@ -1452,7 +1457,8 @@ if dry:
 elif batch_active and not batch_done:
     oldest_wait = (now - min(pending.values())) if pending else 0.0
     batch_age = now - batch_since
-    if not pending_entries and detached_orphan_sources:
+    if (not pending_entries and detached_orphan_sources
+            and orphaned_entries):
         # A detached (parallel) worker died while this batch is in
         # flight and nobody new is queued: wake a worker for the
         # orphaned messages now and demote this batch to the
@@ -1939,8 +1945,11 @@ if not dry:
     for _fjid in failed_now:
         _ftext = "【副助手失败】两次无响应，已放弃"
         _sent = False
-        if entries:
-            _to = entries[-1].get("from_user_id") or ""
+        _jmid = str(jobs[_fjid].get("msgid") or "")
+        _row = next((e for e in entries if str(e.get("msgid")) == _jmid),
+                    entries[-1] if entries else None)
+        if _row is not None:
+            _to = _row.get("from_user_id") or ""
             if _to:
                 try:
                     _r = subprocess.run([cli_path, "send", "--to", str(_to),
@@ -2024,9 +2033,14 @@ def build_history(new_list):
     primary = chatkey(new_list[0])
     new_ids = {e["msgid"] for e in new_list}
     replies = {}
+    reply_files = {}
     for r in load_jsonl(outbox_path):
         if r.get("mode") == "reply" and r.get("msgid"):
             replies[r["msgid"]] = r.get("content", "")
+        elif r.get("mode") == "reply_file" and r.get("msgid"):
+            _fname = os.path.basename(str(r.get("file_path") or ""))
+            reply_files.setdefault(r["msgid"], []).append(
+                f"[文件 {_fname}]" if _fname else "[文件]")
     def compress(text, limit=1200):
         # Over-long turns: keep head+tail with an explicit omission marker
         # instead of a hard cut that silently loses the ending.
@@ -2048,7 +2062,9 @@ def build_history(new_list):
         t = (e.get("text") or "").strip()
         if t:
             turns.append({"role": "user", "text": compress(t), "ts": e.get("ts", 0)})
-        rep = (replies.get(mid) or "").strip()
+        rep = "\n".join(
+            [x for x in [(replies.get(mid) or "").strip()]
+             + reply_files.get(mid, []) if x])
         if rep:
             turns.append({"role": "assistant", "text": compress(rep), "ts": e.get("ts", 0) + 1})
     ordered = sorted(turns, key=lambda x: x["ts"])
