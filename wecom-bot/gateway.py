@@ -66,6 +66,7 @@ from channel_common import (  # noqa: E402
     outbound_file_allowed,
     parse_jsonl_line,
     pid_alive,
+    same_mode_delivery_blocks,
     read_offset,
     read_pid_file,
     retry_backoff_secs,
@@ -347,6 +348,47 @@ def split_chunks(text: str, limit: int = CHUNK_LIMIT) -> list[str]:
     return chunks
 
 
+def merged_text_covered(merged: str, sent_chunks: int) -> int:
+    """How far into ``merged`` the first sent slices reach.
+
+    ``split_chunks`` drops a newline it uses as a cut. That newline
+    is not inside a slice. The returned index still sits on it, so
+    the next row — which starts after the newline — is not counted
+    as delivered until a later slice moves past it.
+    """
+    if not merged:
+        return 0
+    try:
+        count = int(sent_chunks)
+    except (TypeError, ValueError):
+        return 0
+    if count <= 0:
+        return 0
+    pos = 0
+    for piece in split_chunks(merged)[:count]:
+        if merged.startswith(piece, pos):
+            pos += len(piece)
+            continue
+        skipped = pos
+        while skipped < len(merged) and merged[skipped] == "\n":
+            skipped += 1
+        if piece and merged.startswith(piece, skipped):
+            pos = skipped + len(piece)
+            continue
+        break
+    return pos
+
+
+def send_row_text(row: dict) -> str:
+    """Body the coalescer joins for one send row."""
+    if not isinstance(row, dict):
+        return ""
+    content = row.get("content") or row.get("text")
+    if content is None:
+        return ""
+    return str(content)
+
+
 def _decode_wecom_aes_key(aeskey_b64: str) -> bytes:
     """AES key from a WeCom media callback.
 
@@ -478,6 +520,24 @@ def _gateway_process_alive(status: dict, state_dir: Path) -> bool:
 
 def log(msg: str) -> None:
     print(f"[wecom-gateway {time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
+
+
+def jsonl_text_lines(text: str) -> list[str]:
+    """Split JSONL text on ``\\n`` only.
+
+    ``str.splitlines`` also breaks on U+2028, U+2029 and U+0085.
+    ``json.dumps(..., ensure_ascii=False)`` keeps those characters
+    inside string values, so a splitlines read cuts one record into
+    two fragments and the row is skipped. A trailing CR from CRLF
+    is stripped so each line matches what ``splitlines`` returned
+    for ordinary newlines.
+    """
+    if not text:
+        return []
+    parts = text.split("\n")
+    if parts and parts[-1] == "":
+        parts.pop()
+    return [part[:-1] if part.endswith("\r") else part for part in parts]
 
 
 # ---------- slash commands (gateway-intercepted) ----------
@@ -657,12 +717,12 @@ def _spool_texts(channel):
             f.seek(max(0, size - 524288))
             data = f.read().decode("utf-8", "replace")
         out = {}
-        for line in data.splitlines():
+        for line in jsonl_text_lines(data):
             try:
                 r = json.loads(line)
             except ValueError:
                 continue
-            if r.get("msgid"):
+            if isinstance(r, dict) and r.get("msgid"):
                 out[r["msgid"]] = r.get("text", "")
         return out
     except Exception:
@@ -845,10 +905,12 @@ def _last_outbound_ts(state_dir, msgids):
             f.seek(max(0, size - 524288))
             data = f.read().decode("utf-8", "replace")
         best = None
-        for line in data.splitlines():
+        for line in jsonl_text_lines(data):
             try:
                 row = json.loads(line)
             except ValueError:
+                continue
+            if not isinstance(row, dict):
                 continue
             if str(row.get("msgid") or "") not in idset:
                 continue
@@ -877,12 +939,12 @@ def _bridge_queued_rows(channel):
         texts = {}
         spool = Path(f"/home/hatch/workspace/native-bridge/"
                      f"spool/{channel}.jsonl")
-        for line in spool.read_text(encoding="utf-8").splitlines():
+        for line in jsonl_text_lines(spool.read_text(encoding="utf-8")):
             try:
                 r = json.loads(line)
             except ValueError:
                 continue
-            if r.get("msgid"):
+            if isinstance(r, dict) and r.get("msgid"):
                 texts[r["msgid"]] = r.get("text", "")
         return [(m, texts.get(m, "")) for m in qids]
     except Exception:
@@ -1603,18 +1665,19 @@ def _approval_pending_submission(num):
         with open(APPROVAL_RELAY_DIR / "decisions.jsonl",
                   encoding="utf-8") as f:
             f.seek(off)
-            lines = f.read().splitlines()
+            lines = jsonl_text_lines(f.read())
     except OSError:
         return None
-    found = None
     for line in lines:
         try:
             row = json.loads(line)
         except ValueError:
             continue
+        if not isinstance(row, dict):
+            continue
         if str(row.get("num")) == str(num) and row.get("decision"):
-            found = row["decision"]
-    return found
+            return row["decision"]
+    return None
 
 
 def slash_approval_decide_ack(num, decision, channel):
@@ -1845,18 +1908,18 @@ class Gateway:
     def _load_persisted(self) -> None:
         if INBOX.exists():
             try:
-                for line in INBOX.read_text(encoding="utf-8").splitlines():
+                for line in jsonl_text_lines(INBOX.read_text(encoding="utf-8")):
                     try:
                         entry = json.loads(line)
-                        if entry.get("msgid"):
-                            self.seen_msgids.add(entry["msgid"])
                     except json.JSONDecodeError:
                         continue
+                    if isinstance(entry, dict) and entry.get("msgid"):
+                        self.seen_msgids.add(entry["msgid"])
             except OSError:
                 pass
         if SEEN_FILE.exists():
             try:
-                for line in SEEN_FILE.read_text(encoding="utf-8").splitlines():
+                for line in jsonl_text_lines(SEEN_FILE.read_text(encoding="utf-8")):
                     try:
                         entry = json.loads(line)
                     except json.JSONDecodeError:
@@ -2211,14 +2274,13 @@ class Gateway:
     def _delivered_reply_before(item: dict) -> bool:
         """Sending-layer late suppression.
 
-        True when any other outbox row for this msgid is a formal
-        reply or reply_file whose delivery result is ok. Row order
-        does not matter: a parked text reply that sits above an
-        already-delivered file reply is still a duplicate formal
-        answer. Dispatch uses this to drop a late progress update
-        and a second formal text reply. It does not drop reply_file:
-        the bridge queues the media row for the same msgid, and that
-        file is part of the answer. Fail-open.
+        Same-mode: a delivered reply suppresses other reply rows, and
+        a delivered reply_file suppresses another reply_file only when
+        it is not a distinct file. A progress or notice row is
+        suppressed once any formal row for the msgid was delivered.
+        Order does not matter, so a parked text row retried after its
+        companion file was delivered is still sent. The current row
+        is skipped. Fail-open.
         """
         try:
             item_id = str(item.get("id") or "")
@@ -2229,29 +2291,33 @@ class Gateway:
             if OUTBOX_RESULTS.exists():
                 text = OUTBOX_RESULTS.read_text(encoding="utf-8")
                 for line in text.split("\n"):
-                    line = line.strip()
-                    if not line:
+                    line = line[:-1] if line.endswith("\r") else line
+                    if not line.strip():
                         continue
                     try:
                         row = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    if row.get("id"):
+                    if isinstance(row, dict) and row.get("id"):
                         results[row["id"]] = row
             if not OUTBOX.exists():
                 return False
             text = OUTBOX.read_text(encoding="utf-8")
             for line in text.split("\n"):
-                line = line.strip()
-                if not line:
+                line = line[:-1] if line.endswith("\r") else line
+                if not line.strip():
                     continue
                 try:
                     row = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                if not isinstance(row, dict):
+                    continue
                 if str(row.get("id") or "") == item_id:
                     continue
-                if row.get("mode") not in ("reply", "reply_file") or str(row.get("msgid")) != msgid:
+                if str(row.get("msgid") or "") != msgid:
+                    continue
+                if not same_mode_delivery_blocks(item, row):
                     continue
                 res = results.get(row.get("id"))
                 if res is not None and res.get("ok") is True:
@@ -3632,6 +3698,16 @@ class Gateway:
         dispatch_item["mode"] = "send"
         dispatch_item["content"] = ready.get("content", "")
         ok = await self.dispatch_outbox_item(dispatch_item)
+        if not ok and len(merged_ids) > 1:
+            # Chunk progress was stored under the first id, against
+            # the joined text. Record each original row's delivered
+            # character span before the retry lane sends them alone.
+            try:
+                sent_n = int(self._partial_for(merged_ids[0]).get("sent_chunks") or 0)
+            except (TypeError, ValueError):
+                sent_n = 0
+            self._record_merged_send_spans(
+                originals, str(dispatch_item.get("content") or ""), sent_n)
         for extra_id in merged_ids[1:]:
             self.append_jsonl(OUTBOX_RESULTS, {
                 "id": extra_id, "mode": "send",
@@ -3647,6 +3723,90 @@ class Gateway:
             for orig in originals:
                 self._note_failure(orig)
         return ok
+
+    def _record_merged_send_spans(self, originals: list, merged: str, sent_chunks: int) -> None:
+        """Store how much of each original row a merged send delivered.
+
+        The on-disk partial record gains ``sent_chars``. Rows written
+        by the deployed gateway only have ``sent_chunks``; a missing
+        ``sent_chars`` still resumes a single-row retry by chunk index.
+        ``sent_chunks`` on these rows is cleared because that index
+        counted slices of the joined text, not of the original row.
+        """
+        if sent_chunks <= 0 or not originals:
+            return
+        parts = [send_row_text(row) for row in originals]
+        joined = "\n".join(parts)
+        if joined != str(merged or ""):
+            return
+        covered = merged_text_covered(joined, sent_chunks)
+        pos = 0
+        for index, orig in enumerate(originals):
+            text = parts[index]
+            start = pos
+            end = start + len(text)
+            pos = end + (0 if index == len(originals) - 1 else 1)
+            if not isinstance(orig, dict):
+                continue
+            delivered = max(0, min(end, covered) - start)
+            row_id = str(orig.get("id") or "")
+            if not row_id:
+                continue
+            self._mark_partial(row_id, {
+                "sent_chars": delivered,
+                "sent_chunks": 0,
+            })
+
+    def _pending_send_body(self, item_id: str, content: str) -> str | None:
+        """Unsent tail of a send row.
+
+        None means the merged dispatch already confirmed the whole
+        row, so a per-row retry must not send it again. ``sent_chunks``
+        still applies to the returned tail.
+        """
+        try:
+            sent_chars = int(self._partial_for(item_id).get("sent_chars") or 0)
+        except (TypeError, ValueError):
+            sent_chars = 0
+        if sent_chars < 0:
+            sent_chars = 0
+        body = str(content or "")
+        if sent_chars:
+            body = body[sent_chars:]
+        if sent_chars and not body:
+            return None
+        return body
+
+    def _delivered_send_ids(self) -> set[str]:
+        """Ids whose mode=send result was ok.
+
+        A crash after a flush and before the offset is persisted
+        leaves the row in the outbox. Send rows have no formal-reply
+        guard, so the next process would dispatch them again. Formal
+        reply and reply_file rows are not included.
+        """
+        found: set[str] = set()
+        try:
+            if not OUTBOX_RESULTS.exists():
+                return found
+            text = OUTBOX_RESULTS.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            return found
+        for line in jsonl_text_lines(text):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(row, dict):
+                continue
+            if row.get("ok") is not True or row.get("mode") != "send":
+                continue
+            row_id = str(row.get("id") or "")
+            if row_id:
+                found.add(row_id)
+        return found
 
     def _buffered_send_ids(self) -> set[str]:
         """Ids sitting in the coalescer, not yet flushed."""
@@ -3727,6 +3887,7 @@ class Gateway:
                     parked_ids = set(self._load_parked().keys())
                     already_buffered = self._buffered_send_ids()
                     awaiting = self._awaiting_offset_ids()
+                    delivered_sends = self._delivered_send_ids()
                     lines = list(complete_jsonl_lines(data))
                     # Feed the whole read so a barrier still flushes
                     # the sends ahead of it in this pass. Lines already
@@ -3742,6 +3903,13 @@ class Gateway:
                             or item_id in parked_ids
                             or item_id in already_buffered
                         ):
+                            continue
+                        if (
+                            item.get("mode") == "send"
+                            and item_id
+                            and item_id in delivered_sends
+                        ):
+                            awaiting.add(item_id)
                             continue
                         for ready in self._coalesce_feed(item):
                             await self._dispatch_outbox_ready(ready)
@@ -3912,20 +4080,15 @@ class Gateway:
             self.append_jsonl(OUTBOX_RESULTS, result)
             log(f"outbox {mode} {item_id}: skipped, cancelled msgid={_mid}")
             return True
-        # Progress updates after a delivered formal reply are late
-        # duplicates. A second formal reply for the same msgid is a
-        # late duplicate too (fencing fix, 2026-10-15): a formal
-        # reply is singular per msgid — the CLI enqueue gate blocks
-        # a second one once the first is delivered and supplements
-        # go via "send" — so a racing duplicate that still reached
-        # the outbox (--force, the gate's fail-open read, or the
-        # >120s no-result window) is suppressed here instead of
-        # double-delivering. reply_file is the media that belongs
-        # with that reply (bridge writes text, then file0..fileN —
-        # several reply_file rows per msgid are one answer and
-        # cannot be told apart from a duplicate by mode+msgid), so
-        # it must still be sent. Same rule as the Weixin gateway.
-        if mode in ("update", "reply_notice", "reply") and _mid and self._delivered_reply_before(item):
+        # Progress updates and notices after any delivered formal row
+        # are late duplicates. A second reply for the same msgid is a
+        # late duplicate too (fencing fix, 2026-10-15). A delivered
+        # reply_file does not suppress the text, and a delivered
+        # reply does not suppress a file. A second reply_file is
+        # suppressed when it repeats a file path already delivered.
+        # Distinct paths (bridge file0..fileN) still go out. Same
+        # rule as the Weixin gateway.
+        if mode in ("update", "reply_notice", "reply", "reply_file") and _mid and self._delivered_reply_before(item):
             result["errmsg"] = "suppressed: msgid already has a delivered formal reply"
             result["suppressed"] = True
             self.append_jsonl(OUTBOX_RESULTS, result)
@@ -4272,8 +4435,15 @@ class Gateway:
             elif mode == "send":
                 chatid = item.get("chatid", "")
                 chat_type = int(item.get("chat_type", 1) or 1)
+                body = self._pending_send_body(item_id, content)
+                if body is None:
+                    result["ok"] = True
+                    result["errmsg"] = ""
+                    self.append_jsonl(OUTBOX_RESULTS, result)
+                    log(f"outbox {mode} {item_id}: ok=True err=")
+                    return True
                 resp = await self._send_markdown_chunks(
-                    item_id, chatid, chat_type, split_chunks(content) or [""],
+                    item_id, chatid, chat_type, split_chunks(body) or [""],
                 )
             elif mode == "send_file":
                 chatid = item.get("chatid", "")

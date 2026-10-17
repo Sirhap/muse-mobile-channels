@@ -51,6 +51,7 @@ from channel_common import (  # noqa: E402
     parse_feedback_clear_line,
     parse_jsonl_line,
     retry_backoff_secs as _retry_backoff_secs,
+    same_mode_delivery_blocks,
     subagent_outcome_default,
     trim_mapping,
     waiting_ahead,
@@ -3353,36 +3354,44 @@ class Gateway:
     def _delivered_reply_before(item: dict) -> bool:
         """Sending-layer late suppression.
 
-        True when any formal reply or reply_file for this msgid
-        already has an ok result, regardless of outbox order. A parked
-        text row can be retried after a later file row for the same
-        msgid was delivered; scanning only earlier rows missed that
-        delivery and sent the text again. The current row is skipped.
-        Dispatch does not pass reply_file here: those media rows
-        belong with the answer. Fail-open."""
+        Same-mode: a delivered reply suppresses other reply rows for
+        this msgid, and a delivered reply_file suppresses another
+        reply_file only when it is not a distinct file. A progress
+        row is suppressed once any formal row was delivered. Order
+        does not matter, so a parked text row retried after its
+        companion file was delivered is still sent. The current row
+        is skipped. Fail-open.
+        """
         try:
-            item_id = item.get("id", "")
+            item_id = str(item.get("id") or "")
+            msgid = str(item.get("msgid") or "")
+            if not msgid:
+                return False
             results: dict[str, dict] = {}
             if OUTBOX_RESULTS.exists():
                 for line in jsonl_text_lines(OUTBOX_RESULTS.read_text(encoding="utf-8")):
                     try:
-                        r = json.loads(line)
+                        row = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    if r.get("id"):
-                        results[r["id"]] = r
+                    if isinstance(row, dict) and row.get("id"):
+                        results[row["id"]] = row
             if not OUTBOX.exists():
                 return False
             for line in jsonl_text_lines(OUTBOX.read_text(encoding="utf-8")):
                 try:
-                    o = json.loads(line)
+                    row = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if o.get("id") == item_id:
+                if not isinstance(row, dict):
                     continue
-                if o.get("mode") not in ("reply", "reply_file") or str(o.get("msgid")) != str(item.get("msgid")):
+                if str(row.get("id") or "") == item_id:
                     continue
-                res = results.get(o.get("id"))
+                if str(row.get("msgid") or "") != msgid:
+                    continue
+                if not same_mode_delivery_blocks(item, row):
+                    continue
+                res = results.get(row.get("id"))
                 if res is not None and res.get("ok") is True:
                     return True
             return False
@@ -3922,20 +3931,15 @@ class Gateway:
             self.append_jsonl(OUTBOX_RESULTS, result)
             log(f"outbox {mode} {item_id}: skipped, cancelled msgid={_mid}")
             return True  # consumed: do not send, do not retry
-        # Progress updates after a delivered formal reply are late
-        # duplicates. A second formal reply for the same msgid is a
-        # late duplicate too (fencing fix, 2026-10-15): a formal
-        # reply is singular per msgid — the CLI enqueue gate blocks
-        # a second one once the first is delivered and supplements
-        # go via "send" — so a racing duplicate that still reached
-        # the outbox (--force, the gate's fail-open read, or the
-        # >120s no-result window) is suppressed here instead of
-        # double-delivering. reply_file is the media that belongs
-        # with that reply (bridge writes text, then file0..fileN —
-        # several reply_file rows per msgid are one answer and
-        # cannot be told apart from a duplicate by mode+msgid), so
-        # it must still be sent.
-        if mode in ("update", "reply") and _mid and self._delivered_reply_before(item):
+        # Progress updates after any delivered formal row are late
+        # duplicates. A second reply for the same msgid is a late
+        # duplicate too (fencing fix, 2026-10-15). A delivered
+        # reply_file does not suppress the text, and a delivered
+        # reply does not suppress a file: the answer is the text
+        # plus its media. A second reply_file is suppressed when it
+        # repeats a file path already delivered. Distinct paths
+        # (bridge file0..fileN) are one answer and still go out.
+        if mode in ("update", "reply", "reply_file") and _mid and self._delivered_reply_before(item):
             result["errmsg"] = "suppressed: msgid already has a delivered formal reply"
             result["suppressed"] = True
             self.append_jsonl(OUTBOX_RESULTS, result)
