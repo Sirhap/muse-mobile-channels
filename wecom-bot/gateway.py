@@ -165,6 +165,9 @@ STUCK_NOTICE_WEIXIN_OUTBOX = (
 STUCK_NOTICE_WEIXIN_TO = os.environ.get(
     "WECOM_STUCK_NOTICE_TO", "〈wechat-user-id〉")
 CANCELLED_FILE = STATE / "cancelled.json"
+# Last cancelled-id set read cleanly. A torn or corrupt read falls back
+# to it so a /stop that was already honored stays honored.
+_LAST_GOOD_CANCELLED_IDS: set = set()
 SEEN_FILE = STATE / "seen_ids.jsonl"
 LOCK_FILE = STATE / "gateway.lock"
 CRED_FILE = Path(
@@ -489,6 +492,11 @@ def _frame_headers(frame: dict) -> dict:
     if isinstance(headers, dict):
         return headers
     return {}
+
+
+def _as_dict(node) -> dict:
+    """The node when it is a dict, else {}. Inbound frames are untrusted."""
+    return node if isinstance(node, dict) else {}
 
 
 def _approval_ascii_number(token: str) -> str | None:
@@ -2038,11 +2046,21 @@ class Gateway:
 
     @staticmethod
     def _cancelled_ids() -> set:
+        global _LAST_GOOD_CANCELLED_IDS
         try:
             rows = json.loads(CANCELLED_FILE.read_text(encoding="utf-8"))
-            return {str(row.get("msgid")) for row in rows if isinstance(row, dict) and row.get("msgid")}
-        except (OSError, json.JSONDecodeError, UnicodeError):
+            if not isinstance(rows, list):
+                raise ValueError("cancelled.json is not a JSON list")
+            ids = {str(row.get("msgid")) for row in rows if isinstance(row, dict) and row.get("msgid")}
+        except FileNotFoundError:
+            _LAST_GOOD_CANCELLED_IDS = set()
             return set()
+        except (OSError, ValueError) as exc:
+            log(f"cancelled.json unreadable ({exc!r}); using last good set "
+                f"of {len(_LAST_GOOD_CANCELLED_IDS)} ids")
+            return set(_LAST_GOOD_CANCELLED_IDS)
+        _LAST_GOOD_CANCELLED_IDS = ids
+        return set(ids)
 
     @staticmethod
     def _load_retry() -> dict:
@@ -2205,11 +2223,18 @@ class Gateway:
                         f"{attempts} 次，仍在自动重试、不会丢弃。多半"
                         "是企微发送通道临时故障。")
             chatid = str(item.get("chatid") or "")
+            chat_type = int(item.get("chat_type") or 1)
+            if not chatid:
+                # Bridge and CLI rows carry only the msgid; the chat
+                # lives in the request map stored when it arrived.
+                info = self.reqinfo(str(item.get("msgid") or ""))
+                chatid = str(info.get("chatid") or "")
+                chat_type = 2 if info.get("chattype") == "group" else 1
             if chatid:
                 self.append_jsonl(OUTBOX, {
                     "id": f"stucknote-{uuid.uuid4().hex[:12]}",
                     "mode": "send", "chatid": chatid,
-                    "chat_type": int(item.get("chat_type") or 1),
+                    "chat_type": chat_type,
                     "content": text,
                     "queued_at": int(time.time())})
             if STUCK_NOTICE_WEIXIN_OUTBOX.exists():
@@ -2852,7 +2877,7 @@ class Gateway:
                 log(f"feedback watch failed (ignored): {e!r}")
 
     async def handle_message_callback(self, frame: dict) -> None:
-        body = frame.get("body", {}) or {}
+        body = _as_dict(_as_dict(frame).get("body"))
         req_id = _frame_headers(frame).get("req_id", "")
         msgid = body.get("msgid", "")
         if msgid and str(msgid) in self.seen_msgids:
@@ -2865,42 +2890,47 @@ class Gateway:
         media: list[dict] = []
 
         def _collect_media(kind: str, node: dict | None) -> None:
-            if node and node.get("url"):
+            if isinstance(node, dict) and node.get("url"):
                 media.append(
                     {"kind": kind, "url": node["url"], "aeskey": node.get("aeskey", "")}
                 )
 
         if msgtype == "mixed":
-            for item in (body.get("mixed") or {}).get("msg_item", []) or []:
+            msg_items = _as_dict(body.get("mixed")).get("msg_item")
+            for item in (msg_items if isinstance(msg_items, list) else []):
+                if not isinstance(item, dict):
+                    continue
                 itype = item.get("msgtype", "")
                 if itype == "text":
-                    c = (item.get("text") or {}).get("content", "")
-                    if c:
+                    c = _as_dict(item.get("text")).get("content", "")
+                    if c and isinstance(c, str):
                         text_parts.append(c)
                 elif itype == "image":
                     _collect_media("image", item.get("image"))
                 elif itype == "video":
                     _collect_media("video", item.get("video"))
         else:
-            if (body.get("text") or {}).get("content"):
-                text_parts.append(body["text"]["content"])
-            if msgtype == "voice" and (body.get("voice") or {}).get("content"):
-                text_parts.append(body["voice"]["content"])
+            text_content = _as_dict(body.get("text")).get("content")
+            if text_content and isinstance(text_content, str):
+                text_parts.append(text_content)
+            voice_content = _as_dict(body.get("voice")).get("content")
+            if msgtype == "voice" and voice_content and isinstance(voice_content, str):
+                text_parts.append(voice_content)
             if msgtype == "image":
                 _collect_media("image", body.get("image"))
             if msgtype == "file":
                 _collect_media("file", body.get("file"))
             if msgtype == "video":
                 _collect_media("video", body.get("video"))
-        quote = body.get("quote") or {}
+        quote = _as_dict(body.get("quote"))
         if quote:
             qtext = ""
             qtype = quote.get("msgtype", "")
             if qtype == "text":
-                qtext = (quote.get("text") or {}).get("content", "")
+                qtext = _as_dict(quote.get("text")).get("content", "")
             elif qtype == "voice":
-                qtext = (quote.get("voice") or {}).get("content", "")
-            if qtext:
+                qtext = _as_dict(quote.get("voice")).get("content", "")
+            if qtext and isinstance(qtext, str):
                 text_parts.append(f"（引用：{qtext}）")
             elif qtype == "image":
                 # Non-text quotes used to surface only as collected
@@ -2921,7 +2951,7 @@ class Gateway:
             text_parts.append(labels.get(m["kind"], "[文件]"))
         text = "\n".join(text_parts)
         chattype = body.get("chattype", "")
-        from_userid = (body.get("from") or {}).get("userid", "")
+        from_userid = _as_dict(body.get("from")).get("userid", "")
         chatid = body.get("chatid") or from_userid
         if not self._sender_allowed(str(from_userid or ""), "message"):
             return
@@ -3058,11 +3088,11 @@ class Gateway:
         self.write_status()
 
     async def handle_event_callback(self, frame: dict) -> None:
-        body = frame.get("body", {}) or {}
+        body = _as_dict(_as_dict(frame).get("body"))
         req_id = _frame_headers(frame).get("req_id", "")
-        event = body.get("event", {}) or {}
+        event = _as_dict(body.get("event"))
         etype = event.get("eventtype", "")
-        from_userid = (body.get("from") or {}).get("userid", "")
+        from_userid = _as_dict(body.get("from")).get("userid", "")
         log(f"event {etype} from {from_userid}")
         if etype == "enter_chat":
             if not self._event_allowed(from_userid):
@@ -3498,7 +3528,20 @@ class Gateway:
         way. ``reply_file`` answers on the callback req_id; ``send_file``
         sends a proactive markdown message.
         """
-        body = {"msgtype": "markdown", "markdown": {"content": err.user_text}}
+        await self._notify_file_failure(
+            item, mode, err.user_text, "wecom video limit")
+
+    async def _notify_file_failure(
+        self, item: dict, mode: str, text: str, label: str,
+    ) -> None:
+        """Send one markdown notice about a file row that cannot be delivered.
+
+        Best-effort; failures are only logged. ``reply_file`` answers on
+        the callback req_id from the request map and falls back to a
+        proactive message to the stored chat; ``send_file`` goes to the
+        row's own chat.
+        """
+        body = {"msgtype": "markdown", "markdown": {"content": text}}
         try:
             chatid = ""
             chat_type = 1
@@ -3518,7 +3561,7 @@ class Gateway:
                 return
             if not chatid:
                 log(
-                    f"wecom video limit notice skipped: no chat for "
+                    f"{label} notice skipped: no chat for "
                     f"{mode} {item.get('id')}"
                 )
                 return
@@ -3530,13 +3573,38 @@ class Gateway:
                         "chatid": chatid,
                         "chat_type": chat_type,
                         "msgtype": "markdown",
-                        "markdown": {"content": err.user_text},
+                        "markdown": {"content": text},
                     },
                 },
                 wait_response=True,
             )
         except Exception as exc:
-            log(f"wecom video limit notice failed: {exc}")
+            log(f"{label} notice failed: {exc}")
+
+    async def _notify_permanent_failure(
+        self, item: dict, mode: str, errmsg: str,
+    ) -> None:
+        """Tell the user a file row was consumed undelivered.
+
+        Same terminal treatment and wording style as the Weixin gateway's
+        _notify_permanent_failure: the row is not retried, and the user
+        learns why. Best-effort.
+        """
+        err = errmsg or ""
+        name = Path(str(item.get("file_path") or "")).name or "文件"
+        if "file not found" in err or "No such file" in err:
+            text = (f"⚠️ 文件「{name}」没能发出：原文件已经不在，"
+                    "这条已停止，没有另发说明。")
+        elif "not allowed" in err:
+            text = (f"⚠️ 文件「{name}」没能发出：路径不在允许发送的目录里，"
+                    "已拒绝发送。")
+        elif "Permission denied" in err:
+            text = (f"⚠️ 文件「{name}」没能发出：没有权限读取这个文件，"
+                    "这条已停止，没有另发说明。")
+        else:
+            text = f"⚠️ 有一条消息没能发出：{err[:160]}"
+        await self._notify_file_failure(
+            item, mode, text, "permanent-failure")
 
     async def upload_media(self, data: bytes, mtype: str, filename: str) -> str:
         chunk_size = 512 * 1024
@@ -4283,10 +4351,22 @@ class Gateway:
                     return True
                 fpath = item.get("file_path", "")
                 file_path = Path(fpath)
+                if not file_path.exists():
+                    # outbound_file_allowed is False for a missing file,
+                    # which would be reported as a refused path.
+                    result["errmsg"] = f"file not found: {fpath}"
+                    result["deadletter"] = True
+                    self.append_jsonl(OUTBOX_RESULTS, result)
+                    log(f"outbox reply_file {item_id}: {result['errmsg']}")
+                    await self._notify_permanent_failure(
+                        item, mode, result["errmsg"])
+                    return True
                 if not outbound_file_allowed(file_path, CRED_FILE, [muse_home(), STATE, BASE, Path("/tmp")]):
                     result["errmsg"] = f"file path is not allowed: {fpath}"
                     self.append_jsonl(OUTBOX_RESULTS, result)
                     log(f"outbox reply_file {item_id}: {result['errmsg']}")
+                    await self._notify_permanent_failure(
+                        item, mode, result["errmsg"])
                     return True
                 # Over the 10MB video cap: transcode, or fail with a
                 # clear notice. Do not upload the original (40011).
@@ -4506,6 +4586,18 @@ class Gateway:
             await self._notify_wecom_video_limit(item, mode, e)
             self.append_jsonl(OUTBOX_RESULTS, result)
             log(f"outbox {mode} {item_id}: {result['errmsg']}")
+            return True
+        except (FileNotFoundError, PermissionError) as e:
+            # Permanent local error, same terminal fate as the Weixin
+            # gateway: retrying cannot make the file appear or readable.
+            result["errmsg"] = f"exception: {e}"
+            result["ok"] = False
+            result["deadletter"] = True
+            self.append_jsonl(OUTBOX_RESULTS, result)
+            log(f"outbox {mode} {item_id}: {result['errmsg']}")
+            if mode in FORMAL_MODES or mode == "send_file":
+                await self._notify_permanent_failure(
+                    item, mode, result["errmsg"])
             return True
         except Exception as e:
             result["errmsg"] = f"exception: {e}"

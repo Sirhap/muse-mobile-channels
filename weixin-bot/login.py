@@ -118,7 +118,10 @@ async def main(verify_code: str = "") -> int:
             qrcode = data.get("qrcode", "")
             img_content = data.get("qrcode_img_content", "")
             if not qrcode or not img_content:
-                note(f"unexpected qrcode response: {json.dumps(data)[:300]}")
+                note(
+                    "unexpected qrcode response: "
+                    f"qrcode_len={len(str(qrcode))} img_content_len={len(str(img_content))}"
+                )
                 return 1
             save_login_state({"status": "waiting_scan", "qrcode": qrcode, "ts": int(time.time())})
             try:
@@ -141,7 +144,8 @@ async def main(verify_code: str = "") -> int:
             except httpx.TimeoutException:
                 continue
             except Exception as e:
-                note(f"status poll error (retrying): {e}")
+                code = getattr(getattr(e, "response", None), "status_code", "")
+                note(f"status poll error (retrying): {type(e).__name__} {code}".rstrip())
                 await asyncio.sleep(3)
                 continue
             status = st.get("status", "")
@@ -150,7 +154,7 @@ async def main(verify_code: str = "") -> int:
                 bot_id = st.get("ilink_bot_id", "")
                 user_id = st.get("ilink_user_id", "")
                 if not token:
-                    note(f"confirmed but no bot_token: {json.dumps(st)[:300]}")
+                    note(f"confirmed but no bot_token: status=confirmed bot_token_len={len(str(token))}")
                     return 1
                 write_credentials(token, bot_id, user_id)
                 save_login_state(
@@ -171,7 +175,7 @@ async def main(verify_code: str = "") -> int:
                 note("WeChat asks for a verify code: rerun with the code as argv[1]")
                 return 3
             if status and status not in ("wait", "scanned"):
-                note(f"status={status} raw={json.dumps(st)[:200]}")
+                note(f"status={str(status)[:40]} payload_len={len(json.dumps(st))}")
             save_login_state(
                 {"status": status or "wait", "qrcode": qrcode, "ts": int(time.time())}
             )
