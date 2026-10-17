@@ -3494,7 +3494,20 @@ class Gateway:
         way. ``reply_file`` answers on the callback req_id; ``send_file``
         sends a proactive markdown message.
         """
-        body = {"msgtype": "markdown", "markdown": {"content": err.user_text}}
+        await self._notify_file_failure(
+            item, mode, err.user_text, "wecom video limit")
+
+    async def _notify_file_failure(
+        self, item: dict, mode: str, text: str, label: str,
+    ) -> None:
+        """Send one markdown notice about a file row that cannot be delivered.
+
+        Best-effort; failures are only logged. ``reply_file`` answers on
+        the callback req_id from the request map and falls back to a
+        proactive message to the stored chat; ``send_file`` goes to the
+        row's own chat.
+        """
+        body = {"msgtype": "markdown", "markdown": {"content": text}}
         try:
             chatid = ""
             chat_type = 1
@@ -3514,7 +3527,7 @@ class Gateway:
                 return
             if not chatid:
                 log(
-                    f"wecom video limit notice skipped: no chat for "
+                    f"{label} notice skipped: no chat for "
                     f"{mode} {item.get('id')}"
                 )
                 return
@@ -3526,13 +3539,38 @@ class Gateway:
                         "chatid": chatid,
                         "chat_type": chat_type,
                         "msgtype": "markdown",
-                        "markdown": {"content": err.user_text},
+                        "markdown": {"content": text},
                     },
                 },
                 wait_response=True,
             )
         except Exception as exc:
-            log(f"wecom video limit notice failed: {exc}")
+            log(f"{label} notice failed: {exc}")
+
+    async def _notify_permanent_failure(
+        self, item: dict, mode: str, errmsg: str,
+    ) -> None:
+        """Tell the user a file row was consumed undelivered.
+
+        Same terminal treatment and wording style as the Weixin gateway's
+        _notify_permanent_failure: the row is not retried, and the user
+        learns why. Best-effort.
+        """
+        err = errmsg or ""
+        name = Path(str(item.get("file_path") or "")).name or "文件"
+        if "file not found" in err or "No such file" in err:
+            text = (f"⚠️ 文件「{name}」没能发出：原文件已经不在，"
+                    "这条已停止，没有另发说明。")
+        elif "not allowed" in err:
+            text = (f"⚠️ 文件「{name}」没能发出：路径不在允许发送的目录里，"
+                    "已拒绝发送。")
+        elif "Permission denied" in err:
+            text = (f"⚠️ 文件「{name}」没能发出：没有权限读取这个文件，"
+                    "这条已停止，没有另发说明。")
+        else:
+            text = f"⚠️ 有一条消息没能发出：{err[:160]}"
+        await self._notify_file_failure(
+            item, mode, text, "permanent-failure")
 
     async def upload_media(self, data: bytes, mtype: str, filename: str) -> str:
         chunk_size = 512 * 1024
@@ -4279,10 +4317,22 @@ class Gateway:
                     return True
                 fpath = item.get("file_path", "")
                 file_path = Path(fpath)
+                if not file_path.exists():
+                    # outbound_file_allowed is False for a missing file,
+                    # which would be reported as a refused path.
+                    result["errmsg"] = f"file not found: {fpath}"
+                    result["deadletter"] = True
+                    self.append_jsonl(OUTBOX_RESULTS, result)
+                    log(f"outbox reply_file {item_id}: {result['errmsg']}")
+                    await self._notify_permanent_failure(
+                        item, mode, result["errmsg"])
+                    return True
                 if not outbound_file_allowed(file_path, CRED_FILE, [muse_home(), STATE, BASE, Path("/tmp")]):
                     result["errmsg"] = f"file path is not allowed: {fpath}"
                     self.append_jsonl(OUTBOX_RESULTS, result)
                     log(f"outbox reply_file {item_id}: {result['errmsg']}")
+                    await self._notify_permanent_failure(
+                        item, mode, result["errmsg"])
                     return True
                 # Over the 10MB video cap: transcode, or fail with a
                 # clear notice. Do not upload the original (40011).
@@ -4502,6 +4552,18 @@ class Gateway:
             await self._notify_wecom_video_limit(item, mode, e)
             self.append_jsonl(OUTBOX_RESULTS, result)
             log(f"outbox {mode} {item_id}: {result['errmsg']}")
+            return True
+        except (FileNotFoundError, PermissionError) as e:
+            # Permanent local error, same terminal fate as the Weixin
+            # gateway: retrying cannot make the file appear or readable.
+            result["errmsg"] = f"exception: {e}"
+            result["ok"] = False
+            result["deadletter"] = True
+            self.append_jsonl(OUTBOX_RESULTS, result)
+            log(f"outbox {mode} {item_id}: {result['errmsg']}")
+            if mode in FORMAL_MODES or mode == "send_file":
+                await self._notify_permanent_failure(
+                    item, mode, result["errmsg"])
             return True
         except Exception as e:
             result["errmsg"] = f"exception: {e}"
