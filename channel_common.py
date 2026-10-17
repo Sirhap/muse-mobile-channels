@@ -362,7 +362,8 @@ def outbound_file_allowed(path: Path, cred_file: Path, roots: list[Path]) -> boo
         return False
     parts = resolved.parts
     for index, part in enumerate(parts[:-1]):
-        if part == ".config" and parts[index + 1] in ("weixin-bot", "wecom-bot"):
+        if part == ".config" and parts[index + 1] in (
+                "weixin-bot", "wecom-bot", "native-bridge"):
             return False
     try:
         cred = cred_file.expanduser().resolve(strict=False)
