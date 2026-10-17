@@ -25,7 +25,7 @@ this directory; otherwise shadow (outbox/inbox writes go to shadow/).
 Credentials: env NATIVE_TOKEN_JSON, else cookies.txt + vm_id.txt in
 ~/.config/native-bridge/ (auto-renew, primary), else token.json there.
 """
-import hashlib, importlib.util, json, os, sys, threading, time, traceback
+import fcntl, hashlib, importlib.util, json, os, sys, threading, time, traceback
 from datetime import datetime, timezone
 
 BASE = "/home/hatch/workspace/native-bridge"
@@ -302,10 +302,19 @@ def inbox_path(ch):
 
 
 def append_jsonl(path, row):
+    """Append one row under the same exclusive flock as
+    channel_common.append_jsonl (lock held on the data file itself), so
+    the bridge cannot interleave with the gateways and CLIs that write
+    the same outbox."""
+    line = json.dumps(row, ensure_ascii=False) + "\n"
     with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(row, ensure_ascii=False) + "\n")
-        f.flush()
-        os.fsync(f.fileno())
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            f.write(line)
+            f.flush()
+            os.fsync(f.fileno())
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
 
 
 def bridge_row_id(msgid, suffix=""):

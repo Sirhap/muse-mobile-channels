@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import fcntl
 import json
+import logging
 import os
+import re
 import time
 import uuid
 from contextlib import contextmanager
@@ -452,7 +454,12 @@ def allocate_subagent_id(state_dir: Path) -> str | None:
 
 
 def register_cancel(path: Path, msgid: str) -> None:
-    """Append msgid to cancelled.json under a lock, via a temp-file replace."""
+    """Append msgid to cancelled.json under a lock, via a temp-file replace.
+
+    A file that cannot be parsed as a list is moved aside to
+    ``cancelled.json.corrupt-<ts>`` and the msgids still readable in it
+    are carried into the new file, so earlier /stop records survive.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.with_name("cancelled.lock")
     with lock_path.open("a+") as lock_handle:
@@ -460,17 +467,38 @@ def register_cancel(path: Path, msgid: str) -> None:
         try:
             rows: list = []
             if path.exists():
-                try:
-                    loaded = json.loads(path.read_text(encoding="utf-8"))
-                    if isinstance(loaded, list):
-                        rows = loaded
-                except (OSError, json.JSONDecodeError, UnicodeError):
-                    rows = []
+                rows = _load_cancel_rows(path)
             if not any(isinstance(row, dict) and row.get("msgid") == msgid for row in rows):
                 rows.append({"msgid": msgid, "ts": time.time()})
                 atomic_write_text(path, json.dumps(rows, ensure_ascii=False))
         finally:
             fcntl.flock(lock_handle, fcntl.LOCK_UN)
+
+
+def _load_cancel_rows(path: Path) -> list:
+    """Rows of cancelled.json; a corrupt file is set aside, not discarded."""
+    raw = b""
+    try:
+        raw = path.read_bytes()
+        loaded = json.loads(raw.decode("utf-8"))
+        if isinstance(loaded, list):
+            return loaded
+        reason = "not a JSON list"
+    except (OSError, json.JSONDecodeError, UnicodeError) as exc:
+        reason = f"{type(exc).__name__}: {exc}"
+    backup = path.with_name(f"{path.name}.corrupt-{int(time.time())}")
+    if backup.exists():
+        backup = backup.with_name(f"{backup.name}-{uuid.uuid4().hex[:6]}")
+    # A failed move raises: overwriting would destroy the only copy.
+    os.replace(path, backup)
+    logging.getLogger(__name__).error(
+        "cancelled.json unreadable (%s); preserved as %s", reason, backup)
+    seen: list[str] = []
+    for found in re.findall(rb'"msgid"\s*:\s*"([^"\\]+)"', raw):
+        text = found.decode("utf-8", "replace")
+        if text not in seen:
+            seen.append(text)
+    return [{"msgid": text, "ts": time.time()} for text in seen]
 
 
 def _merge_worker_activity(path: Path, msgids: list[str], now: float,

@@ -192,6 +192,9 @@ SYNC_FILE = STATE / "sync.json"
 CONTEXT_FILE = STATE / "context.json"
 LOCK_FILE = STATE / "gateway.lock"
 CANCELLED_FILE = STATE / "cancelled.json"
+# Last cancelled-id set read cleanly. A torn or corrupt read falls back
+# to it so a /stop that was already honored stays honored.
+_LAST_GOOD_CANCELLED_IDS: set = set()
 FEEDBACK_CLEAR_FILE = STATE / "feedback_clear.jsonl"
 SEEN_FILE = STATE / "seen_ids.jsonl"
 CRED_FILE = Path(
@@ -3348,11 +3351,21 @@ class Gateway:
 
     @staticmethod
     def _cancelled_ids() -> set:
+        global _LAST_GOOD_CANCELLED_IDS
         try:
             rows = json.loads(CANCELLED_FILE.read_text(encoding="utf-8"))
-            return {str(r.get("msgid")) for r in rows if isinstance(r, dict) and r.get("msgid")}
-        except Exception:
+            if not isinstance(rows, list):
+                raise ValueError("cancelled.json is not a JSON list")
+            ids = {str(r.get("msgid")) for r in rows if isinstance(r, dict) and r.get("msgid")}
+        except FileNotFoundError:
+            _LAST_GOOD_CANCELLED_IDS = set()
             return set()
+        except Exception as exc:
+            log(f"cancelled.json unreadable ({exc!r}); using last good set "
+                f"of {len(_LAST_GOOD_CANCELLED_IDS)} ids")
+            return set(_LAST_GOOD_CANCELLED_IDS)
+        _LAST_GOOD_CANCELLED_IDS = ids
+        return set(ids)
 
     @staticmethod
     def _delivered_reply_before(item: dict) -> bool:
