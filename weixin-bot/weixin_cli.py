@@ -249,7 +249,7 @@ def main() -> int:
 
     if args.cmd == "reply":
         content = read_text_arg(args)
-        if not content:
+        if not content.strip():
             print("empty reply text", file=sys.stderr)
             return 2
         if not args.force:
@@ -268,14 +268,14 @@ def main() -> int:
         print(f"queued reply id={item_id} for msgid={args.msgid}")
     elif args.cmd == "send":
         content = read_text_arg(args)
-        if not content:
+        if not content.strip():
             print("empty send text", file=sys.stderr)
             return 2
         item_id = queue({"mode": "send", "to_user_id": args.to_user_id, "content": content})
         print(f"queued send id={item_id} to {args.to_user_id}")
     elif args.cmd == "update":
         content = read_text_arg(args)
-        if not content:
+        if not content.strip():
             print("empty update text", file=sys.stderr)
             return 2
         # Late-update suppression (fix, 2026-10-04 evening): a progress
