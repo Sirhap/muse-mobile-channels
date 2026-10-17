@@ -161,15 +161,15 @@ class QueueAdminTests(unittest.TestCase):
         self.assertEqual(merged["action"], "clear")
         self.assertEqual(merged["msgids"], ["a", "b"])
 
-    def test_stale_file_is_not_merged(self) -> None:
+    def test_stale_unconsumed_file_is_merged(self) -> None:
         merged = merge_queue_admin(
             {"ts": 1, "action": "clear", "msgids": ["old"]},
             "drop",
             ["new"],
             now=100,
         )
-        self.assertEqual(merged["msgids"], ["new"])
-        self.assertEqual(merged["action"], "drop")
+        self.assertEqual(merged["msgids"], ["old", "new"])
+        self.assertEqual(merged["action"], "clear")
 
 
 class SafetyTests(unittest.TestCase):
