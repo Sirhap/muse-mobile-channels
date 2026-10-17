@@ -1499,8 +1499,10 @@ def slash_subagent_stop_ack(hook_state_dir, job_id):
     st = rec.get("status")
     if st in _JOB_ENDED_LABELS:
         return f"副助手 #{job_id} {_JOB_ENDED_LABELS[st]}，无需再停。"
-    _append_jsonl_file(hook_state_dir / "subagent_cmd.jsonl",
-                       {"type": "stop", "job_id": job_id, "ts": time.time()})
+    if not _append_jsonl_file(hook_state_dir / "subagent_cmd.jsonl",
+                              {"type": "stop", "job_id": job_id, "ts": time.time()}):
+        return (f"停止失败：暂时写不了停止指令，副助手 #{job_id} "
+                "仍按原状态继续。请稍后再试。")
     if st == "queued":
         return (f"已提交停止 #{job_id}。这条还在排队，下一轮会直接退出，"
                 "不再开工，也不会另发一条结果。")
