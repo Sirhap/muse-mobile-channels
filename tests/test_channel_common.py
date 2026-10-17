@@ -204,6 +204,14 @@ class SafetyTests(unittest.TestCase):
             other.write_text("SECRET=1\n", encoding="utf-8")
             self.assertFalse(outbound_file_allowed(other, cred, [root]))
             self.assertTrue(outbound_file_allowed(note, cred, [root]))
+            # The native-bridge credential directory (bridge token +
+            # cookies) is refused too — full-review 2026-10-17 item 6.
+            bridge_dir = root / ".config" / "native-bridge"
+            bridge_dir.mkdir(parents=True)
+            for name in ("token.json", "cookies.txt"):
+                secret = bridge_dir / name
+                secret.write_text("SECRET=<redacted>\n", encoding="utf-8")
+                self.assertFalse(outbound_file_allowed(secret, cred, [root]))
 
     def test_feedback_clear_accepts_json_or_bare_msgid(self) -> None:
         self.assertEqual(parse_feedback_clear_line("abc"), "abc")
