@@ -13,6 +13,7 @@ import json
 import os
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -150,7 +151,7 @@ def reply_block_reason_for_row(
     row. Only a dead-letter, or a retry record that already hit the
     attempt cap, opens the gate for another reply.
     """
-    if row.get("mode") != "reply" or str(row.get("msgid")) != str(msgid):
+    if row.get("mode") not in FORMAL_REPLY_MODES or str(row.get("msgid")) != str(msgid):
         return None
     row_id = str(row.get("id") or "")
     rec = (retry or {}).get(row_id) if row_id else None
@@ -204,21 +205,21 @@ def merge_queue_admin(
 ) -> dict:
     """Combine a new clear/drop with an unconsumed queue_admin object.
 
-    The hook reads one JSON object. Two commands a few seconds apart
-    used to overwrite each other. A clear covers every listed msgid, so
-    it absorbs an unconsumed drop. A file older than fresh_secs is left
-    behind: the hook has had time to apply it.
+    The hook reads one JSON object and deletes the file after applying
+    it. Two commands that land before that read used to overwrite each
+    other. A clear covers every listed msgid, so it absorbs an
+    unconsumed drop. The file's presence is the consumed signal:
+    ``fresh_secs`` does not retire an object the hook has not deleted,
+    because a slow poll is older than 15s and still has not applied it.
     """
+    del fresh_secs  # retained for callers; age is not consumption
     prev_ids: list[str] = []
     prev_action = ""
     if isinstance(existing, dict):
-        ts = existing.get("ts")
-        fresh = isinstance(ts, (int, float)) and (now - float(ts)) <= fresh_secs
-        if fresh:
-            prev_action = str(existing.get("action") or "")
-            raw_ids = existing.get("msgids") or []
-            if isinstance(raw_ids, list):
-                prev_ids = [str(mid) for mid in raw_ids if str(mid)]
+        prev_action = str(existing.get("action") or "")
+        raw_ids = existing.get("msgids") or []
+        if isinstance(raw_ids, list):
+            prev_ids = [str(mid) for mid in raw_ids if str(mid)]
     new_ids = [str(mid) for mid in msgids if str(mid)]
     merged_action = "clear" if action == "clear" or prev_action == "clear" else "drop"
     seen: list[str] = []
@@ -346,17 +347,49 @@ def subagent_outcome_default(content: str, status: str | None) -> str:
     return "完成"
 
 
-def allocate_subagent_id(state_dir: Path) -> str | None:
-    """Next S<n> id, or None when the sequence file cannot be replaced.
+@contextmanager
+def exclusive_file_lock(lock_path: Path):
+    """Hold an exclusive advisory lock on ``lock_path`` for the block.
 
+    The lock file is created if needed. It serializes cross-process
+    read-modify-write of a sibling state file.
+    """
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield handle
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+    finally:
+        handle.close()
+
+
+def allocate_subagent_id(state_dir: Path) -> str | None:
+    """Next S<n> id, or None when the sequence file cannot be updated.
+
+    The read and the replace share one file lock. A missing file starts
+    at S1. A file that exists but cannot be parsed is an error: treating
+    that as an empty map would mint S1 again and collide with a live job.
     Returning the same id after a failed replace would collide two jobs.
     """
     path = state_dir / "subagent_seq.json"
-    data = load_json_dict(path)
-    current = data.get("next")
-    number = current if isinstance(current, int) and current >= 1 else 1
     try:
-        atomic_write_text(path, json.dumps({"next": number + 1}))
+        with exclusive_file_lock(state_dir / "subagent_seq.lock"):
+            if path.exists():
+                try:
+                    loaded = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError, UnicodeError):
+                    return None
+                if not isinstance(loaded, dict):
+                    return None
+                data = loaded
+            else:
+                data = {}
+            current = data.get("next")
+            number = current if isinstance(current, int) and current >= 1 else 1
+            atomic_write_text(path, json.dumps({"next": number + 1}))
     except OSError:
         return None
     return f"S{number}"
@@ -673,8 +706,11 @@ def _jsonl_dicts(path: Path) -> list[dict]:
     except (OSError, UnicodeError):
         return []
     rows: list[dict] = []
-    for line in text.splitlines():
-        parsed = parse_jsonl_line(line.encode("utf-8"))
+    # splitlines() also cuts on U+2028 / U+2029 / U+0085, which
+    # json.dumps(ensure_ascii=False) keeps inside a string. JSONL
+    # records are separated only by "\n".
+    for line in text.split("\n"):
+        parsed = parse_jsonl_line(line.rstrip("\r").encode("utf-8"))
         if not parsed or parsed.get("__invalid__"):
             continue
         rows.append(parsed)

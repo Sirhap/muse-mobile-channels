@@ -1083,7 +1083,7 @@ class WecomDownloadTests(_RetryDownloadMixin, _GatewaySandbox):
     def _item(self, plain: bytes, pad_size: int = 32) -> tuple[dict, bytes]:
         cipher = _encrypt_cbc(plain, CBC_KEY, pad_size)
         token = base64.b64encode(CBC_KEY).decode("ascii")
-        return {"kind": "file", "url": "https://example.test/file", "aeskey": token}, cipher
+        return {"kind": "file", "url": "https://weixin.qq.com/file", "aeskey": token}, cipher
 
     def _gateway(self, client) -> object:
         gateway = wc.Gateway.__new__(wc.Gateway)
@@ -1193,7 +1193,7 @@ class WecomDownloadTests(_RetryDownloadMixin, _GatewaySandbox):
         response = FakeResponse([cipher], headers={"content-length": str(len(cipher))})
         client = FakeClient(response)
         gateway = self._gateway(client)
-        gateway.allow_users = set()
+        gateway.allow_users = {"user-1"}
         gateway.seen_msgids = set()
         gateway.reqmap = {}
         gateway.open_streams = {}

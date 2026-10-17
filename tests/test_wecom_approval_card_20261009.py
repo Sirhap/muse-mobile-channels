@@ -157,7 +157,7 @@ def make_gateway():
     g.respond_locks = {}
     g.open_streams = {}
     g._http = None
-    g.allow_users = set()
+    g.allow_users = {"testuser"}
     g.seen_msgids = set()
     g.reqmap = {}
     g.cards = {}
