@@ -103,7 +103,13 @@ AUTH_FAIL_BACKOFF_SECS = 600
 # this same cap. After the cap, only a cred-file change or a
 # process restart tries again.
 RECONNECT_MAX_ATTEMPTS = 3
-MERGE_CHANNELS = {"weixin", "test", "wecom"}
+# Queue redesign stage 1 (todo 31): merging is OFF for every channel,
+# i.e. strict per-message FIFO — a message arriving mid-turn stays
+# queued and starts as its own turn when the running one closes. The
+# merge code below is kept, unreachable, for rollback during the
+# observation window; removal is a later stage. Rollback value:
+# {"weixin", "test", "wecom"}.
+MERGE_CHANNELS = set()
 # Channels in MERGE_CHANNELS fold a queued message into the running
 # turn (official-client steering) while that turn's reply has not
 # started; other channels keep strict FIFO. The combined answer is
