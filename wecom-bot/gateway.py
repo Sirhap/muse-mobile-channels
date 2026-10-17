@@ -494,6 +494,11 @@ def _frame_headers(frame: dict) -> dict:
     return {}
 
 
+def _as_dict(node) -> dict:
+    """The node when it is a dict, else {}. Inbound frames are untrusted."""
+    return node if isinstance(node, dict) else {}
+
+
 def _approval_ascii_number(token: str) -> str | None:
     """Unsigned ASCII integer, after NFKC.
 
@@ -2868,7 +2873,7 @@ class Gateway:
                 log(f"feedback watch failed (ignored): {e!r}")
 
     async def handle_message_callback(self, frame: dict) -> None:
-        body = frame.get("body", {}) or {}
+        body = _as_dict(_as_dict(frame).get("body"))
         req_id = _frame_headers(frame).get("req_id", "")
         msgid = body.get("msgid", "")
         if msgid and str(msgid) in self.seen_msgids:
@@ -2881,42 +2886,47 @@ class Gateway:
         media: list[dict] = []
 
         def _collect_media(kind: str, node: dict | None) -> None:
-            if node and node.get("url"):
+            if isinstance(node, dict) and node.get("url"):
                 media.append(
                     {"kind": kind, "url": node["url"], "aeskey": node.get("aeskey", "")}
                 )
 
         if msgtype == "mixed":
-            for item in (body.get("mixed") or {}).get("msg_item", []) or []:
+            msg_items = _as_dict(body.get("mixed")).get("msg_item")
+            for item in (msg_items if isinstance(msg_items, list) else []):
+                if not isinstance(item, dict):
+                    continue
                 itype = item.get("msgtype", "")
                 if itype == "text":
-                    c = (item.get("text") or {}).get("content", "")
-                    if c:
+                    c = _as_dict(item.get("text")).get("content", "")
+                    if c and isinstance(c, str):
                         text_parts.append(c)
                 elif itype == "image":
                     _collect_media("image", item.get("image"))
                 elif itype == "video":
                     _collect_media("video", item.get("video"))
         else:
-            if (body.get("text") or {}).get("content"):
-                text_parts.append(body["text"]["content"])
-            if msgtype == "voice" and (body.get("voice") or {}).get("content"):
-                text_parts.append(body["voice"]["content"])
+            text_content = _as_dict(body.get("text")).get("content")
+            if text_content and isinstance(text_content, str):
+                text_parts.append(text_content)
+            voice_content = _as_dict(body.get("voice")).get("content")
+            if msgtype == "voice" and voice_content and isinstance(voice_content, str):
+                text_parts.append(voice_content)
             if msgtype == "image":
                 _collect_media("image", body.get("image"))
             if msgtype == "file":
                 _collect_media("file", body.get("file"))
             if msgtype == "video":
                 _collect_media("video", body.get("video"))
-        quote = body.get("quote") or {}
+        quote = _as_dict(body.get("quote"))
         if quote:
             qtext = ""
             qtype = quote.get("msgtype", "")
             if qtype == "text":
-                qtext = (quote.get("text") or {}).get("content", "")
+                qtext = _as_dict(quote.get("text")).get("content", "")
             elif qtype == "voice":
-                qtext = (quote.get("voice") or {}).get("content", "")
-            if qtext:
+                qtext = _as_dict(quote.get("voice")).get("content", "")
+            if qtext and isinstance(qtext, str):
                 text_parts.append(f"（引用：{qtext}）")
             elif qtype == "image":
                 # Non-text quotes used to surface only as collected
@@ -2937,7 +2947,7 @@ class Gateway:
             text_parts.append(labels.get(m["kind"], "[文件]"))
         text = "\n".join(text_parts)
         chattype = body.get("chattype", "")
-        from_userid = (body.get("from") or {}).get("userid", "")
+        from_userid = _as_dict(body.get("from")).get("userid", "")
         chatid = body.get("chatid") or from_userid
         if not self._sender_allowed(str(from_userid or ""), "message"):
             return
@@ -3074,11 +3084,11 @@ class Gateway:
         self.write_status()
 
     async def handle_event_callback(self, frame: dict) -> None:
-        body = frame.get("body", {}) or {}
+        body = _as_dict(_as_dict(frame).get("body"))
         req_id = _frame_headers(frame).get("req_id", "")
-        event = body.get("event", {}) or {}
+        event = _as_dict(body.get("event"))
         etype = event.get("eventtype", "")
-        from_userid = (body.get("from") or {}).get("userid", "")
+        from_userid = _as_dict(body.get("from")).get("userid", "")
         log(f"event {etype} from {from_userid}")
         if etype == "enter_chat":
             if not self._event_allowed(from_userid):
