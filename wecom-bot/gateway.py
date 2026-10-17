@@ -2201,11 +2201,18 @@ class Gateway:
                         f"{attempts} 次，仍在自动重试、不会丢弃。多半"
                         "是企微发送通道临时故障。")
             chatid = str(item.get("chatid") or "")
+            chat_type = int(item.get("chat_type") or 1)
+            if not chatid:
+                # Bridge and CLI rows carry only the msgid; the chat
+                # lives in the request map stored when it arrived.
+                info = self.reqinfo(str(item.get("msgid") or ""))
+                chatid = str(info.get("chatid") or "")
+                chat_type = 2 if info.get("chattype") == "group" else 1
             if chatid:
                 self.append_jsonl(OUTBOX, {
                     "id": f"stucknote-{uuid.uuid4().hex[:12]}",
                     "mode": "send", "chatid": chatid,
-                    "chat_type": int(item.get("chat_type") or 1),
+                    "chat_type": chat_type,
                     "content": text,
                     "queued_at": int(time.time())})
             if STUCK_NOTICE_WEIXIN_OUTBOX.exists():
