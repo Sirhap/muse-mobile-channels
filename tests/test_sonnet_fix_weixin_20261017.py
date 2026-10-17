@@ -653,7 +653,10 @@ def test_w9():
 def test_w10():
     """Unroutable formal rows and refused files get a notice, not a caption."""
     sbx, saved = bind("w10")
-    secret = Path("/workspace/.w10-secret.bin")
+    # Outside every file-send root (muse_home, sandbox STATE/BASE, /tmp)
+    # on both the dev host and the cloud sandbox; a hardcoded repo path
+    # only existed in the sandbox. /var/tmp is outside all roots.
+    secret = Path("/var/tmp/.w10-secret.bin")
     try:
         secret.write_bytes(b"secret-bytes")
         g = bare()
