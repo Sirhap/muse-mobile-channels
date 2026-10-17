@@ -63,6 +63,14 @@ def sandbox_paths(mod, directory):
     mod.STATUS = directory / "status.json"
     if hasattr(mod, "COMPRESSED_DIR"):
         mod.COMPRESSED_DIR = directory / "compressed"
+    # The permanent-failure notify copies an alert into the OTHER bot's
+    # production outbox via these absolute constants; without rebinding,
+    # every local run delivered a bogus alert to the user (todo 30).
+    for attr, name in (("STUCK_NOTICE_WECOM_OUTBOX", "wecom-outbox.jsonl"),
+                       ("STUCK_NOTICE_WEIXIN_OUTBOX", "weixin-outbox.jsonl"),
+                       ("INBOX", "inbox.jsonl")):
+        if hasattr(mod, attr):
+            setattr(mod, attr, directory / name)
 
 
 def write_outbox(mod, rows):

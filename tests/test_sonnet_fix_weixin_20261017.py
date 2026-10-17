@@ -59,7 +59,7 @@ PATH_ATTRS = (
     "OUTBOX_PARTIAL", "OUTBOX_PARKED", "COMPRESSED_DIR", "HOOK_STATE_DIR",
     "APPROVAL_RELAY_DIR", "STUCK_NOTICE_WECOM_OUTBOX", "CANCELLED_FILE",
     "FEEDBACK_CLEAR_FILE", "DIVERTED_RAW", "SENT_INDEX", "MEDIA_DIR",
-    "CRED_FILE", "POISON_MESSAGES",
+    "CRED_FILE", "POISON_MESSAGES", "QUOTE_SPOOL",
 )
 
 
@@ -93,6 +93,7 @@ def bind(name):
     gw.MEDIA_DIR = sbx / "media"
     gw.CRED_FILE = sbx / "credentials.env"
     gw.POISON_MESSAGES = sbx / "poison_messages.jsonl"
+    gw.QUOTE_SPOOL = sbx / "quote-spool"
     gw.HOOK_STATE_DIR.mkdir(parents=True, exist_ok=True)
     return sbx, saved
 
