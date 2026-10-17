@@ -275,11 +275,18 @@ for tag, rel, chan, hook_name in (
     set_outbox(None)
     PLANTED["status"] = {}
 
-    # G7: status first lines unchanged when nothing runs anywhere.
+    # G7: nothing running anywhere. The running count is its own
+    # line (0 条, no minutes) and the queue line has no running clause.
     FAKE_SNAP["active"] = []
     s = gw.slash_status_text("测试", state_dir, hook_dir)
-    check(f"{chan} G7 idle status still says no task running",
-          "当前无任务在跑" in s)
+    slines = s.splitlines()
+    check(f"{chan} G7 idle status shows zero running tasks",
+          slines[1].startswith("网关：")
+          and slines[2] == "运行中任务：0 条"
+          and slines[3] == "队列：排队 0 条 · 后台续跑 0 批"
+          and "最长已跑" not in s
+          and "当前无任务在跑" not in s
+          and "正在处理" not in s)
 
 failed = [n for n, ok in RESULTS if not ok]
 print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} passed")
