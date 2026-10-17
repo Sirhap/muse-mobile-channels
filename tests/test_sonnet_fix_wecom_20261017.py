@@ -745,7 +745,11 @@ def check_c15_fullwidth_digits() -> None:
 
 
 def check_c16_formal_order() -> None:
-    """A delivered reply_file suppresses an earlier parked text reply."""
+    """A delivered reply_file does not suppress the parked text reply.
+
+    The file result is still visible: it suppresses a progress update,
+    and the text-reply CLI gate does not treat the file as a text reply.
+    """
     directory = Path(tempfile.mkdtemp(prefix="c16-"))
     sandbox_outbox(directory)
     wc.OUTBOX.write_text(
@@ -759,6 +763,8 @@ def check_c16_formal_order() -> None:
     )
     suppressed = wc.Gateway._delivered_reply_before(
         {"id": "text1", "mode": "reply", "msgid": "M"})
+    update = wc.Gateway._delivered_reply_before(
+        {"id": "upd", "mode": "update", "msgid": "M"})
     reason = reply_block_reason_for_row(
         "M",
         {"id": "file1", "mode": "reply_file", "msgid": "M", "queued_at": 1},
@@ -766,9 +772,9 @@ def check_c16_formal_order() -> None:
         now=10,
     )
     check(
-        "C16 delivered reply_file counts regardless of row order",
-        suppressed is True and reason is not None and "delivered" in reason,
-        f"suppressed={suppressed!r} reason={reason!r}",
+        "C16 delivered reply_file does not block the parked text",
+        suppressed is False and update is True and reason is None,
+        f"suppressed={suppressed!r} update={update!r} reason={reason!r}",
     )
     shutil.rmtree(directory, ignore_errors=True)
 

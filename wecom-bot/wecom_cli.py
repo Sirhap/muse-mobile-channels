@@ -59,9 +59,10 @@ def read_text_arg(args) -> str:
 REPLY_INFLIGHT_WINDOW_S = 120
 
 
-def reply_block_reason(msgid: str) -> str | None:
-    """Return a human-readable block reason, or None if the reply may go.
+def reply_block_reason(msgid: str, enqueue_mode: str = "reply") -> str | None:
+    """Return a human-readable block reason, or None if the row may go.
 
+    ``enqueue_mode`` is ``reply``, ``reply_file``, or ``update``.
     Fail-open: any error reading state returns None (with a stderr
     warning) so a broken guard never wedges legitimate replies.
     """
@@ -85,7 +86,7 @@ def reply_block_reason(msgid: str) -> str | None:
                     continue
                 reason = reply_block_reason_for_row(
                     msgid, o, results.get(o.get("id")), now, retry,
-                    REPLY_INFLIGHT_WINDOW_S,
+                    REPLY_INFLIGHT_WINDOW_S, enqueue_mode,
                 )
                 if reason:
                     return reason
@@ -332,7 +333,7 @@ def main() -> int:
         # reply gate alone could not stop it because updates were
         # never gated. Reuse the reply gate's state check.
         if not args.force:
-            reason = reply_block_reason(args.msgid)
+            reason = reply_block_reason(args.msgid, "update")
             if reason:
                 print(f"ERROR: late update blocked: {reason}. "
                       "The message is already answered; do NOT send "
@@ -350,10 +351,10 @@ def main() -> int:
         if not Path(args.file).exists():
             print(f"file not found: {args.file}", file=sys.stderr)
             return 2
-        # Same late suppression as update: a reply_file is a formal
-        # closing delivery and must not land after a formal reply.
+        # Same-mode gate: another reply_file blocks a duplicate file
+        # row. A delivered text reply does not.
         if not args.force:
-            reason = reply_block_reason(args.msgid)
+            reason = reply_block_reason(args.msgid, "reply_file")
             if reason:
                 print(f"ERROR: late reply-file blocked: {reason}. "
                       "The message is already answered; deliver any "
