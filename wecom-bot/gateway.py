@@ -165,6 +165,9 @@ STUCK_NOTICE_WEIXIN_OUTBOX = (
 STUCK_NOTICE_WEIXIN_TO = os.environ.get(
     "WECOM_STUCK_NOTICE_TO", "〈wechat-user-id〉")
 CANCELLED_FILE = STATE / "cancelled.json"
+# Last cancelled-id set read cleanly. A torn or corrupt read falls back
+# to it so a /stop that was already honored stays honored.
+_LAST_GOOD_CANCELLED_IDS: set = set()
 SEEN_FILE = STATE / "seen_ids.jsonl"
 LOCK_FILE = STATE / "gateway.lock"
 CRED_FILE = Path(
@@ -2034,11 +2037,21 @@ class Gateway:
 
     @staticmethod
     def _cancelled_ids() -> set:
+        global _LAST_GOOD_CANCELLED_IDS
         try:
             rows = json.loads(CANCELLED_FILE.read_text(encoding="utf-8"))
-            return {str(row.get("msgid")) for row in rows if isinstance(row, dict) and row.get("msgid")}
-        except (OSError, json.JSONDecodeError, UnicodeError):
+            if not isinstance(rows, list):
+                raise ValueError("cancelled.json is not a JSON list")
+            ids = {str(row.get("msgid")) for row in rows if isinstance(row, dict) and row.get("msgid")}
+        except FileNotFoundError:
+            _LAST_GOOD_CANCELLED_IDS = set()
             return set()
+        except (OSError, ValueError) as exc:
+            log(f"cancelled.json unreadable ({exc!r}); using last good set "
+                f"of {len(_LAST_GOOD_CANCELLED_IDS)} ids")
+            return set(_LAST_GOOD_CANCELLED_IDS)
+        _LAST_GOOD_CANCELLED_IDS = ids
+        return set(ids)
 
     @staticmethod
     def _load_retry() -> dict:
