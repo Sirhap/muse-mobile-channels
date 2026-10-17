@@ -371,6 +371,9 @@ def check_a4_cancelled_ids() -> None:
         third = mod.Gateway._cancelled_ids()
         check(f"A4b {label}: a later good read replaces the cached set",
               third == {"stopped-3"}, f"third={third}")
+        mod.CANCELLED_FILE.unlink()
+        check(f"A4b {label}: a missing file is an empty set, not a stale cache",
+              mod.Gateway._cancelled_ids() == set())
 
 
 # ---------------------------------------------------------------- A5
@@ -564,7 +567,7 @@ class _FakeResponse:
         return self._payload
 
 
-def run_login(login, post_payload: dict, status_payloads: list[dict]) -> str:
+def run_login(login, post_payload: dict, status_payloads: list) -> str:
     """Run login.main() against canned responses and return its output."""
     statuses = list(status_payloads)
 
@@ -582,7 +585,10 @@ def run_login(login, post_payload: dict, status_payloads: list[dict]) -> str:
             return _FakeResponse(post_payload)
 
         async def get(self, *_a, **_k):
-            return _FakeResponse(statuses.pop(0))
+            nxt = statuses.pop(0)
+            if isinstance(nxt, Exception):
+                raise nxt
+            return _FakeResponse(nxt)
 
     saved = login.httpx.AsyncClient
     login.httpx.AsyncClient = FakeClient
@@ -621,6 +627,22 @@ def check_a8() -> None:
          {"status": "expired"}])
     check("A8 unknown status logs the status but no raw payload",
           "status=mystery" in out and secret not in out, out)
+
+    async def no_sleep(_secs):
+        return None
+
+    saved_sleep = login.asyncio.sleep
+    login.asyncio.sleep = no_sleep
+    try:
+        url_error = RuntimeError(
+            f"Client error '404' for url 'https://x/get_qrcode_status?qrcode={secret}'")
+        out = run_login(
+            login, {"qrcode": secret, "qrcode_img_content": "img"},
+            [url_error, {"status": "expired"}])
+    finally:
+        login.asyncio.sleep = saved_sleep
+    check("A8 a failed status poll does not log the qrcode URL",
+          "status poll error" in out and secret not in out, out)
 
 
 def main() -> int:
