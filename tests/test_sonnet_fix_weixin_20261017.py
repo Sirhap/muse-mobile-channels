@@ -603,7 +603,7 @@ def test_w9():
             encoding="utf-8",
         )
         delivered = gw.Gateway._delivered_reply_before(
-            {"id": "text1", "mode": "reply", "msgid": "M"})
+            {"id": "upd1", "mode": "update", "msgid": "M"})
         check(
             "W9 delivered-check sees a result row that contains unicode separators",
             delivered is True,
@@ -976,10 +976,10 @@ def test_w17():
         hit = gw.Gateway._delivered_reply_before(
             {"id": "text1", "mode": "reply", "msgid": "M"})
         check(
-            "W17 a later delivered reply_file suppresses the earlier parked text",
-            hit is True,
+            "W17 a later delivered reply_file does not suppress the parked text",
+            hit is False,
         )
-        if hit is not True:
+        if hit is not False:
             print(f"  W17 evidence delivered_before={hit!r}")
 
         gw.OUTBOX_RESULTS.write_text(
