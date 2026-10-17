@@ -288,7 +288,14 @@ def media_url_allowed(url: str) -> bool:
     if not host:
         return False
     suffixes = (".weixin.qq.com", ".qq.com")
-    return host in ("weixin.qq.com", "qq.com") or host.endswith(suffixes)
+    if host in ("weixin.qq.com", "qq.com") or host.endswith(suffixes):
+        return True
+    # WeCom aibot media is served from the platform's own COS buckets
+    # (production shape: ww-aibot-img-<appid>.cos.<region>.myqcloud.com).
+    # Only the aibot bucket family is allowed, not arbitrary COS buckets.
+    first_label = host.split(".", 1)[0]
+    return (first_label.startswith("ww-aibot-")
+            and ".cos." in host and host.endswith(".myqcloud.com"))
 
 
 def outbound_file_allowed(path: Path, cred_file: Path, roots: list[Path]) -> bool:
