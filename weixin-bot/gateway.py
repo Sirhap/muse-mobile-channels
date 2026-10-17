@@ -2913,7 +2913,18 @@ class Gateway:
         if msg.get("message_type") not in (None, 1):
             return  # only user messages
         raw_msgid = msg.get("message_id", "")
-        msgid = raw_msgid if isinstance(raw_msgid, str) else ""
+        # iLink sends message_id as an int, so numeric ids must be
+        # stringified, not dropped: the 2026-10-17 todo-28 W7 change
+        # sent every int id down the empty-id path, which silently
+        # un-diverted all inbound owner messages. Only None/missing
+        # and non-scalar values take the empty-id path (str(None)
+        # would poison the dedupe set with the key "None").
+        if isinstance(raw_msgid, str):
+            msgid = raw_msgid
+        elif isinstance(raw_msgid, int) and not isinstance(raw_msgid, bool):
+            msgid = str(raw_msgid)
+        else:
+            msgid = ""
         if msgid and msgid in self.seen_msgids:
             return
         from_user = msg.get("from_user_id", "")

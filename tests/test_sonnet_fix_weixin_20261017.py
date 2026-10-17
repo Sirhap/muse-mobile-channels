@@ -292,11 +292,18 @@ def test_w3():
     try:
         g = bare()
         inbox = []
+        diverted = []
 
         def capture_append(path, obj):
             if Path(path) == gw.INBOX:
                 inbox.append(obj)
-            gw.Gateway.append_jsonl(path, obj)
+                gw.Gateway.append_jsonl(path, obj)
+            elif "spool" in Path(path).parts:
+                # Never write to the production bridge spool from a
+                # test; record the divert instead.
+                diverted.append(obj)
+            else:
+                gw.Gateway.append_jsonl(path, obj)
 
         async def boom(*_a, **_k):
             raise RuntimeError("ilink _post failed")
@@ -448,16 +455,27 @@ def test_w6():
 
 
 def test_w7():
-    """Null message_id must not become the truthy dedupe key 'None'."""
+    """Null message_id must not become the truthy dedupe key 'None'.
+
+    Numeric ids are legitimate (iLink sends message_id as an int):
+    they are stringified and deduped like string ids.
+    """
     _sbx, saved = bind("w7")
     try:
         g = bare()
         inbox = []
+        diverted = []
 
         def capture_append(path, obj):
             if Path(path) == gw.INBOX:
                 inbox.append(obj)
-            gw.Gateway.append_jsonl(path, obj)
+                gw.Gateway.append_jsonl(path, obj)
+            elif "spool" in Path(path).parts:
+                # Never write to the production bridge spool from a
+                # test; record the divert instead.
+                diverted.append(obj)
+            else:
+                gw.Gateway.append_jsonl(path, obj)
 
         async def quiet(*_a, **_k):
             return None
@@ -487,12 +505,14 @@ def test_w7():
 
         asyncio.run(run())
         texts = [row.get("text") for row in inbox]
+        dtexts = [row.get("text") for row in diverted]
         check(
-            "W7 null and non-string message_id follow the empty-id path",
-            texts == ["null-a", "null-b", "num-a", "num-b"] and "None" not in g.seen_msgids,
+            "W7 null ids take the empty-id path; numeric ids stringify, divert and dedupe",
+            texts == ["null-a", "null-b"] and dtexts == ["num-a"]
+            and "None" not in g.seen_msgids and "123" in g.seen_msgids,
         )
-        if texts != ["null-a", "null-b", "num-a", "num-b"]:
-            print(f"  W7 evidence texts={texts!r} seen={g.seen_msgids}")
+        if texts != ["null-a", "null-b"] or dtexts != ["num-a"]:
+            print(f"  W7 evidence texts={texts!r} diverted={dtexts!r} seen={g.seen_msgids}")
     finally:
         restore(saved)
 
