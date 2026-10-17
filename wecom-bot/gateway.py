@@ -1154,6 +1154,10 @@ def slash_status_text(chan_label, state_dir, hook_state_dir):
     channel = "weixin" if "weixin" in str(hook_state_dir) else "wecom"
     bridge_active, _bq = _bridge_snapshot(channel)
     running = len(mids) + len(detached_mids) + len(bridge_active)
+    # Display only: the count above is unchanged. Minutes are the
+    # longest elapsed across those same actives, and are omitted
+    # when none of them carries a usable timestamp (previously "?").
+    running_line = f"运行中任务：{running} 条"
     if running:
         elapsed = []
         if mids and isinstance(batch.get("since"), (int, float)):
@@ -1165,10 +1169,9 @@ def slash_status_text(chan_label, state_dir, hook_state_dir):
             if isinstance(a, dict) \
                     and isinstance(a.get("secs"), (int, float)):
                 elapsed.append(float(a["secs"]))
-        mins = max(0, round(max(elapsed) / 60)) if elapsed else "?"
-        run_part = f"正在处理 {running} 条（已跑约 {mins} 分钟）"
-    else:
-        run_part = "当前无任务在跑"
+        if elapsed:
+            mins = max(0, round(max(elapsed) / 60))
+            running_line += f" · 最长已跑约 {mins} 分钟"
     chk = _read_json_file(hook_state_dir / "last_check.json")
     if isinstance(chk, dict) and chk.get("ts"):
         if chk.get("ok"):
@@ -1181,7 +1184,8 @@ def slash_status_text(chan_label, state_dir, hook_state_dir):
     lines = [
         f"📊 {chan_label}通道状态",
         f"网关：{state}（{conn}，{err_part}）· 最近入站 {_fmt_hm((last_in or {}).get('ts'))} · 最近出站 {_fmt_hm((last_out or {}).get('ts'))}",
-        f"队列：{run_part} · 排队 {pcount} 条 · 后台续跑 {dcount} 批",
+        running_line,
+        f"队列：排队 {pcount} 条 · 后台续跑 {dcount} 批",
         f"上次自检：{chk_part}",
     ]
     return "\n".join(lines)
