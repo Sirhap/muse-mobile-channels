@@ -137,6 +137,49 @@ def parse_jsonl_line(raw: bytes) -> dict | None:
     return obj
 
 
+def formal_modes_blocking(enqueue_mode: str) -> tuple[str, ...]:
+    """Outbox modes that block one new row of ``enqueue_mode``.
+
+    A text reply is blocked only by another text reply. A reply_file
+    is blocked only by another reply_file. Progress rows (``update``
+    and ``reply_notice``) are blocked once any formal row exists.
+    Callers that do not name a mode are checking a text reply.
+    """
+    if enqueue_mode in ("update", "reply_notice"):
+        return FORMAL_REPLY_MODES
+    if enqueue_mode == "reply_file":
+        return ("reply_file",)
+    return ("reply",)
+
+
+def same_mode_delivery_blocks(candidate: dict, other: dict) -> bool:
+    """Whether a delivered ``other`` row suppresses ``candidate``.
+
+    A delivered reply suppresses other reply rows. A delivered
+    reply_file suppresses other reply_file rows only when the two
+    rows are not distinct files: different non-empty paths are
+    separate media in one answer and both still go out. Progress
+    rows, including a row that has no mode, are suppressed once any
+    formal row for the msgid was delivered. Cross-mode delivery does
+    not suppress a reply or a reply_file.
+    """
+    if not isinstance(candidate, dict) or not isinstance(other, dict):
+        return False
+    candidate_mode = str(candidate.get("mode") or "")
+    other_mode = str(other.get("mode") or "")
+    if candidate_mode == "reply":
+        return other_mode == "reply"
+    if candidate_mode == "reply_file":
+        if other_mode != "reply_file":
+            return False
+        left = str(candidate.get("file_path") or "")
+        right = str(other.get("file_path") or "")
+        if left and right and left != right:
+            return False
+        return True
+    return other_mode in ("reply", "reply_file")
+
+
 def reply_block_reason_for_row(
     msgid: str,
     row: dict,
@@ -144,14 +187,19 @@ def reply_block_reason_for_row(
     now: float,
     retry: dict | None = None,
     window: float = REPLY_INFLIGHT_WINDOW_S,
+    enqueue_mode: str = "reply",
 ) -> str | None:
-    """Why a second formal reply must not be queued, or None to allow it.
+    """Why this existing row blocks a new enqueue, or None to allow it.
 
-    A transient ok=false result means the gateway is still retrying that
-    row. Only a dead-letter, or a retry record that already hit the
-    attempt cap, opens the gate for another reply.
+    ``enqueue_mode`` selects the same-mode rule: a text reply looks
+    only at reply rows, a reply_file looks only at reply_file rows,
+    and a progress enqueue looks at both. A transient ok=false result
+    means the gateway is still retrying that row. Only a dead-letter,
+    or a retry record that already hit the attempt cap, opens the gate
+    for another row of the same mode.
     """
-    if row.get("mode") not in FORMAL_REPLY_MODES or str(row.get("msgid")) != str(msgid):
+    blocking = formal_modes_blocking(enqueue_mode)
+    if row.get("mode") not in blocking or str(row.get("msgid")) != str(msgid):
         return None
     row_id = str(row.get("id") or "")
     rec = (retry or {}).get(row_id) if row_id else None

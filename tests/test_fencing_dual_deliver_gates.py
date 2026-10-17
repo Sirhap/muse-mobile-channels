@@ -179,10 +179,10 @@ def test_open_gate_missing_dir_does_not_plant() -> None:
 
 
 def test_residual_and_delivered_reply() -> None:
-    """The production fence blocks a delivered reply and skips reply_file."""
+    """The production fence blocks a delivered reply and not a reply_file."""
     check(
-        "delivered reply_file blocks a later reply",
-        exp.reply_file_is_uncovered() is False,
+        "delivered reply_file does not block a later text reply",
+        exp.reply_file_is_uncovered() is True,
     )
     reason = reply_block_reason_for_row(
         "m1",
