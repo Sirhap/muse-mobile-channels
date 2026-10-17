@@ -39,6 +39,7 @@ if str(_REPO) not in sys.path:
 
 from channel_common import (  # noqa: E402
     allocate_subagent_id,
+    exclusive_file_lock,
     append_jsonl as append_jsonl_line,
     atomic_write_text,
     complete_jsonl_lines,
@@ -1478,16 +1479,24 @@ def slash_approval_decide_ack(num, decision, channel):
         return f"审批 #{num} 已经处理过了。"
     label = {"allow_once": "批准（仅这次）", "allow_always": "批准（永久）",
              "deny": "拒绝"}[decision]
-    prev = _approval_pending_submission(num)
-    if prev is not None:
-        prev_label = {"allow_once": "批准（仅这次）",
-                      "allow_always": "批准（永久）",
-                      "deny": "拒绝"}.get(prev, prev)
-        return (f"审批 #{num} 已提交过（{prev_label}），"
-                f"等执行结果就行，不用重复提交。")
-    if _append_jsonl_file(APPROVAL_RELAY_DIR / "decisions.jsonl",
-                          {"num": str(num), "decision": decision,
-                           "channel": channel, "ts": time.time()}):
+    # Check and append share one lock. Two channels can both observe
+    # "pending" and both append if this stays check-then-append.
+    try:
+        with exclusive_file_lock(APPROVAL_RELAY_DIR / "decisions.lock"):
+            prev = _approval_pending_submission(num)
+            if prev is not None:
+                prev_label = {"allow_once": "批准（仅这次）",
+                              "allow_always": "批准（永久）",
+                              "deny": "拒绝"}.get(prev, prev)
+                return (f"审批 #{num} 已提交过（{prev_label}），"
+                        f"等执行结果就行，不用重复提交。")
+            wrote = _append_jsonl_file(
+                APPROVAL_RELAY_DIR / "decisions.jsonl",
+                {"num": str(num), "decision": decision,
+                 "channel": channel, "ts": time.time()})
+    except OSError:
+        wrote = False
+    if wrote:
         return f"已提交{label} #{num}：{it.get('who', '')}。执行结果马上发你。"
     return "提交失败：暂时写不了审批指令，请稍后再试。"
 
