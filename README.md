@@ -1,25 +1,72 @@
-# Muse mobile channels (WeChat + WeCom)
+# 在微信和企业微信里用 Muse：双通道接入（个人微信机器人 + 企业微信智能机器人）
 
-Dual mobile channels for Muse, running in parallel on one VM:
+把 Muse 接进微信和企业微信的开源网关项目。装好之后，直接在手机
+微信 / 企业微信里发消息就能和自己的 Muse 对话，不用开代理、不用
+打开网页。个人微信走腾讯 iLink 机器人协议，企业微信走官方智能机器人
+长连接（WebSocket），两条通道可以只装一边，也可以双开。
 
-- `weixin-bot/` — personal WeChat gateway via Tencent's iLink bot protocol
-  (`gateway.py`), plus its CLI (`weixin_cli.py`, wrapper `weixin`) and QR
-  login helper (`login.py`). systemd unit: `weixin-bot.service`.
-- `wecom-bot/` — WeCom (企业微信) smart-robot gateway over the official
-  long-connection WebSocket (`gateway.py`), plus its CLI (`wecom_cli.py`,
-  wrapper `wecom`). systemd unit: `wecom-bot.service`.
-- `channel-restore/` — self-heal for both gateways: `restore.sh` reinstalls /
-  restarts the systemd units if they vanish (e.g. after a VM replacement);
-  `channel-restore.timer` runs it every 5 minutes. The timer unit is
-  deleted by the same replacement, so it cannot restart itself. The
-  heartbeat checklist and the external read-only check are
-  [HEARTBEAT.md](HEARTBEAT.md) and `channel-restore/liveness-probe.sh`.
-- `slash-commands-2026-10-04.md` — the in-chat slash command table
-  (/ping /status /queue /jump /stop /new /help /check /subagent) implemented
-  by the gateways.
+Chat with your Muse from WeChat and WeCom (Enterprise WeChat):
+a self-hosted, dual-channel gateway — personal WeChat via Tencent
+iLink, WeCom via the official smart-robot long connection.
 
-The inbox hooks that wake the agent per message live outside this repo in
-`~/hooks/` (scripts + definitions), managed by the Muse runtime.
+中文图文教程：[《微信企微畅连 Muse 教程》](https://my.feishu.cn/docx/SsDMdusWboCxOrxJJD7c6Z2xngc)
+（从开权限、拿凭证到部署、验证，一步步带图说明）。
+
+## 能做什么
+
+- **手机上随时对话**：在微信 / 企微里发文字、图片、文件，Muse 直接处理并回复。
+- **聊天命令控制**：`/ping` `/status` `/new` `/stop` `/queue` `/check`
+  `/subagent` `/help`，完整命令表见 `slash-commands-2026-10-04.md`。
+- **审批直达手机**：Muse 执行敏感操作要审批时，卡片推到企业微信、
+  文字版推到个人微信，手机上点按钮或回 `/a` `/b` `/c` 即可批准或拒绝。
+- **掉线自愈**：整机换代或重启把 systemd 服务冲掉后，`channel-restore`
+  每 5 分钟巡检并自动重装恢复；公网入口有 Cloudflare 隧道插件包兜底。
+- **凭证不进仓库**：Bot ID、Secret、cookie、token 只存本机配置目录，
+  仓库里只有代码和文档。
+
+## 组成
+
+- `weixin-bot/` — 个人微信网关（iLink 协议）：网关本体、命令行工具、
+  扫码登录 `login.py`，systemd 单元 `weixin-bot.service`。
+- `wecom-bot/` — 企业微信智能机器人网关（长连接 WebSocket）：网关本体、
+  命令行工具，systemd 单元 `wecom-bot.service`。
+- `native-bridge/` — 原生桥：把网关收到的消息送进 Muse 会话；桥的
+  cookie / token 凭证可自动续期，失效时的恢复办法见
+  `native-bridge/get-muse-token.md`。
+- `channel-restore/` — 双网关自愈：定时重装被冲掉的 systemd 单元并
+  拉起服务，自带存活探针与心跳清单（`HEARTBEAT.md`）。
+- `cloudflare-tunnel-plugin/` — Cloudflare 隧道插件：给 Muse 一个
+  固定公网入口（命名隧道 + 本地中转），整机换代后一条命令重装。
+- `approval-relay/` — 审批中转：把 Muse 的操作审批推送到微信 / 企微，
+  并回收你在手机上的决定。
+- `hooks/` — 消息唤醒层：双渠道收件钩子脚本与定义。
+- `ops/`、`tests/`、`docs/` — 运维巡检脚本、沙箱测试套件、问题清单
+  与设计文档。
+
+## 快速开始
+
+1. 把本仓库克隆到家目录的 `workspace` 下（仓库根目录即 workspace 本层）。
+2. 按要接的渠道装依赖，只装选中的一边即可：
+
+   ```sh
+   cd weixin-bot && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+   cd ../wecom-bot && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+   ```
+
+3. 拿凭证：个人微信运行 `weixin-bot/login.py` 出二维码、用要当机器人
+   的微信扫码登录；企业微信在管理后台创建智能机器人（API 长连接
+   模式），把 Bot ID 和 Secret 填进 `~/.config/wecom-bot/credentials.env`。
+4. 安装并启用各目录自带的 systemd 单元（两个网关、原生桥、
+   `channel-restore` 定时器）。
+5. 验证：在微信 / 企微里发 `/ping` 应回 `pong`，再发一条普通消息能
+   得到正式回复才算通——只看服务状态显示绿色不算数。
+
+各单元都把 `HOME`、`MUSE_HOME` 指向家目录，保证网关、聊天命令和
+收件钩子共用同一份状态目录。
+
+---
+
+以下为英文技术细节（凭证存放、钩子机制、测试与问题上报规则）：
 
 ## Secrets
 
