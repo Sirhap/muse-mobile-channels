@@ -1,0 +1,8 @@
+tunnel: <TUNNEL-UUID>
+credentials-file: /home/hatch/.cloudflared/<TUNNEL-UUID>.json
+protocol: http2
+
+ingress:
+  - hostname: your.domain.example
+    service: http://127.0.0.1:8899
+  - service: http_status:404

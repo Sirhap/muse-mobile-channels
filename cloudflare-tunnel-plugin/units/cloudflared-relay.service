@@ -1,0 +1,14 @@
+[Unit]
+Description=Cloudflare tunnel edge relay (via egress proxy CONNECT)
+After=network.target
+Before=cloudflared-tunnel.service
+
+[Service]
+Type=simple
+EnvironmentFile=@HOME@/.config/cloudflared-relay.env
+ExecStart=/usr/bin/python3 @PKG@/relay.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

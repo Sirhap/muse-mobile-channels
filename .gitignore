@@ -39,8 +39,26 @@
 !/native-bridge/native_bridge.py
 !/native-bridge/native-bridge.service
 
+!/cloudflare-tunnel-plugin/
+!/cloudflare-tunnel-plugin/*.md
+!/cloudflare-tunnel-plugin/*.sh
+!/cloudflare-tunnel-plugin/*.py
+!/cloudflare-tunnel-plugin/*.yml
+!/cloudflare-tunnel-plugin/plugin.example.conf
+!/cloudflare-tunnel-plugin/units/
+!/cloudflare-tunnel-plugin/units/*.service
+!/approval-relay/
+!/approval-relay/*.py
+!/approval-relay/*.service
+
 # Runtime / local-only — never commit
 native-bridge/config.json
+cloudflare-tunnel-plugin/plugin.conf
+approval-relay/decisions.jsonl
+approval-relay/decisions.lock
+approval-relay/decisions.offset
+approval-relay/state.json
+approval-relay/status.json
 native-bridge/state.json
 native-bridge/status.json
 native-bridge/spool/

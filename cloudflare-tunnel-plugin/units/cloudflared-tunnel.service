@@ -1,0 +1,13 @@
+[Unit]
+Description=Cloudflare Tunnel @TUNNEL_NAME@ (@HOSTNAME@ -> 127.0.0.1:@LOCAL_PORT@)
+After=network.target intro-site.service cloudflared-relay.service
+Wants=intro-site.service cloudflared-relay.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/cloudflared --config @HOME@/.cloudflared/config-@TUNNEL_NAME@.yml tunnel --edge 127.0.0.1:17844 --edge 127.0.0.1:17845 run @TUNNEL_NAME@
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

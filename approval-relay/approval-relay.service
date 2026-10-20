@@ -1,0 +1,16 @@
+[Unit]
+Description=Muse approval relay (egress approvals -> WeChat/WeCom)
+After=network-online.target
+
+[Service]
+Environment=HOME=/home/hatch
+EnvironmentFile=-/home/hatch/.config/approval-relay/notice.env
+Environment=MUSE_CLI_SRC=/home/hatch/workspace/reference/muse-cli/src
+Type=simple
+ExecStart=/home/hatch/muse-test-venv/bin/python /home/hatch/workspace/approval-relay/approval_relay.py
+WorkingDirectory=/home/hatch/workspace/approval-relay
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

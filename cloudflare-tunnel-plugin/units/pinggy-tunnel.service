@@ -1,0 +1,15 @@
+[Unit]
+Description=Pinggy backup tunnel for plugin site (@LOCAL_PORT@)
+After=network.target intro-site.service
+Wants=intro-site.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/ssh -p 443 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -R0:127.0.0.1:@LOCAL_PORT@ a.pinggy.io
+StandardOutput=append:/tmp/tunnel-pinggy-service.log
+StandardError=append:/tmp/tunnel-pinggy-service.log
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
