@@ -154,7 +154,7 @@ class CardFormTests(CardGroupTestCase):
         self.assertEqual(keys, ["appr_once", "appr_always", "appr_deny"])
         wx = [r for r in self.rows("weixin") if r.get("mode") == "send"]
         self.assertEqual(len(wx), 1)
-        self.assertIn("/批准 1", wx[0]["content"])
+        self.assertIn("回 /a 1｜/b 1｜/c 1", wx[0]["content"])
 
     def test_card_carries_target_and_reason(self):
         card = relay.build_approval_card(
