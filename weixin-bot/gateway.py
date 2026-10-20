@@ -166,7 +166,7 @@ STUCK_NOTICE_WECOM_OUTBOX = (
     Path(os.environ.get("HOME") or "/home/hatch")
     / "workspace" / "wecom-bot" / "state" / "outbox.jsonl")
 STUCK_NOTICE_WECOM_CHATID = os.environ.get(
-    "WEIXIN_STUCK_NOTICE_CHATID", "testuser")
+    "WEIXIN_STUCK_NOTICE_CHATID", "")
 
 # Large-file compression (user decision 2026-10-06: "太大就压缩发"):
 # WeChat CDN uploads of multi-MB files fail intermittently (HTTP 500

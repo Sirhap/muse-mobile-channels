@@ -4,7 +4,7 @@
 Pins the fix for the live duplicate-progress bug (investigation:
 ~/workspace/dup-stale-investigation-2026-10-15/evidence.md §2):
 the bridge queued the same progress bubble twice — Weixin
-bridgeprog-75163870-0 written and delivered twice on 2026-10-15
+bridgeprog-75140000-0 written and delivered twice on 2026-10-15
 14:39 — because step()'s timed trigger (45s / next_prog) and the
 LT2 event trigger (last_event_prog, starting at 0) kept separate
 throttle clocks, and progress_notice() was the only outbox write
@@ -158,12 +158,12 @@ now = int(time.time())
 # an LT2 event lands seconds later, still bucket 0.
 stub = StubGW()
 w = worker_with("weixin", stub)
-turn = make_turn(msgid="〈msgid已打码〉", sent_at=now - 50)
+turn = make_turn(msgid="7514000000000000007", sent_at=now - 50)
 set_state("weixin", turns=[turn], last_boundary_ts=0, session_id="sid1")
 w.step(SPOOL, None)
 rows = prog_rows()
 check("S1 timed trigger queues the first notice",
-      len(rows) == 1 and rows[0]["id"] == "bridgeprog-75163870-0"
+      len(rows) == 1 and rows[0]["id"] == "bridgeprog-75140000-0"
       and "约 1 分钟" in rows[0]["content"])
 sv = saved_turn()
 check("S1 timed fire stamps the shared last_prog_at",
@@ -190,13 +190,13 @@ check("S1 direct same-rid progress_notice is deduped by the guard",
 (WX / "outbox.jsonl").unlink(missing_ok=True)
 stub = StubGW()
 w = worker_with("weixin", stub)
-turn = make_turn(msgid="〈msgid已打码〉", sent_at=now - 70)
+turn = make_turn(msgid="7514000000000000008", sent_at=now - 70)
 w.progress_notice(turn, 45)
 check("S2 simulated timed notice queued (bucket 0)",
       len(prog_rows()) == 1
-      and prog_rows()[0]["id"] == "bridgeprog-75163923-0")
+      and prog_rows()[0]["id"] == "bridgeprog-75140000-0")
 fired_at = int(time.time()) - 25
-turn2 = make_turn(msgid="〈msgid已打码〉", sent_at=now - 70,
+turn2 = make_turn(msgid="7514000000000000008", sent_at=now - 70,
                   last_prog_at=fired_at,
                   next_prog=fired_at + nb.PROG_EVERY_SECS,
                   last_event_prog=0, activity_dirty=True)

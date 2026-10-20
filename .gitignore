@@ -37,10 +37,10 @@
 !/slash-commands-2026-10-04.md
 !/native-bridge/
 !/native-bridge/native_bridge.py
-!/native-bridge/config.json
 !/native-bridge/native-bridge.service
 
 # Runtime / local-only — never commit
+native-bridge/config.json
 native-bridge/state.json
 native-bridge/status.json
 native-bridge/spool/

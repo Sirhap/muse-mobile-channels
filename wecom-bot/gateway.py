@@ -163,7 +163,7 @@ STUCK_NOTICE_WEIXIN_OUTBOX = (
     Path(os.environ.get("HOME") or "/home/hatch")
     / "workspace" / "weixin-bot" / "state" / "outbox.jsonl")
 STUCK_NOTICE_WEIXIN_TO = os.environ.get(
-    "WECOM_STUCK_NOTICE_TO", "〈wechat-user-id〉")
+    "WECOM_STUCK_NOTICE_TO", "")
 CANCELLED_FILE = STATE / "cancelled.json"
 # Last cancelled-id set read cleanly. A torn or corrupt read falls back
 # to it so a /stop that was already honored stays honored.

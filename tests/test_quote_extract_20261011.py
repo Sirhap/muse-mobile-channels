@@ -215,7 +215,7 @@ SAMPLE_REF = {"message_item": {"type": 0,
               "create_time_ms": 1791650680000,
               "update_time_ms": 1791650680000,
               "is_completed": True,
-              "msg_id": "〈msgid已打码〉",
+              "msg_id": "7514000000000000007",
               "button_item_list": [], "at_bot_username_list": []}}
 
 
@@ -226,7 +226,7 @@ def sample_msg(text="测试"):
 
 # 25. qid extraction from the real captured structure
 check("wx: qid from captured ref shape",
-      wx.Gateway._find_ref_qid(sample_msg()) == "〈msgid已打码〉")
+      wx.Gateway._find_ref_qid(sample_msg()) == "7514000000000000007")
 
 # 26. qid from a message-level ref
 msg = {"item_list": [{"type": 1, "text_item": {"text": "测试"}}],
@@ -299,7 +299,7 @@ wx.SENT_INDEX = Q_SENT
 
 # 30. extract -> generic marker -> resolve -> replace (the exact
 # composition handle_inbound performs), plus the unresolvable case.
-write_jsonl(Q_SPOOL, [{"msgid": "〈msgid已打码〉", "text": "继续修复"}])
+write_jsonl(Q_SPOOL, [{"msgid": "7514000000000000007", "text": "继续修复"}])
 _t, _m = wx.Gateway._extract_text(sample_msg())
 check("wx: captured shape alone still generic marker",
       "（引用：[消息]）" in _t)

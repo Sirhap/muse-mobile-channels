@@ -11,6 +11,7 @@ WorkingDirectory=/home/hatch/workspace/wecom-bot
 Environment=PYTHONUNBUFFERED=1
 Environment=WECOM_CRED_FILE=/home/hatch/.config/wecom-bot/credentials.env
 EnvironmentFile=-/etc/environment
+EnvironmentFile=-/home/hatch/.config/wecom-bot/notice.env
 Environment=HOME=/home/hatch
 Environment=MUSE_HOME=/home/hatch
 ExecStart=/home/hatch/workspace/wecom-bot/.venv/bin/python /home/hatch/workspace/wecom-bot/gateway.py

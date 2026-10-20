@@ -10,6 +10,7 @@ Type=simple
 WorkingDirectory=/home/hatch/workspace/weixin-bot
 Environment=ILINK_CRED_FILE=/home/hatch/.config/weixin-bot/credentials.env
 EnvironmentFile=-/etc/environment
+EnvironmentFile=-/home/hatch/.config/weixin-bot/notice.env
 Environment=HOME=/home/hatch
 Environment=MUSE_HOME=/home/hatch
 ExecStart=/home/hatch/workspace/weixin-bot/.venv/bin/python /home/hatch/workspace/weixin-bot/gateway.py

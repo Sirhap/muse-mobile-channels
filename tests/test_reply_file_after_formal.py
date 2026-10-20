@@ -21,7 +21,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 SBX = Path("/tmp/reply-file-after-formal-sbx")
-MSGID = "〈msgid已打码〉"
+MSGID = "7514000000000000007"
 TEXT = "做好了，视频在下面"
 
 RESULTS = []
@@ -142,8 +142,8 @@ shutil.copy(ROOT / "native-bridge" / "config.json", BRIDGE / "config.json")
 nb = load_bridge(BRIDGE)
 check(
     "incident ids are the bridge text + file0 pair",
-    nb.bridge_row_id(MSGID) == "d5ef69115473"
-    and nb.bridge_row_id(MSGID, "file0") == "54e6c0203633",
+    nb.bridge_row_id(MSGID) == "0641780341f3"
+    and nb.bridge_row_id(MSGID, "file0") == "d59406b4e79b",
 )
 
 nb.BASE = str(BRIDGE)
@@ -167,11 +167,11 @@ queued = read_jsonl(WX_STATE / "outbox.jsonl")
 check("bridge queues text then both files",
       [r.get("mode") for r in queued] == ["reply", "reply_file", "reply_file"])
 check("bridge text is the formal reply",
-      queued[0].get("id") == "d5ef69115473"
+      queued[0].get("id") == "0641780341f3"
       and queued[0].get("content") == TEXT
       and queued[0].get("msgid") == MSGID)
 check("bridge file0 is the incident row and does not repeat the text",
-      queued[1].get("id") == "54e6c0203633"
+      queued[1].get("id") == "d59406b4e79b"
       and queued[1].get("file_path") == str(clip)
       and queued[1].get("content") == ""
       and queued[1].get("msgid") == MSGID)
@@ -190,8 +190,8 @@ shutil.copy(clip, media)
 extra = SBX / "weixin" / "still.png"
 shutil.copy(still, extra)
 
-reply_id = "d5ef69115473"
-file_id = "54e6c0203633"
+reply_id = "0641780341f3"
+file_id = "d59406b4e79b"
 file2_id = nb.bridge_row_id(MSGID, "file1")
 update_id = "late-update"
 write_outbox(gw, [
