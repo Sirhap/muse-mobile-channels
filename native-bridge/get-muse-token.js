@@ -7,13 +7,17 @@
 //   重新导出一份 token JSON 装回去，桥即可恢复（2026-10-14 实操过一次）。
 //
 // 使用方法（详细版见同目录 get-muse-token.md）
+//   【执行人：用户本人。靠的是用户自己的浏览器登录态，Muse
+//   没有这个登录态、无法代跑；导出后把 JSON 以文件形式交给
+//   Muse，由 Muse 装回桥并验证。】
 //   1. 用浏览器打开 https://muse.ai 并确认已登录。
 //   2. 按 F12 打开开发者工具，切到 Console（控制台）页签。
 //   3. 把本文件整段粘贴进控制台，回车运行。
 //   4. 控制台会打印一段 JSON 并自动复制到剪贴板，形如：
 //        { "vm_id": "...", "access_token": "...", "hatch_token": "...",
 //          "issued_at": "...", "issued_at_local": "...", "exp": null }
-//   5. 把它保存为 ~/.config/native-bridge/token.json 并设权限 0600；
+//   5. 把 JSON 存成文件交给 Muse，由 Muse 保存为
+//      ~/.config/native-bridge/token.json 并设权限 0600；
 //      若输出的 vm_id 与 ~/.config/native-bridge/vm_id.txt 里不同，
 //      一并把 vm_id.txt 更新为新值。桥靠 cred_stamp 变化自动感知新凭证，
 //      一般无需重启。

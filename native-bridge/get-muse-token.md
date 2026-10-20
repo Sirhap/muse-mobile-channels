@@ -21,6 +21,12 @@ cookies 存回 `cookies.txt`；本脚本只解决 token.json 这一路。
 
 ## 使用步骤
 
+分工先说清：这段脚本**只能由用户本人在自己已登录的浏览器里执行**，
+靠的是用户自己的登录态，Muse 没有这个登录态、无法代跑；用户导出
+后把结果以文件形式交给 Muse，安装和验证由 Muse 在本机完成。
+
+### 第一段：用户本人执行（在自己的浏览器里）
+
 1. 浏览器打开 <https://muse.ai>，确认是已登录状态（能看到自己的会话）。
 2. 按 `F12` 打开开发者工具，切到 **Console（控制台）**页签。
    - 浏览器若提示粘贴保护，按提示手动输入 `allow pasting` 后再粘贴
@@ -39,23 +45,21 @@ cookies 存回 `cookies.txt`；本脚本只解决 token.json 这一路。
    }
    ```
 
-5. 安装到桥（在本机终端做，不要经聊天传递这段 JSON）：
+5. 把这段 JSON 存成一个文件（例如 `token.json`），**以文件形式交给
+   Muse**（走文件投递，不要贴进聊天明文）。
 
-   ```bash
-   # 把剪贴板里的 JSON 存成 token.json（编辑器粘贴保存即可），然后：
-   chmod 600 ~/.config/native-bridge/token.json
-   # 若输出的 vm_id 与现文件不同，同步更新 vm_id.txt：
-   cat ~/.config/native-bridge/vm_id.txt   # 对照脚本输出的 vm_id
-   ```
+### 第二段：Muse 接手（在本机安装与验证）
 
-   装之前先备份旧凭证：`cp -a ~/.config/native-bridge/token.json
-   ~/.config/native-bridge/token.json.bak`（旧文件可能已失效，备份只为
-   回滚对照）。装入前核对两点：输出 JSON 里的 `vm_id` 与预期 VM 一致；
-   `issued_at` 与导出时刻一致（别把旧的一份又贴回来）。
-
-6. 验证：桥靠凭证文件的 cred_stamp 变化自动感知，一般**无需重启**，
-   三渠道 `idle_scan_fail_streak` 会自行清零。想要立刻实证，用桥自己的
-   `connect()` 验活（只打印成败、不打印凭证值）：
+6. Muse 收到文件后安装到桥：先备份旧凭证
+   `cp -a ~/.config/native-bridge/token.json ~/.config/native-bridge/token.json.bak`
+   （旧文件可能已失效，备份只为回滚对照），再把新文件放到
+   `~/.config/native-bridge/token.json` 并 `chmod 600`。装入前核对
+   两点：输出 JSON 里的 `vm_id` 与预期 VM 一致；`issued_at` 与导出
+   时刻一致（别把旧的一份又贴回来）。若输出的 vm_id 与现文件不同，
+   同步更新 `vm_id.txt`。
+7. 验证：桥靠凭证文件的 cred_stamp 变化自动感知，一般**无需重启**，
+   三渠道 `idle_scan_fail_streak` 会自行清零。想要立刻实证，用桥
+   自己的 `connect()` 验活（只打印成败、不打印凭证值）：
 
    ```bash
    ~/muse-test-venv/bin/python ~/workspace/cred-replace-2026-10-14/verify.py
@@ -93,7 +97,8 @@ cookies 存回 `cookies.txt`；本脚本只解决 token.json 这一路。
 
 - 输出的 JSON 是**等同登录凭证**的真 token：只存本机
   `~/.config/native-bridge/token.json`（0600），不要贴进聊天、issue、
-  截图或任何会入仓/同步的位置；传递时走本机文件，别经第三方渠道。
+  截图或任何会入仓/同步的位置；交给 Muse 时用文件投递，
+  别经第三方渠道。
 - 本脚本本身不含任何凭证，可以正常入仓和分享；要防的是它的**输出**。
 - token 会被服务端失效或到期，失效就重跑本脚本导出一份新的，不需要
   改任何代码。
