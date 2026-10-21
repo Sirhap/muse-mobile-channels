@@ -1,49 +1,44 @@
-# Contributing
+# 参与贡献
 
-Thanks for using this project. Bug reports and fixes are welcome.
+感谢使用这个项目，欢迎报告问题和提交修复。
 
-## Where to report
+## 去哪里报告
 
-- Upstream repository: **Sirhap/muse-mobile-channels**
-  (https://github.com/Sirhap/muse-mobile-channels)
-- Report bugs in the upstream repository, even if you are running your own
-  fork — unless the problem is caused by your fork's own changes or your
-  local-only configuration. Fork-specific problems belong in the fork.
-- You need a GitHub account to open an issue; GitHub does not support
-  anonymous issue filing. No other permission or setup is required.
+- 上游仓库：**Sirhap/muse-mobile-channels**
+  （https://github.com/Sirhap/muse-mobile-channels）
+- 问题报到上游仓库，即使你跑的是自己的 fork —— 除非问题是你 fork
+  自身的改动或你本地独有的配置引起的；那类问题属于 fork 自己。
+- 提 issue 需要 GitHub 账号；GitHub 不支持匿名提 issue。除此之外
+  不需要任何权限或额外设置。
 
-## Instructions for AI agents (Muse and others)
+## 给 AI 助手的说明（Muse 和其他助手）
 
-If you are an AI agent assisting a user who installed this project, follow
-these rules when the user reports a bug, or when you discover a
-reproducible bug while working in this repository:
+如果你是正在协助已安装本项目的用户的 AI 助手，当用户报告问题、
+或你在这个仓库里干活时发现可复现的问题，请遵守以下规则：
 
-1. **File upstream.** Create the issue in `Sirhap/muse-mobile-channels`,
-   not in the user's fork:
+1. **提给上游。** 在 `Sirhap/muse-mobile-channels` 建 issue，不要
+   提在用户的 fork 里：
    `gh issue create --repo Sirhap/muse-mobile-channels ...`
-   This requires the user's own GitHub login (`gh auth login`). Never ask
-   the user to share their password or token with you.
-2. **Check for duplicates first.**
-   Run `gh issue list --repo Sirhap/muse-mobile-channels --search "<keywords>"`
-   (and scan open issues) before creating a new one. If an open issue
-   already covers the same problem, add a comment with the new details
-   instead of opening a duplicate.
-3. **Include the essentials:**
-   - Title: `[bug] <short summary>` (or `[feature] <short summary>`)
-   - What happened vs. what was expected
-   - Exact reproduction steps
-   - Environment: OS, Python version, which gateway (weixin / wecom),
-     and the commit hash being run (`git rev-parse --short HEAD`)
-   - Relevant log excerpts, trimmed to the failing part
-4. **Never post secrets or personal data.** Remove credentials, tokens,
-   API keys, the contents of any `credentials.env` or `.env` file, user
-   IDs, phone numbers, and private chat content from anything you paste
-   into an issue. When in doubt, leave it out.
-5. **Confirm with the user when unsure.** If it is not clear whether the
-   problem comes from this project or from the user's local setup, ask
-   before filing. After filing, give the user the issue URL.
+   这需要用户自己的 GitHub 登录（`gh auth login`）。永远不要让用户
+   把密码或 token 分享给你。
+2. **先查重。** 建新 issue 前先跑
+   `gh issue list --repo Sirhap/muse-mobile-channels --search "<关键词>"`
+   （并扫一遍 open issues）。已有 open issue 覆盖同一问题时，把新
+   细节以评论形式加到那条下面，不要重复建。
+3. **包含这些要素：**
+   - 标题：`[bug] <简短摘要>`（或 `[feature] <简短摘要>`）
+   - 发生了什么 vs 预期是什么
+   - 确切的复现步骤
+   - 环境：操作系统、Python 版本、哪个网关（weixin / wecom）、
+     正在运行的 commit 哈希（`git rev-parse --short HEAD`）
+   - 相关日志摘录，只截失败的那部分
+4. **永远不要贴密钥或个人信息。** 贴进 issue 的任何内容里，都要
+   去掉凭证、token、API key、任何 `credentials.env` 或 `.env`
+   文件的内容、用户 ID、电话号码和私人聊天内容。拿不准的就不贴。
+5. **拿不准时先问用户。** 分不清问题出在本项目还是用户的本地
+   环境时，先问再提。提完之后，把 issue 的链接给用户。
 
-Example:
+示例：
 
 ```sh
 gh issue list --repo Sirhap/muse-mobile-channels --search "gateway disconnect"
@@ -58,8 +53,8 @@ Logs (sanitized): ..."
 
 ## Pull requests
 
-- Keep changes focused; describe what you changed and how you tested it.
-- Never commit credentials, `credentials.env`, `.env` files, runtime
-  `state/`, or virtualenvs — they are gitignored for a reason.
-- Make sure Python files compile (`python3 -m py_compile ...`) and shell
-  scripts pass `bash -n` before submitting.
+- 改动保持聚焦；说明你改了什么、怎么测的。
+- 永远不要提交凭证、`credentials.env`、`.env` 文件、运行时
+  `state/` 或虚拟环境 —— 它们被 gitignore 是有原因的。
+- 提交前确保 Python 文件能编译（`python3 -m py_compile ...`）、
+  shell 脚本通过 `bash -n`。
