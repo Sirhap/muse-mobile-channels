@@ -504,13 +504,15 @@ def _load_cancel_rows(path: Path) -> list:
 def _merge_worker_activity(path: Path, msgids: list[str], now: float,
                              source: str, run_id: str | None = None,
                              progress: str | None = None,
-                             hold_secs: float | None = None) -> dict:
+                             hold_secs: float | None = None,
+                             handoff: bool | None = None) -> dict:
     """Read-merge-write worker_activity.json under a lock.
 
     The file is the worker's own activity ledger for the death watch
-    (see death_watch_activity.py, source 2/3): ``{msgid: {"ts":
+    (see death_watch_activity.py, source 2/3/4): ``{msgid: {"ts":
     epoch, "source": str, "run_id": str|None, "progress": str|None,
-    "hold_until": epoch|None}}``. Records written by older writers
+    "hold_until": epoch|None, "handoff": bool|None,
+    "handoff_at": epoch|None}}``. Records written by older writers
     (a bare epoch, or a dict without run_id) are preserved as-is
     apart from the fields this call sets. A corrupt existing file
     is replaced by a fresh map: the ledger is a liveness hint, not
@@ -539,6 +541,13 @@ def _merge_worker_activity(path: Path, msgids: list[str], now: float,
                         rec["hold_until"] = now + float(hold_secs)
                     else:
                         rec.pop("hold_until", None)
+                if handoff is not None:
+                    if handoff:
+                        rec["handoff"] = True
+                        rec["handoff_at"] = now
+                    else:
+                        rec.pop("handoff", None)
+                        rec.pop("handoff_at", None)
                 data[mid] = rec
                 written[mid] = rec
             atomic_write_text(path, json.dumps(data, ensure_ascii=False))
@@ -561,16 +570,26 @@ def register_worker_activity(path: Path, msgids: list[str],
 
 def update_worker_activity(path: Path, msgid: str, now: float,
                            progress: str | None = None,
-                           hold_secs: float | None = None) -> dict:
-    """One beat (optionally with progress text) or one hold write.
+                           hold_secs: float | None = None,
+                           handoff: bool | None = None) -> dict:
+    """One beat (optionally with progress text), one hold write,
+    or one handoff write.
 
     hold_secs > 0 declares "I will be silent this long on purpose";
-    hold_secs == 0 clears an earlier declaration.
+    hold_secs == 0 clears an earlier declaration. handoff=True
+    declares "this batch was handed to the main session on purpose";
+    the death watch treats a fresh handoff like a hold (see
+    death_watch_activity.py source 4), and handoff=False clears it.
     """
-    source = "worker-hold" if hold_secs is not None else "worker-beat"
+    if handoff is not None:
+        source = "worker-handoff"
+    elif hold_secs is not None:
+        source = "worker-hold"
+    else:
+        source = "worker-beat"
     return _merge_worker_activity(
         path, [msgid], now, source=source, progress=progress,
-        hold_secs=hold_secs)
+        hold_secs=hold_secs, handoff=handoff)
 
 
 def trim_mapping(items: list[tuple[str, object]], cap: int, pinned: set[str]) -> dict:

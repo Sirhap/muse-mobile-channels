@@ -281,6 +281,10 @@ def main() -> int:
     pwa.add_argument("--hold-secs", type=float, dest="hold_secs",
                      help="declare intentional silence for this many "
                           "seconds (0 clears a previous hold)")
+    pwa.add_argument("--handoff", action="store_true",
+                     help="mark this msgid as handed to the main "
+                          "session (death watch will not resume or "
+                          "fail-stop it for 24h)")
     sub.add_parser("status", help="show gateway status")
 
     pi = sub.add_parser("inbox", help="show recent inbox entries")
@@ -524,10 +528,10 @@ def main() -> int:
             return 2
         modes = sum(bool(x) for x in (
             args.register, args.beat or args.progress is not None,
-            args.hold_secs is not None))
+            args.hold_secs is not None, args.handoff))
         if modes != 1:
             print("give exactly one of --register, --beat/--progress, "
-                  "--hold-secs", file=sys.stderr)
+                  "--hold-secs, --handoff", file=sys.stderr)
             return 2
         try:
             if args.register:
@@ -540,7 +544,8 @@ def main() -> int:
             else:
                 rec = update_worker_activity(
                     WORKER_ACTIVITY, args.msgid, time.time(),
-                    progress=args.progress, hold_secs=args.hold_secs)
+                    progress=args.progress, hold_secs=args.hold_secs,
+                    handoff=True if args.handoff else None)
         except Exception as e:
             print(f"worker-activity write failed ({e})", file=sys.stderr)
             return 1

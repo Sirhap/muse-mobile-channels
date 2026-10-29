@@ -1121,11 +1121,7 @@ def slash_help_text():
 
 # Receipts whose wording is the contract. Both gateways keep these
 # strings identical; the slash audit test compares them.
-SLASH_NEW_ACK = (
-    "已记下换会话边界，新会话还没创建。"
-    "下一条走原生桥的文字消息才会新建会话，并且不再带入这之前的对话。"
-    "现在只发图片、或这条消息没进桥，网站上还不会出现新会话。"
-)
+SLASH_NEW_ACK = "已开启新会话。"
 SLASH_NEW_FAIL_ACK = (
     "换会话没记下：边界文件暂时写不了，请稍后再试。当前会话没有变。"
 )

@@ -41,6 +41,19 @@ Sources, in order:
    run_id is ignored (a newer wake re-registered the msgid). A
    stale ``checked_at``, an unknown status, or a missing/corrupt
    file is no signal, exactly like the other sources.
+4. A worker handoff record in the same ``worker_activity.json``
+   map: ``{msgid: {"handoff": true, "handoff_at": epoch}}``.
+   A handoff written within ``HANDOFF_MAX_AGE_SECS`` counts as
+   alive (source ``worker-handoff``) and, like a live hold,
+   outranks a platform-terminal verdict: the worker declared
+   this silence on purpose by transferring the batch to the
+   main session, so it must not be resumed or fail-stopped.
+   A handoff is bounded, not forever: after 24h it expires and
+   the normal death route resumes, so a main session that never
+   acts cannot hide a batch indefinitely. A handoff is not a
+   formal reply -- the worker must still send one first (see the
+   hook definitions' HANDOFF rule); it is only the safety net
+   when that reply has not yet landed when the hook polls.
 
 ``queue_snapshot``, ``status.json``, and heartbeat files are not
 sources.
@@ -72,6 +85,12 @@ PLATFORM_VERDICT_MAX_AGE_SECS = 600.0
 PLATFORM_RUNNING_FRESH_SECS = 300.0
 PLATFORM_TERMINAL_STATUSES = frozenset(
     {"completed", "shutdown", "errored", "interrupted"})
+
+# Source 4 (2026-10-29 handoff fix): a handoff marker is trusted
+# for one day. After that the batch returns to the normal death
+# route instead of being held forever by a main session that
+# never acted.
+HANDOFF_MAX_AGE_SECS = 86400.0
 
 
 def epoch_of(raw: object) -> float | None:
@@ -252,8 +271,10 @@ def assess(msgid: str, *, now: float, window: float,
     Returns ``alive``, ``source``, ``activity_ts``, and ``degraded``,
     plus the todo-21 fields ``platform_terminal``,
     ``platform_status``, ``worker_run_id``, and
-    ``worker_hold_until``. ``alive`` is true only for a positive
-    fresh signal (a live worker hold counts). ``platform_terminal``
+    ``worker_hold_until``, plus the handoff fields
+    ``worker_handoff`` and ``worker_handoff_at``. ``alive`` is
+    true only for a positive fresh signal (a live worker hold or
+    a fresh worker handoff counts). ``platform_terminal``
     is evidence for the hook's early route, never an alive signal.
     Degraded sources contribute no signal.
     """
@@ -272,26 +293,42 @@ def assess(msgid: str, *, now: float, window: float,
     record = _worker_record(worker, msgid) if isinstance(worker, dict) else None
     registered_run = None
     hold_until = None
+    handoff_at = None
     if record is not None:
         run = record.get("run_id")
         if isinstance(run, str) and run:
             registered_run = run
         hold_until = epoch_of(record.get("hold_until"))
+        if record.get("handoff") is True:
+            handoff_at = epoch_of(record.get("handoff_at"))
+            if handoff_at is None:
+                handoff_at = epoch_of(record.get("ts"))
 
     platform = {"terminal": False, "alive_ts": None, "status": None}
     if isinstance(verdicts, dict):
         platform = _platform_hit(verdicts, msgid, now, registered_run)
 
+    handoff_fresh = _fresh(handoff_at, now, HANDOFF_MAX_AGE_SECS)
     extra = {"platform_terminal": platform["terminal"],
              "platform_status": platform["status"],
              "worker_run_id": registered_run,
-             "worker_hold_until": hold_until}
+             "worker_hold_until": hold_until,
+             "worker_handoff": handoff_fresh,
+             "worker_handoff_at": handoff_at}
 
     # A live hold outranks everything, terminal verdicts included:
     # the worker declared this silence in advance.
     if hold_until is not None and hold_until > now:
         return {"alive": True, "source": "worker-hold",
                 "activity_ts": hold_until, "degraded": degraded, **extra}
+
+    # A fresh handoff outranks a terminal verdict the same way:
+    # the worker declared this transfer on purpose, so the batch
+    # must not be resumed or fail-stopped while the handoff is
+    # still within its day-long window.
+    if handoff_fresh:
+        return {"alive": True, "source": "worker-handoff",
+                "activity_ts": handoff_at, "degraded": degraded, **extra}
 
     best: tuple[int, float, str] | None = None
     if isinstance(bridge, dict):

@@ -829,6 +829,14 @@ def _route_death(e, window=DEATH_WATCH_SECS):
     _mid = str(e["msgid"])
     if _activity_blocks([_mid], window):
         return "hold"
+    # Handoff veto (2026-10-29): a worker that transferred the batch
+    # to the main session must not be resumed or fail-stopped, even
+    # when its platform session has ended. _activity_blocks already
+    # returns hold for a fresh handoff via the probe's worker-handoff
+    # signal; this check is defence in depth for a probe that
+    # reports handoff without alive.
+    if _assess_msgid(_mid).get("worker_handoff"):
+        return "hold"
     if _assess_msgid(_mid).get("platform_terminal"):
         # Routed on platform-terminal evidence (todo 21): remember
         # the basis so the resume / fail-stop notices can state it.

@@ -155,6 +155,34 @@ class ProbePlatformTests(unittest.TestCase):
         self.assertFalse(info["alive"])
         self.assertTrue(info["platform_terminal"])
 
+    def test_fresh_handoff_vetoes_terminal_verdict(self) -> None:
+        # 2026-10-29: a worker that handed the batch to the main
+        # session must not be resumed or fail-stopped, even when
+        # its platform session has ended.
+        self.write_worker({"m1": {"ts": NOW - 900, "source": "worker-handoff",
+                                  "run_id": RUN,
+                                  "handoff": True, "handoff_at": NOW - 100}})
+        self.write_verdict(self.verdict())
+        info = self.assess()
+        self.assertTrue(info["alive"])
+        self.assertEqual(info["source"], "worker-handoff")
+        self.assertTrue(info["platform_terminal"])
+        self.assertTrue(info["worker_handoff"])
+
+    def test_expired_handoff_does_not_veto(self) -> None:
+        # Handoff is bounded to 24h: after that the normal death
+        # route resumes, so a main session that never acts cannot
+        # hide a batch forever.
+        self.write_worker({"m1": {"ts": NOW - 90000, "source": "worker-handoff",
+                                  "run_id": RUN,
+                                  "handoff": True,
+                                  "handoff_at": NOW - 86401}})
+        self.write_verdict(self.verdict())
+        info = self.assess()
+        self.assertFalse(info["alive"])
+        self.assertTrue(info["platform_terminal"])
+        self.assertFalse(info["worker_handoff"])
+
     def test_old_formats_still_work(self) -> None:
         # Bare epoch record: ts still counts, no run_id, no hold.
         self.write_worker({"m1": NOW - 40})
@@ -201,6 +229,21 @@ class WriterTests(unittest.TestCase):
         self.assertEqual(data["m1"]["hold_until"], NOW + 180 + 900)
         cc.update_worker_activity(self.path, "m1", NOW + 200, hold_secs=0)
         self.assertNotIn("hold_until", self.read()["m1"])
+
+    def test_handoff_roundtrip(self) -> None:
+        cc.register_worker_activity(self.path, ["m1"], RUN, NOW)
+        cc.update_worker_activity(self.path, "m1", NOW + 60,
+                                  handoff=True)
+        data = self.read()
+        self.assertTrue(data["m1"]["handoff"])
+        self.assertEqual(data["m1"]["handoff_at"], NOW + 60)
+        self.assertEqual(data["m1"]["source"], "worker-handoff")
+        self.assertEqual(data["m1"]["run_id"], RUN)
+        cc.update_worker_activity(self.path, "m1", NOW + 70,
+                                  handoff=False)
+        data = self.read()
+        self.assertNotIn("handoff", data["m1"])
+        self.assertNotIn("handoff_at", data["m1"])
 
     def test_register_preserves_other_records(self) -> None:
         self.path.write_text(json.dumps({"old": NOW - 5000,
@@ -262,6 +305,15 @@ class CliTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         data = json.loads(state.read_text(encoding="utf-8"))
         self.assertGreater(data["m1"]["hold_until"], time.time())
+        r = self.run_cli(cli, "worker-activity", "--msgid", "m1",
+                         "--handoff")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        data = json.loads(state.read_text(encoding="utf-8"))
+        self.assertTrue(data["m1"]["handoff"])
+        self.assertGreater(data["m1"]["handoff_at"], 0)
+        r = self.run_cli(cli, "worker-activity", "--msgid", "m1",
+                         "--beat", "--handoff")
+        self.assertEqual(r.returncode, 2)  # exactly one mode required
         r = self.run_cli(cli, "worker-activity", "--msgid", "m1")
         self.assertEqual(r.returncode, 2)  # exactly one mode required
         r = self.run_cli(cli, "worker-activity", "--msgid", "m1",
