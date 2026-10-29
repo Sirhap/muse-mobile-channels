@@ -172,6 +172,9 @@ def notify(text, tag, approval=None, channels=None, item=None):
     template card instead of plain text. WeChat keeps the text form.
     The text is kept on the card row as fallback/audit content.
     Missing evidence still notifies both channels.
+
+    各通道写入独立处理，单渠道部署也能收到通知。全部目标写入
+    失败时抛出 OSError，调用方保留未通知状态，等待下一轮重试。
     """
     if channels is not None:
         targets = _ordered_unique(
@@ -183,6 +186,8 @@ def notify(text, tag, approval=None, channels=None, item=None):
     else:
         targets = resolve_notify_channels(item=item)
 
+    queued = False
+    last_error = None
     for ch in targets:
         cfg = CHANNELS[ch]
         row = {"id": f"appr-{tag}-{uuid.uuid4().hex[:8]}",
@@ -194,11 +199,18 @@ def notify(text, tag, approval=None, channels=None, item=None):
             row["mode"] = "send"
         row.update(cfg["row"])
         path = cfg["outbox"]
-        if TEST:
-            path = os.path.join(BASE, "shadow", f"{ch}-outbox.jsonl")
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        try:
+            if TEST:
+                path = os.path.join(BASE, "shadow", f"{ch}-outbox.jsonl")
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+            queued = True
+        except OSError as exc:
+            last_error = exc
+            log("notify write failed", ch, type(exc).__name__)
+    if not queued:
+        raise OSError("approval notice could not be queued to any selected channel") from last_error
 
 
 def _what_field(what, label):
@@ -535,7 +547,6 @@ def poll_once(gw, st):
                 if not item.get("group_key"):
                     item["group_key"] = (group_key(source)
                                          or group_key_from_what(what))
-                item["notified"] = True
                 always_from = find_recent_always_primary(st, num, item)
                 auto_done = False
                 if always_from is not None:
@@ -556,16 +567,18 @@ def poll_once(gw, st):
                 primary = (None if auto_done
                            else find_group_primary(st, num, item))
                 if auto_done:
-                    pass
+                    item["notified"] = True
                 elif primary is not None:
                     # Same command + target as an already-notified
                     # pending item: do not push another card/text.
                     # The primary's decision is applied to this item
                     # too (see consume_decisions).
                     item["grouped_with"] = primary
+                    item["notified"] = True
                     log("grouped pending", num, "->", primary, aid[:12])
                 else:
                     send_approval_notice(num, item)
+                    item["notified"] = True
                     log("notified pending", num, aid[:12], who)
             else:
                 # Hold the notification: an empty one would ask the
@@ -585,9 +598,10 @@ def poll_once(gw, st):
         if primary is not None and primary.get("status") == "pending":
             continue
         item.pop("grouped_with", None)
+        item["notified"] = False
         if has_content(item.get("who"), item.get("what")):
-            item["notified"] = True
             send_approval_notice(num, item)
+            item["notified"] = True
             log("promoted grouped pending", num)
         else:
             item["notified"] = False

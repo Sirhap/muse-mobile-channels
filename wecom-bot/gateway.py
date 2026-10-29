@@ -132,6 +132,8 @@ MEDIA_DIR = STATE / "media"
 # never modified. Tests redirect this global.
 COMPRESSED_DIR = STATE / "compressed"
 INBOX = STATE / "inbox.jsonl"
+# 已转交原生桥的消息同样是重启去重的可靠来源。
+BRIDGE_SPOOL = Path("/home/hatch/workspace/native-bridge/spool/wecom.jsonl")
 OUTBOX = STATE / "outbox.jsonl"
 OUTBOX_RESULTS = STATE / "outbox_results.jsonl"
 REQMAP = STATE / "reqmap.json"
@@ -1914,28 +1916,19 @@ class Gateway:
     # ---------- persistence helpers ----------
 
     def _load_persisted(self) -> None:
-        if INBOX.exists():
+        """从已提交消息及去重文件恢复状态，覆盖去重标记单独写入失败。"""
+        for path in (INBOX, SEEN_FILE, BRIDGE_SPOOL):
             try:
-                for line in jsonl_text_lines(INBOX.read_text(encoding="utf-8")):
-                    try:
-                        entry = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if isinstance(entry, dict) and entry.get("msgid"):
-                        self.seen_msgids.add(entry["msgid"])
+                text = path.read_bytes().decode("utf-8", errors="replace")
             except OSError:
-                pass
-        if SEEN_FILE.exists():
-            try:
-                for line in jsonl_text_lines(SEEN_FILE.read_text(encoding="utf-8")):
-                    try:
-                        entry = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if isinstance(entry, dict) and entry.get("msgid"):
-                        self.seen_msgids.add(str(entry["msgid"]))
-            except OSError:
-                pass
+                continue
+            for line in jsonl_text_lines(text):
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(entry, dict) and entry.get("msgid"):
+                    self.seen_msgids.add(str(entry["msgid"]))
         if REQMAP.exists():
             try:
                 self.reqmap = json.loads(REQMAP.read_text(encoding="utf-8"))
@@ -1982,6 +1975,12 @@ class Gateway:
             append_jsonl_line(SEEN_FILE, {"msgid": str(msgid)})
         except OSError:
             self.seen_msgids.discard(str(msgid))
+
+    def _commit_inbound_seen(self, msgid: str) -> None:
+        """已入队的消息保留内存去重；重启时可从收件箱或桥队列重建。"""
+        self._mark_seen(msgid)
+        if msgid:
+            self.seen_msgids.add(str(msgid))
 
     def _save_reqmap(self) -> None:
         # Keep open streams even when the map is trimmed. 200 was short
@@ -2121,13 +2120,11 @@ class Gateway:
         return True
 
     def _note_failure(self, item: dict) -> str:
-        """Register one failed dispatch and decide the row's fate:
-        "park" (keep retrying in the lane) or "deadletter"
-        (SEND_MAX_ATTEMPTS reached, non-formal modes only — formal
-        rows park forever). State is persisted in OUTBOX_PARKED
-        (item payload, attempt count, next retry time) with a
-        mirror in OUTBOX_RETRY so the CLI reply gate keeps seeing
-        the row as still-retrying; terminal states remove both."""
+        """记录失败并返回 park、deadletter 或持久化失败时的 deferred。
+
+        完整载荷保存在 OUTBOX_PARKED，OUTBOX_RETRY 仅用于状态镜像。
+        deferred 表示源队列必须继续持有该行；正式回复不会因次数耗尽丢弃。
+        """
         item_id = str(item.get("id") or "")
         mode = item.get("mode", "")
         if not item_id:
@@ -2173,8 +2170,10 @@ class Gateway:
         saved = self._save_parked(parked)
         self._save_retry(retry)
         if not saved:
-            log(f"outbox {mode} {item_id}: parked save failed; stuck notice withheld")
-            return action
+            # 重试镜像没有消息载荷；完整记录未落盘时，源队列仍负责投递，
+            # 调用方必须保留该行，不能推进对应的游标。
+            log(f"outbox {mode} {item_id}: parked save failed; source row retained")
+            return "deferred"
         if should_notify and action == "park":
             rec["notified"] = True
             mirror = retry.get(item_id)
@@ -2873,6 +2872,30 @@ class Gateway:
                 log(f"feedback watch failed (ignored): {e!r}")
 
     async def handle_message_callback(self, frame: dict) -> None:
+        """串行处理同一消息的回调，避免提前提交尚未入队的去重记录。
+
+        首次处理在持久化之前失败时，等待中的重复回调可以重新尝试。
+        进程内锁负责并发互斥，seen_ids 和收件箱负责重启后的去重。
+        """
+        msgid = str(_as_dict(_as_dict(frame).get("body")).get("msgid") or "")
+        if not msgid:
+            await self._handle_message_callback(frame)
+            return
+        locks = getattr(self, "_inbound_locks", None)
+        if locks is None:
+            locks = self._inbound_locks = {}
+        lock = locks.setdefault(msgid, asyncio.Lock())
+        lock._users = getattr(lock, "_users", 0) + 1
+        try:
+            async with lock:
+                await self._handle_message_callback(frame)
+        finally:
+            lock._users -= 1
+            if self._is_respond_lock_idle(lock) and locks.get(msgid) is lock:
+                locks.pop(msgid, None)
+
+    async def _handle_message_callback(self, frame: dict) -> None:
+        """先持久化消息，再提交表示已处理的去重记录。"""
         body = _as_dict(_as_dict(frame).get("body"))
         req_id = _frame_headers(frame).get("req_id", "")
         msgid = body.get("msgid", "")
@@ -2951,11 +2974,6 @@ class Gateway:
         chatid = body.get("chatid") or from_userid
         if not self._sender_allowed(str(from_userid or ""), "message"):
             return
-        # Mark before any await. Callbacks run as concurrent tasks, so
-        # a second frame with this msgid can pass the check above while
-        # the first is inside slash handling or a media download.
-        if msgid:
-            self._mark_seen(str(msgid))
         if msgtype == "text" and not media:
             # Slash commands: intercepted after allowlist + dedupe,
             # before the inbox write — they never wake a worker.
@@ -2999,7 +3017,7 @@ class Gateway:
         if msgtype == "text" and stripped.lower() == "ping":
             entry["auto_handled"] = True
             self.append_jsonl(INBOX, entry)
-            self._mark_seen(msgid)
+            self._commit_inbound_seen(msgid)
             resp = await self.respond(
                 req_id, {"msgtype": "markdown", "markdown": {"content": "pong ✅ 网关在线"}}
             )
@@ -3020,8 +3038,7 @@ class Gateway:
                         "/home/hatch/workspace/native-bridge/divert-wecom")):
                 try:
                     self.append_jsonl(
-                        Path("/home/hatch/workspace/native-bridge/"
-                             "spool/wecom.jsonl"),
+                        BRIDGE_SPOOL,
                         {"msgid": msgid, "text": text,
                          "chatid": chatid, "chattype": chattype,
                          "ts": int(time.time())})
@@ -3031,7 +3048,7 @@ class Gateway:
                     log(f"native divert failed, using inbox: {e}")
             if not diverted:
                 self.append_jsonl(INBOX, entry)
-            self._mark_seen(msgid)
+            self._commit_inbound_seen(msgid)
             if not diverted:
                 # Cold-lane soft ack DISABLED (2026-10-09, user order
                 # after live voice-burst incident): the old
@@ -3736,61 +3753,86 @@ class Gateway:
             return [item] if item.get("mode") != "send" else []
 
     async def _dispatch_outbox_ready(self, ready: dict) -> bool:
-        """Dispatch one coalescer-ready row with per-original-id
-        accounting (the main pass's ok -> cleanup / fail -> park
-        rule, applied to EVERY original row a merged send stands
-        for). A merged row is dispatched once, enriched with the
-        first original row's fields the merged dict drops (e.g.
-        chat_type); dispatch writes the first id's result row, and
-        one extra result row is written here per remaining id."""
-        merged_ids = [str(m) for m in (ready.get("merged_ids") or [])]
-        if not merged_ids:
-            ok = await self.dispatch_outbox_item(ready)
-            item_id = str(ready.get("id") or "")
-            if ok:
-                self._cleanup_item(item_id)
-            else:
-                self._note_failure(ready)
-            return ok
-        pending = getattr(self, "_coalesce_pending", {})
-        originals = []
-        for mid_ in merged_ids:
-            orig = pending.pop(mid_, None)
-            if orig is not None:
-                originals.append(orig)
-        dispatch_item = dict(originals[0]) if originals else {}
-        for k, v in ready.items():
-            if k != "merged_ids":
-                dispatch_item[k] = v
-        dispatch_item["id"] = merged_ids[0]
-        dispatch_item["mode"] = "send"
-        dispatch_item["content"] = ready.get("content", "")
-        ok = await self.dispatch_outbox_item(dispatch_item)
-        if not ok and len(merged_ids) > 1:
-            # Chunk progress was stored under the first id, against
-            # the joined text. Record each original row's delivered
-            # character span before the retry lane sends them alone.
+        """投递合并批次，在每条原始消息可靠交接之前保留其载荷。
+
+        网络尝试之后的落盘失败保留内存检查点。恢复时继续写入状态，
+        避免再次向用户发送相同的合并消息。
+        """
+        merged_ids = [str(mid) for mid in (ready.get("merged_ids") or [])]
+        ids = merged_ids or [str(ready.get("id") or "")]
+        checkpoints = getattr(self, "_ready_delivery_state", None)
+        if checkpoints is None:
+            checkpoints = self._ready_delivery_state = {}
+        key = tuple(ids)
+        checkpoint = checkpoints.get(key)
+        if checkpoint is None:
+            pending = getattr(self, "_coalesce_pending", {})
+            originals = [pending[mid] for mid in merged_ids if mid in pending]
+            if not merged_ids:
+                originals = [ready]
+            elif len(originals) != len(merged_ids):
+                raise RuntimeError("coalesced send is missing original outbox rows")
+            dispatch_item = dict(originals[0])
+            dispatch_item.update({key: value for key, value in ready.items()
+                                  if key != "merged_ids"})
+            if merged_ids:
+                dispatch_item.update(id=merged_ids[0], mode="send",
+                                     content=ready.get("content", ""))
+            ok = await self.dispatch_outbox_item(dispatch_item)
+            checkpoint = {"ok": ok, "originals": originals,
+                          "dispatch_item": dispatch_item, "spans_saved": False,
+                          "extra_results": set(), "accounted": set()}
+            checkpoints[key] = checkpoint
+        ok = checkpoint["ok"]
+        originals = checkpoint["originals"]
+        if not ok and len(merged_ids) > 1 and not checkpoint["spans_saved"]:
             try:
-                sent_n = int(self._partial_for(merged_ids[0]).get("sent_chunks") or 0)
+                sent_n = int(self._partial_for(ids[0]).get("sent_chunks") or 0)
             except (TypeError, ValueError):
                 sent_n = 0
             self._record_merged_send_spans(
-                originals, str(dispatch_item.get("content") or ""), sent_n)
+                originals, str(checkpoint["dispatch_item"].get("content") or ""), sent_n)
+            checkpoint["spans_saved"] = True
         for extra_id in merged_ids[1:]:
-            self.append_jsonl(OUTBOX_RESULTS, {
-                "id": extra_id, "mode": "send",
-                "ts": int(time.time()), "ok": bool(ok),
-                "errmsg": "" if ok else
-                "merged send failed; parked for individual retry",
-                "merged_into": merged_ids[0],
-            })
-        if ok:
-            for oid in merged_ids:
-                self._cleanup_item(oid)
-        else:
-            for orig in originals:
-                self._note_failure(orig)
+            if extra_id not in checkpoint["extra_results"]:
+                self.append_jsonl(OUTBOX_RESULTS, {
+                    "id": extra_id, "mode": "send",
+                    "ts": int(time.time()), "ok": bool(ok),
+                    "errmsg": "" if ok else "merged send failed; parked for individual retry",
+                    "merged_into": ids[0],
+                })
+                checkpoint["extra_results"].add(extra_id)
+        for original in originals:
+            item_id = str(original.get("id") or "")
+            if item_id in checkpoint["accounted"]:
+                continue
+            if ok:
+                self._cleanup_item(item_id)
+            elif self._note_failure(original) == "deferred":
+                raise OSError(f"outbox row {item_id}: retry handoff is not durable")
+            checkpoint["accounted"].add(item_id)
+        pending = getattr(self, "_coalesce_pending", {})
+        for item_id in merged_ids:
+            pending.pop(item_id, None)
+        checkpoints.pop(key, None)
         return ok
+
+    async def _drain_ready_outbox(self, ready_rows: list | None = None) -> bool:
+        """保留已从合并器取出的行，直到投递或持久化重试交接完成。"""
+        queued = getattr(self, "_ready_outbox_rows", None)
+        if queued is None:
+            queued = self._ready_outbox_rows = []
+        queued.extend(ready_rows or [])
+        while queued:
+            ready = queued[0]
+            try:
+                await self._dispatch_outbox_ready(ready)
+            except Exception as error:
+                log(f"outbox handoff deferred; source cursor held: {error!r}")
+                return False
+            self._remember_dispatched_ids(ready)
+            queued.pop(0)
+        return True
 
     def _record_merged_send_spans(self, originals: list, merged: str, sent_chunks: int) -> None:
         """Store how much of each original row a merged send delivered.
@@ -3922,6 +3964,8 @@ class Gateway:
         while True:
             await asyncio.sleep(1.0)
             await self.check_stream_watchdog()
+            if not await self._drain_ready_outbox():
+                continue
             # ---- coalescer due pass (2026-10-09) ----
             # Buffers whose idle gap / max-wait cap is reached go
             # out BEFORE any newer main-queue rows are read, so
@@ -3933,9 +3977,8 @@ class Gateway:
                 except Exception as e:
                     log(f"coalesce due failed (ignored): {e!r}")
                     _due_rows = []
-                for _ready in _due_rows:
-                    await self._dispatch_outbox_ready(_ready)
-                    self._remember_dispatched_ids(_ready)
+                if not await self._drain_ready_outbox(_due_rows):
+                    continue
             # ---- main queue pass ----
             if OUTBOX.exists():
                 offset = self._outbox_offset()
@@ -3960,6 +4003,7 @@ class Gateway:
                     # Feed the whole read so a barrier still flushes
                     # the sends ahead of it in this pass. Lines already
                     # dispatched or still buffered are not fed again.
+                    handoff_failed = False
                     for raw_line in lines:
                         parsed = parse_jsonl_line(raw_line)
                         if parsed is None or parsed.get("__invalid__"):
@@ -3979,9 +4023,11 @@ class Gateway:
                         ):
                             awaiting.add(item_id)
                             continue
-                        for ready in self._coalesce_feed(item):
-                            await self._dispatch_outbox_ready(ready)
-                            self._remember_dispatched_ids(ready)
+                        if not await self._drain_ready_outbox(self._coalesce_feed(item)):
+                            handoff_failed = True
+                            break
+                    if handoff_failed:
+                        continue
                     buffered_now = self._buffered_send_ids()
                     consumed = 0
                     for raw_line in lines:

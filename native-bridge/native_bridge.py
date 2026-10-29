@@ -202,7 +202,8 @@ def save_state(st):
 def ch_state(st, ch):
     defaults = {
         "session_id": None, "preamble_done": False,
-        "spool_offset": 0, "processed": 0, "fallbacks": 0, "cancels": 0,
+        "spool_offset": 0, "spool_tombstones": [],
+        "processed": 0, "fallbacks": 0, "cancels": 0,
         "fallback_streak": 0, "last_fb_alert": 0,
         "turns": [], "last_boundary_ts": None,
         "rotate_main": False, "fresh_start": False,
@@ -220,6 +221,25 @@ def ch_state(st, ch):
     for k, v in defaults.items():
         c.setdefault(k, v)
     return c
+
+
+def spool_progress(cs, nbytes=0, tombstones=None):
+    """仅推进已消费的连续前缀，并回收紧邻前缀的删除标记。
+
+    墓碑记录被删行的绝对字节区间；更早的消息开工前保留这些区间，
+    避免重启时跳过仍在排队的消息。旧状态缺少墓碑字段时视为空列表。
+    """
+    offset = cs["spool_offset"] + nbytes
+    ranges = cs.get("spool_tombstones", []) if tombstones is None else tombstones
+    remaining = []
+    for start, end in sorted(ranges):
+        if end <= offset:
+            continue
+        if start <= offset:
+            offset = end
+        else:
+            remaining.append([start, end])
+    return {"spool_offset": offset, "spool_tombstones": remaining}
 
 
 def write_status(extra, active=None):
@@ -974,6 +994,32 @@ class ChannelWorker(threading.Thread):
             c = ch_state(st, self.ch)
             c.update(kw)
             save_state(st)
+
+    def _discard_queued(self, msgids, count_cancel=False, **state_updates):
+        """先持久化删除区间，再从内存队列移除对应行。
+
+        管理指令偏移、取消计数与删除区间同次提交，保证重启后不会
+        消费了删除指令却丢失被删行记录。
+        """
+        cs = self.cs()
+        ranges = list(cs.get("spool_tombstones", []))
+        position = cs["spool_offset"]
+        keep, removed = [], []
+        for row, nbytes in self.queue:
+            position = spool_progress(
+                {"spool_offset": position, "spool_tombstones": ranges}
+            )["spool_offset"]
+            end = position + nbytes
+            if row.get("msgid") in msgids:
+                removed.append([position, end])
+            else:
+                keep.append((row, nbytes))
+            position = end
+        if count_cancel:
+            state_updates["cancels"] = cs["cancels"] + len(removed)
+        state_updates.update(spool_progress(cs, tombstones=ranges + removed))
+        self.update_cs(**state_updates)
+        self.queue = keep
 
     def _auth_connect_blocked(self):
         """True while a credential-class failure is in backoff AND the
@@ -1853,11 +1899,17 @@ class ChannelWorker(threading.Thread):
             self.log("topic boundary seen; session rotates on next turn")
         if self.read_offset is None:
             self.read_offset = cs["spool_offset"]
+        row_offset = self.read_offset
+        tombstone_starts = {start for start, _end in cs.get("spool_tombstones", [])}
         with open(spool, "rb") as f:
             f.seek(self.read_offset)
             raw_lines = f.readlines()
             self.read_offset = f.tell()
         for raw in raw_lines:
+            start = row_offset
+            row_offset += len(raw)
+            if start in tombstone_starts:
+                continue
             s = raw.strip()
             if not s:
                 continue
@@ -2001,30 +2053,11 @@ class ChannelWorker(threading.Thread):
                         drop_ids.update(rec.get("msgids", []))
                     except ValueError:
                         continue
-                if drop_ids and self.queue:
-                    keep = []
-                    for row, nbytes in self.queue:
-                        if row.get("msgid") in drop_ids:
-                            self.log(f"queue admin drop msgid={row['msgid']}")
-                            cur = self.cs()
-                            self.update_cs(
-                                spool_offset=cur["spool_offset"] + nbytes)
-                            continue
-                        keep.append((row, nbytes))
-                    self.queue = keep
-                self.update_cs(admin_offset=new_admin_off)
+                self._discard_queued(drop_ids, admin_offset=new_admin_off)
         if self.queue:
             cids = cancelled_ids(ch)
-            keep = []
-            for row, nbytes in self.queue:
-                if row.get("msgid") in cids:
-                    self.log(f"skip cancelled queued msgid={row['msgid']}")
-                    cur = self.cs()
-                    self.update_cs(cancels=cur["cancels"] + 1,
-                                   spool_offset=cur["spool_offset"] + nbytes)
-                    continue
-                keep.append((row, nbytes))
-            self.queue = keep
+            if any(row.get("msgid") in cids for row, _n in self.queue):
+                self._discard_queued(cids, count_cancel=True)
         cs = self.cs()
         if self.queue and cs["turns"] and self.ch in MERGE_CHANNELS:
             self._merge_into_active()
@@ -2058,7 +2091,7 @@ class ChannelWorker(threading.Thread):
         cs = self.cs()
         streak = cs.get("fallback_streak", 0) + 1
         kw = {"fallbacks": cs["fallbacks"] + 1,
-              "spool_offset": cs["spool_offset"] + nbytes,
+              **spool_progress(cs, nbytes),
               "fallback_streak": streak}
         alert = streak >= 3 and \
             time.time() - cs.get("last_fb_alert", 0) >= 3600
@@ -2177,7 +2210,7 @@ class ChannelWorker(threading.Thread):
             self.queue.pop(0)
             ids.append(row["msgid"])
             cur = self.cs()
-            self.update_cs(spool_offset=cur["spool_offset"] + nbytes)
+            self.update_cs(**spool_progress(cur, nbytes))
             self.log(f"merged msgid={row['msgid']} into turn "
                      f"msgid={turn['msgid']}")
             merged = True
@@ -2229,8 +2262,7 @@ class ChannelWorker(threading.Thread):
         self.queue.pop(0)
         cs = self.cs()
         turns = list(cs["turns"]) + [turn]
-        self.update_cs(turns=turns,
-                       spool_offset=cs["spool_offset"] + nbytes)
+        self.update_cs(turns=turns, **spool_progress(cs, nbytes))
 
 
 def cmd_daemon():
