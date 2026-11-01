@@ -239,6 +239,17 @@ def check_bridge_item(gateway, label, key):
     def wrapped(path, default=None):
         if str(path).endswith("native-bridge/status.json"):
             return planted["body"]
+        if str(path).endswith("native-bridge/state.json"):
+            # 2026-11-01 修复：之前只植入 status.json，state.json
+            # 仍读生产文件，生产 weixin 的 reconnect_failures=1
+            # 会让 live 项报“连接连续失败 1 次”而非“连接未验证”，
+            # 测试结果随生产状态漂移。植入干净的渠道状态，
+            # 使三项只取决于植入的心跳/mode，不依赖生产。
+            return {"channels": {key: {
+                "turns": [], "recovery_queue": [], "spool_offset": 0,
+                "submission_pending": None, "reconnect_exhausted": False,
+                "reconnect_failures": planted.get("failures", 0),
+            }}}
         return orig(path, default)
 
     planted = {"body": {}}
@@ -251,6 +262,11 @@ def check_bridge_item(gateway, label, key):
         live = bridge_line(gateway.slash_run_check("测试", state, hook))
         planted["body"] = {"ts": now - 120, "mode": {key: "live"}}
         stale = bridge_line(gateway.slash_run_check("测试", state, hook))
+        # 隔离修复不能掩盖真实逻辑：植入 failures=2 时，
+        # /check 仍应报连续失败，而不是被改成“连接未验证”。
+        planted["failures"] = 2
+        planted["body"] = {"ts": now, "mode": {key: "live"}}
+        failing = bridge_line(gateway.slash_run_check("测试", state, hook))
     finally:
         gateway._read_json_file = orig
     check(f"{label} shadow bridge is not a pass",
@@ -259,6 +275,8 @@ def check_bridge_item(gateway, label, key):
           live.startswith("✗") and "live" in live and "连接未验证" in live)
     check(f"{label} stale bridge heartbeat fails",
           stale.startswith("✗") and "无心跳" in stale)
+    check(f"{label} live bridge with failures still reports them",
+          failing.startswith("✗") and "连接连续失败 2 次" in failing)
 
 
 async def check_commands(gateway, dispatch, label):
