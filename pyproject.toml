@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "muse-mobile-channels"
+version = "0.1.0"
+description = "Local task core and WeChat/WeCom adapters for Muse"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.optional-dependencies]
+weixin = ["httpx==0.28.1", "cryptography==46.0.3", "qrcode==8.2", "pillow==11.3.0"]
+wecom = ["httpx==0.28.1", "websockets==17.1", "cryptography==46.0.3"]
+dev = ["httpx==0.28.1", "websockets==17.1", "cryptography==46.0.3", "qrcode==8.2", "pillow==11.3.0"]
+
+[project.scripts]
+muse-channels = "mobile_channels.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["mobile_channels*"]

@@ -28,6 +28,10 @@
 # messages are declared orphaned and handed to the next wake (payload
 # key "orphaned"), or re-woken on their own if nobody new is waiting.
 set -euo pipefail
+# A coordinated core cutover disables this legacy scheduler under a lease.
+if [[ -n "${MUSE_CHANNEL_MODES:-}" && "${MUSE_HOOK_MODE_GUARDED:-}" != "1" ]]; then
+  exec python3 -m mobile_channels.modes weixin "$0" "$@"
+fi
 source "$HATCH_HOOK_RUNTIME"
 
 # --- channel self-heal, method-1 primary trigger (2026-10-11) ---

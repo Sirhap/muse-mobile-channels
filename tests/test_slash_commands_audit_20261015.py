@@ -225,7 +225,7 @@ def bridge_line(text):
 
 
 def check_bridge_item(gateway, label, key):
-    """Shadow with a fresh heartbeat is a failed check; live passes.
+    """Shadow and unverified live heartbeats both fail a connectivity check.
 
     The channel key is taken from the hook directory name
     (``weixin-bot`` / ``wecom-bot``), same as the gateway.
@@ -255,8 +255,8 @@ def check_bridge_item(gateway, label, key):
         gateway._read_json_file = orig
     check(f"{label} shadow bridge is not a pass",
           shadow.startswith("✗") and "shadow" in shadow)
-    check(f"{label} live bridge passes",
-          live.startswith("✓") and "live" in live)
+    check(f"{label} live bridge heartbeat leaves connection unverified",
+          live.startswith("✗") and "live" in live and "连接未验证" in live)
     check(f"{label} stale bridge heartbeat fails",
           stale.startswith("✗") and "无心跳" in stale)
 

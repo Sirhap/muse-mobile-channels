@@ -8,13 +8,22 @@ decisions.jsonl (written by the gateways' /a /b /c and aliases) and
 submits them via egress.approval.decide.
 Credentials: ~/.config/native-bridge/ only. Test mode:
 APPROVAL_RELAY_TEST=1 redirects outbox writes to ./shadow/."""
+import fcntl
 import json, os, sys, time, uuid
-sys.path.insert(0, "/home/hatch/workspace/native-probe")
-from gw2 import GW2
-from muse_cli.gateway import load_cookies, GatewayError
+from pathlib import Path
+from contextlib import nullcontext
+
+_ROOT = str(Path(__file__).resolve().parents[1])
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+from channel_common import exclusive_file_lock
+from mobile_channels.approvals import decision_allowed
+from mobile_channels.modes import lease_from_env, ModeError
+
+GW2 = None
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-CONF = "/home/hatch/.config/native-bridge"  # units run with $HOME unset; pin it
+CONF = os.environ.get("NATIVE_BRIDGE_CREDENTIALS", str(Path.home() / ".config/native-bridge"))
 STATE_F = os.path.join(BASE, "state.json")
 STATUS_F = os.path.join(BASE, "status.json")
 DECISIONS_F = os.path.join(BASE, "decisions.jsonl")
@@ -40,16 +49,41 @@ def log(*a):
 
 
 def load_state():
+    """Load durable decisions; corrupt existing state must stop processing."""
     try:
-        return json.load(open(STATE_F))
-    except (OSError, ValueError):
+        with open(STATE_F, encoding="utf-8") as source:
+            state = json.load(source)
+    except FileNotFoundError:
         return {"next_num": 1, "items": {}}
+    if not isinstance(state, dict) or not isinstance(state.get("items"), dict):
+        raise ValueError("invalid approval relay state")
+    return state
+
+
+def _atomic_text(path, text):
+    """Commit private state with file and directory durability barriers."""
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(destination.name + ".tmp." + uuid.uuid4().hex)
+    try:
+        with temporary.open("x", encoding="utf-8") as target:
+            os.fchmod(target.fileno(), 0o600)
+            target.write(text)
+            target.flush()
+            os.fsync(target.fileno())
+        os.replace(temporary, destination)
+        descriptor = os.open(destination.parent, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def save_state(st):
-    tmp = STATE_F + ".tmp"
-    json.dump(st, open(tmp, "w"), ensure_ascii=False)
-    os.replace(tmp, STATE_F)
+    """Persist approval attempts before any external decision request."""
+    _atomic_text(STATE_F, json.dumps(st, ensure_ascii=False))
 
 
 def _normalize_channel(name):
@@ -123,6 +157,9 @@ def resolve_notify_channels(item=None, explicit=None):
     stable weixin-then-wecom order. Logs notify_reason.
     """
     both = list(CHANNEL_ORDER)
+    scope = item.get("decision_scope") if isinstance(item, dict) else None
+    if isinstance(scope, dict) and _normalize_channel(scope.get("channel")) and scope.get("chat_id"):
+        return [_normalize_channel(scope["channel"])]
 
     # P0 — explicit source on the approval item (or future upstream).
     if isinstance(item, dict):
@@ -176,7 +213,14 @@ def notify(text, tag, approval=None, channels=None, item=None):
     各通道写入独立处理，单渠道部署也能收到通知。全部目标写入
     失败时抛出 OSError，调用方保留未通知状态，等待下一轮重试。
     """
-    if channels is not None:
+    scope = item.get("decision_scope") if isinstance(item, dict) else None
+    if scope is not None:
+        # A notification preference can never widen an approval's private route.
+        scoped_channel = _normalize_channel(scope.get("channel")) if isinstance(scope, dict) else None
+        if scoped_channel is None or not isinstance(scope.get("chat_id"), str) or not scope["chat_id"]:
+            raise OSError("approval scope has no valid notification route")
+        targets = [scoped_channel]
+    elif channels is not None:
         targets = _ordered_unique(
             [c for c in channels if _normalize_channel(c)])
         if not targets:
@@ -198,17 +242,31 @@ def notify(text, tag, approval=None, channels=None, item=None):
         else:
             row["mode"] = "send"
         row.update(cfg["row"])
+        scope = item.get("decision_scope") if isinstance(item, dict) else None
+        if isinstance(scope, dict) and scope.get("channel") == ch and scope.get("chat_id"):
+            if ch == "wecom":
+                row.update(chatid=scope["chat_id"], chat_type=2 if scope.get("chat_type") == "group" else 1)
+            else:
+                row["to_user_id"] = scope["chat_id"]
         path = cfg["outbox"]
+        lease = None
         try:
+            lease = lease_from_env(ch, "legacy")
             if TEST:
                 path = os.path.join(BASE, "shadow", f"{ch}-outbox.jsonl")
                 os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+            with open(path, "a", encoding="utf-8") as output:
+                fcntl.flock(output, fcntl.LOCK_EX)
+                output.write(json.dumps(row, ensure_ascii=False) + "\n")
+                output.flush()
+                os.fsync(output.fileno())
             queued = True
-        except OSError as exc:
+        except (OSError, ModeError) as exc:
             last_error = exc
-            log("notify write failed", ch, type(exc).__name__)
+            log("notify write disabled or failed", ch, type(exc).__name__)
+        finally:
+            if lease is not None:
+                lease.close()
     if not queued:
         raise OSError("approval notice could not be queued to any selected channel") from last_error
 
@@ -328,33 +386,24 @@ RECENT_ALWAYS_WINDOW_SECS = 600
 
 
 def find_recent_always_primary(st, num, item):
-    """Num of a recently allow_always-decided item in the same group."""
-    key = effective_group_key(item)
-    if not key:
-        return None
-    now = int(time.time())
-    for n, other in sorted(st["items"].items(), key=lambda kv: int(kv[0])):
-        if n == num or not isinstance(other, dict):
-            continue
-        if other.get("status") != "decided:allow_always":
-            continue
-        if effective_group_key(other) != key:
-            continue
-        decided_at = other.get("decided_at") or 0
-        if decided_at and now - int(decided_at) <= RECENT_ALWAYS_WINDOW_SECS:
-            return n
+    """Do not synthesize decisions for new approval IDs from matching text.
+
+    Platform allow-always policy is enforced by the platform itself. Local
+    matching of command/host does not prove authorization for another request.
+    """
     return None
 
 
 def find_group_primary(st, num, item):
     """Num of the already-notified pending item this one groups under."""
     key = effective_group_key(item)
-    if not key:
+    scope = item.get("decision_scope")
+    if not key or not scope:
         return None
     for n, other in sorted(st["items"].items(), key=lambda kv: int(kv[0])):
         if n == num or not isinstance(other, dict):
             continue
-        if effective_group_key(other) != key:
+        if effective_group_key(other) != key or other.get("decision_scope") != scope:
             continue
         if other.get("status") != "pending" or other.get("grouped_with"):
             continue
@@ -486,8 +535,18 @@ def has_content(who, what):
 
 
 def connect():
+    """Load optional platform dependencies only when an RPC client is needed."""
+    global GW2
+    if GW2 is None:
+        probe = str(Path(__file__).resolve().parents[1] / "native-probe")
+        if probe not in sys.path:
+            sys.path.insert(0, probe)
+        from gw2 import GW2 as gateway_class
+        GW2 = gateway_class
+    from muse_cli.gateway import load_cookies
     cookies = load_cookies(os.path.join(CONF, "cookies.txt"))
-    vm_id = open(os.path.join(CONF, "vm_id.txt")).read().strip()
+    with open(os.path.join(CONF, "vm_id.txt"), encoding="utf-8") as source:
+        vm_id = source.read().strip()
     return GW2(cookies=cookies, vm_id=vm_id)
 
 
@@ -513,6 +572,9 @@ def poll_once(gw, st):
                 "notified": False, "group_key": group_key(record),
             }
         item = st["items"][num]
+        scope = record.get("decision_scope")
+        if isinstance(scope, dict) and not item.get("decision_scope"):
+            item["decision_scope"] = scope
         if not item.get("group_key"):
             item["group_key"] = group_key(record)
         if "notified" not in item:
@@ -544,38 +606,18 @@ def poll_once(gw, st):
                 who, what = summarize(enriched)
             if has_content(who, what):
                 item["who"], item["what"] = who, what
+                scope = source.get("decision_scope")
+                if isinstance(scope, dict) and not item.get("decision_scope"):
+                    item["decision_scope"] = scope
                 if not item.get("group_key"):
                     item["group_key"] = (group_key(source)
                                          or group_key_from_what(what))
-                always_from = find_recent_always_primary(st, num, item)
-                auto_done = False
-                if always_from is not None:
-                    try:
-                        gw.call_json(
-                            "egress.approval.decide",
-                            path_params={"approval_id": aid},
-                            body={"decision": "allow_always"}, timeout=20)
-                        item["status"] = "decided:allow_always"
-                        item["decided_at"] = int(time.time())
-                        item["auto_decided_from"] = always_from
-                        auto_done = True
-                        log("auto-decided pending", num, "from",
-                            always_from, aid[:12])
-                    except Exception as exc:
-                        log("auto-decide failed", num,
-                            type(exc).__name__, str(exc)[:100])
-                primary = (None if auto_done
-                           else find_group_primary(st, num, item))
-                if auto_done:
-                    item["notified"] = True
-                elif primary is not None:
-                    # Same command + target as an already-notified
-                    # pending item: do not push another card/text.
-                    # The primary's decision is applied to this item
-                    # too (see consume_decisions).
+                # Matching text is not authorization to decide another ID.
+                primary = find_group_primary(st, num, item)
+                if primary is not None:
                     item["grouped_with"] = primary
                     item["notified"] = True
-                    log("grouped pending", num, "->", primary, aid[:12])
+                    log("grouped scoped pending", num, "->", primary)
                 else:
                     send_approval_notice(num, item)
                     item["notified"] = True
@@ -613,94 +655,106 @@ def poll_once(gw, st):
 
 
 def consume_decisions(gw, st):
-    try:
-        off = int(open(OFFSET_F).read().strip())
-    except (OSError, ValueError):
-        off = 0
-    try:
-        with open(DECISIONS_F, encoding="utf-8") as f:
-            f.seek(off)
-            lines = f.readlines()
-            new_off = f.tell()
-    except OSError:
+    """Consume complete rows; an external decision is never automatically replayed.
+
+    Every decision carries the real inbound operator and route. Explicit source
+    scope or configured administrators authorize it; guessed numbers do not.
+    """
+    with exclusive_file_lock(Path(DECISIONS_F).with_name("decisions.lock")):
+        durable = load_state()
+        for number, previous in durable["items"].items():
+            if previous.get("status") == "decision_unknown" or str(previous.get("status", "")).startswith("decided:"):
+                st["items"][number] = previous
+        try:
+            with open(OFFSET_F, encoding="utf-8") as source:
+                off = int(source.read().strip())
+        except FileNotFoundError:
+            off = 0
+        if off < 0:
+            raise ValueError("negative approval decision offset")
+        try:
+            with open(DECISIONS_F, "rb") as source:
+                source.seek(off)
+                data = source.read()
+        except FileNotFoundError:
+            return
+        new_off = off
+        for raw in data.splitlines(keepends=True):
+            if not raw.endswith(b"\n"):
+                break
+            next_off = new_off + len(raw)
+            try:
+                row = json.loads(raw)
+            except (ValueError, UnicodeError):
+                log("invalid decision row retained at offset", new_off)
+                break
+            if not isinstance(row, dict):
+                log("invalid decision shape retained at offset", new_off)
+                break
+            channel = str(row.get("channel", "")).removesuffix("-card")
+            if channel not in CHANNEL_ORDER:
+                log("approval decision rejected: unknown channel")
+                new_off = next_off
+                continue
+            try:
+                lease = lease_from_env(channel, "legacy")
+                with lease if lease is not None else nullcontext():
+                    _consume_decision_row(gw, st, row)
+            except ModeError:
+                log("legacy approval decision disabled for core channel", channel)
+            new_off = next_off
+        save_state(st)
+        _atomic_text(OFFSET_F, str(new_off))
+
+
+def _consume_decision_row(gw, st, row):
+    """Authorize and commit one decision while its legacy mode lease is held."""
+    num = str(row.get("num", ""))
+    decision = row.get("decision")
+    item = st["items"].get(num)
+    if item is None or not decision_allowed(item, row, time.time()):
+        log("approval decision rejected: unauthorized, expired, or invalid", num)
+        try:
+            notify(f"【审批 #{num}】未提交：来源、操作者或有效期无法验证，请在原会话或 Muse 应用里处理。",
+                   f"rejected{num}", channels=[str(row.get("channel", "")).removesuffix("-card")])
+        except OSError:
+            log("approval rejection notification could not be queued", num)
         return
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            row = json.loads(line)
-        except ValueError:
-            continue
-        num = str(row.get("num", ""))
-        decision = row.get("decision")
-        it = st["items"].get(num)
-        if not it or decision not in DECISION_LABEL:
-            notify(f"【审批 #{num}】没找到这条待审批，无法提交。发 /审批 看当前列表。",
-                   f"bad{num}")
-            continue
-        if it.get("status") != "pending":
-            # Duplicate decision (same approval submitted on two
-            # channels, or text first and a late card after): the
-            # first decision already produced its done notice, so a
-            # second push on BOTH channels is pure noise — live #8,
-            # 2026-10-09, where the dup surfaced as "提交失败" to the
-            # user. Log it and move on.
-            log("duplicate decision ignored", num, it.get("status"))
-            continue
-        try:
-            gw.call_json("egress.approval.decide",
-                         path_params={"approval_id": it["approval_id"]},
-                         body={"decision": decision}, timeout=20)
-            it["status"] = "decided:" + decision
-            it["decided_at"] = int(time.time())
-            # Grouped siblings (same command + target, never
-            # notified) get the same decision: they are the same
-            # request in practice, and leaving them pending would
-            # keep their operations blocked until expiry.
-            grouped_done = 0
-            for gnum, git in list(st["items"].items()):
-                if gnum == num or not isinstance(git, dict):
-                    continue
-                if git.get("grouped_with") != num:
-                    continue
-                if git.get("status") != "pending":
-                    continue
-                try:
-                    gw.call_json(
-                        "egress.approval.decide",
-                        path_params={"approval_id": git["approval_id"]},
-                        body={"decision": decision}, timeout=20)
-                    git["status"] = "decided:" + decision
-                    git["decided_at"] = int(time.time())
-                    git.pop("grouped_with", None)
-                    grouped_done += 1
-                except Exception as exc:
-                    # Leave it pending and ungrouped: the next poll
-                    # promotes it into its own notice.
-                    git.pop("grouped_with", None)
-                    git["notified"] = False
-                    log("grouped decide failed", gnum,
-                        type(exc).__name__, str(exc)[:100])
-            suffix = (f"同类合并的另 {grouped_done} 条已一并处理。"
-                      if grouped_done else "")
-            notify(f"【审批 #{num}】{DECISION_LABEL[decision]}：{it.get('who', '')}。"
-                   f"{suffix}被拦住的操作会继续。", f"done{num}")
-            log("decided", num, decision, "grouped", grouped_done)
-        except GatewayError as e:
-            notify(f"【审批 #{num}】提交失败：服务端 {e.status} {str(e.payload)[:120]}。"
-                   f"可稍后重发决定，或在 Muse 应用里处理。", f"err{num}")
-            log("decide failed", num, e.status, str(e.payload)[:120])
-        except Exception as e:
-            notify(f"【审批 #{num}】提交出错：{type(e).__name__} {str(e)[:100]}",
-                   f"err{num}")
-            log("decide error", num, type(e).__name__, str(e)[:100])
-    with open(OFFSET_F, "w") as f:
-        f.write(str(new_off))
+    if item.get("status") != "pending":
+        log("duplicate or uncertain decision ignored", num, item.get("status"))
+        return
+    item["status"] = "decision_unknown"
+    item["decision_attempt"] = {"id": uuid.uuid4().hex, "decision": decision,
+        "operator_id": row["operator_id"], "chat_id": row["chat_id"],
+        "channel": str(row["channel"]).removesuffix("-card"), "started_at": time.time()}
     save_state(st)
+    try:
+        gw.call_json("egress.approval.decide", path_params={"approval_id": item["approval_id"]},
+                     body={"decision": decision}, timeout=20)
+    except Exception as error:
+        log("approval decision result unknown", num, type(error).__name__)
+        message = f"【审批 #{num}】提交结果尚未确认，不会自动重复提交；请在 Muse 应用中核查原审批。"
+    else:
+        item["status"] = "decided:" + decision
+        item["decided_at"] = int(time.time())
+        save_state(st)
+        message = f"【审批 #{num}】{DECISION_LABEL[decision]}，平台已确认决定；操作最终结果请以执行反馈为准。"
+    # Each approval ID requires its own authorization/attempt. Grouped
+    # siblings will be promoted to individual notices by poll_once.
+    try:
+        notify(message, f"decision{num}", channels=[str(row["channel"]).removesuffix("-card")], item=item)
+    except OSError:
+        log("decision status notification could not be queued", num)
 
 
 def cycle():
+    """Serialize the complete poll/decision cycle across supervised processes."""
+    with exclusive_file_lock(Path(BASE) / "relay-runtime.lock"):
+        _cycle_locked()
+
+
+def _cycle_locked():
+    """Run one cycle while holding the relay process lock."""
     st = load_state()
     gw = None
     try:
@@ -714,8 +768,7 @@ def cycle():
     finally:
         if gw is not None:
             gw.close()
-    json.dump({"ts": int(time.time()), "pending": n, "last_error": err},
-              open(STATUS_F, "w"))
+    _atomic_text(STATUS_F, json.dumps({"ts": int(time.time()), "pending": n, "last_error": err}))
 
 
 def main():

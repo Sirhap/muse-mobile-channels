@@ -142,6 +142,10 @@ SEND_FILE_UPLOAD_REROUTE_AFTER_FAILURES = 3
 UPLOAD_STAGE_MARKER = "upload-stage"
 
 
+class MalformedInboundMessage(ValueError):
+    """An iLink payload violates a validated message shape before execution."""
+
+
 class UploadStageError(RuntimeError):
     """A file delivery failed during the CDN upload leg (before
     sendmessage). Raised by _deliver_file so _note_failure can
@@ -889,7 +893,7 @@ SLASH_HELP_TEXT = """【命令表】在聊天里直接发，网关当场回复�
 /queue 队列明细（冷通道和原生桥都列；两边都空才说空闲）
 /queue clear 清掉排队中未开工的消息（桥和冷通道一起清，正在跑的不动）
 /queue drop N 只删冷通道排队第 N 条；/queue drop 桥N 或 bN 删原生桥排队第 N 条
-/stop 取消正在跑的任务（冷通道在跑、后台续跑、原生桥进行中；还没开工的排队不动）。冷通道在下一次进度检查时停下并回一句已取消；原生桥回合下一轮直接取消，不再另发确认
+/stop 登记正在运行任务的取消请求（含后台续跑；未开工的排队不动）。助手在下一次进度检查时处理，原生桥在下一轮处理；登记成功不代表当前操作已经结束
 /subagent <任务> 登记副助手后台执行（别名 /副助手），名额满了会先排队；/subagent list 查、/subagent stop <编号> 停
 /new 记下换会话边界（别名 /新会话）：此刻不建新会话。下一条走原生桥的文字才会新建，这之前的对话不再带入
 /check 一次性自检，跑完即结束（别名 /自检）。原生桥要心跳新鲜且该渠道为 live 才算通过
@@ -916,9 +920,9 @@ def slash_help_text():
 
 # Receipts whose wording is the contract. Both gateways keep these
 # strings identical; the slash audit test compares them.
-SLASH_NEW_ACK = "已开启新会话。"
+SLASH_NEW_ACK = "已记下换会话请求。下一条进入原生桥的文字会开启新会话。"
 SLASH_NEW_FAIL_ACK = (
-    "换会话没记下：边界文件暂时写不了，请稍后再试。当前会话没有变。"
+    "换会话请求未保存，请稍后再试。当前会话没有变。"
 )
 
 
@@ -1051,20 +1055,29 @@ def slash_run_check(chan_label, state_dir, hook_state_dir):
 
     try:
         bkey = "weixin" if "weixin" in hook_state_dir.name else "wecom"
-        bmode = _read_json_file(
-            Path("/home/hatch/workspace/native-bridge/status.json"), {}) or {}
+        bridge_status_path = Path("/home/hatch/workspace/native-bridge/status.json")
+        bmode = _read_json_file(bridge_status_path, {}) or {}
+        bridge_state = _read_json_file(bridge_status_path.with_name("state.json"), {}) or {}
+        channel_state = (bridge_state.get("channels") or {}).get(bkey) or {}
         bts = bmode.get("ts")
-        balive = isinstance(bts, (int, float)) and (now - float(bts) <= 30)
+        balive = isinstance(bts, (int, float)) and (0 <= now - float(bts) <= 30)
         blive = (bmode.get("mode", {}) or {}).get(bkey) == "live"
-        if balive and blive:
-            bridge_detail = "运行中（live）"
-        elif balive:
-            bridge_detail = "运行中（shadow，未接管）"
-        else:
+        failures = channel_state.get("reconnect_failures") or 0
+        if channel_state.get("submission_pending"):
+            bridge_detail = "任务提交结果待核查，已暂停新任务；请由管理员核实原执行，勿重复提交"
+        elif channel_state.get("reconnect_exhausted"):
+            bridge_detail = f"自动重连已暂停（连续失败 {failures} 次），需检查凭证或由管理员恢复"
+        elif not balive:
             bridge_detail = "无心跳，桥可能未运行"
-        # A fresh heartbeat in shadow is not "all passed": that mode
-        # is not taking this channel's turns.
-        items.append(("原生桥", bool(balive and blive), bridge_detail))
+        elif not blive:
+            bridge_detail = "桥进程在线（shadow，未接管）"
+        elif failures:
+            bridge_detail = f"桥进程在线（live），连接连续失败 {failures} 次，尚未恢复"
+        else:
+            bridge_detail = "桥进程在线（live），连接未验证"
+        # The process heartbeat and live routing mode do not verify the
+        # platform transport. An actual connectivity probe is still required.
+        items.append(("原生桥", False, bridge_detail))
     except Exception:
         items.append(("原生桥", False, "状态不可读"))
 
@@ -1223,9 +1236,9 @@ def slash_stop_ack(cold_n, bridge_n, ok, fail):
         return f"取消没有登记上（{fail} 条失败），请稍后再试。"
     parts = [f"已登记取消 {ok} 条正在跑的消息。"]
     if cold_n:
-        parts.append("冷通道上的会在下一次进度检查时停下，并回你一句已取消。")
+        parts.append("助手会在下一次进度检查时处理取消，并回复确认。")
     if bridge_n:
-        parts.append("原生桥上的回合会在下一轮直接取消，不再另发一句确认。")
+        parts.append("原生桥会在下一轮处理取消请求，不再另发一句确认；当前操作可能尚未结束。")
     parts.append("排队中还没开工的不动。")
     text = "".join(parts)
     if fail:
@@ -1426,8 +1439,11 @@ def parse_approval_slash(name, arg):
     return (num, "allow_once")
 
 
-def slash_approvals_text():
-    items = _approval_items()
+def slash_approvals_text(operator_id="", chat_id=""):
+    """List only approvals the authenticated sender may inspect and decide."""
+    from mobile_channels.approvals import authorized_operator
+    items = {num: item for num, item in _approval_items().items()
+             if authorized_operator(item, "weixin", chat_id, operator_id)}
     pend = [(n, it) for n, it in
             sorted(items.items(), key=lambda kv: int(kv[0]))
             if it.get("status") == "pending"]
@@ -1474,11 +1490,19 @@ def _approval_pending_submission(num):
     return None
 
 
-def slash_approval_decide_ack(num, decision, channel):
+def slash_approval_decide_ack(num, decision, channel, operator_id="", chat_id=""):
+    """Record an authorized decision with its trusted inbound identity."""
+    from mobile_channels.approvals import decision_allowed
     items = _approval_items()
     it = items.get(str(num))
     if it is None:
         return f"没有找到审批 #{num}。发 /审批 看当前列表。"
+    decision_row = {"num": str(num), "decision": decision, "channel": channel,
+                    "operator_id": operator_id, "chat_id": chat_id, "ts": time.time()}
+    if not decision_allowed(it, decision_row, time.time()):
+        return "无法提交：操作者、会话或审批有效期未通过验证，请在原审批会话或 Muse 应用里处理。"
+    if it.get("status") == "decision_unknown":
+        return f"审批 #{num} 的提交结果待核查，请勿重复提交。"
     if it.get("status") != "pending":
         return f"审批 #{num} 已经处理过了。"
     label = {"allow_once": "批准（仅这次）", "allow_always": "批准（永久）",
@@ -1496,12 +1520,11 @@ def slash_approval_decide_ack(num, decision, channel):
                         f"等执行结果就行，不用重复提交。")
             wrote = _append_jsonl_file(
                 APPROVAL_RELAY_DIR / "decisions.jsonl",
-                {"num": str(num), "decision": decision,
-                 "channel": channel, "ts": time.time()})
+                decision_row)
     except OSError:
         wrote = False
     if wrote:
-        return f"已提交{label} #{num}：{it.get('who', '')}。执行结果马上发你。"
+        return f"已提交{label} #{num}：{it.get('who', '')}。审批中转确认后会通知你；当前尚未确认生效。"
     return "提交失败：暂时写不了审批指令，请稍后再试。"
 
 
@@ -1795,6 +1818,8 @@ class Gateway:
         self.sync_buf = ""
         self._lock_fd = None
         self._acquire_instance_lock()
+        from mobile_channels.gateway import GatewayBinding
+        self._core_binding = GatewayBinding("weixin")
         self._load_persisted()
 
     # ---------- persistence ----------
@@ -1855,6 +1880,7 @@ class Gateway:
         """Load dedupe ids and session files without crashing startup."""
         self.seen_msgids.update(self._msgids_in_jsonl(INBOX))
         self.seen_msgids.update(self._msgids_in_jsonl(SEEN_FILE))
+        self.seen_msgids.update(self._msgids_in_jsonl(QUOTE_SPOOL))
         self.sync_buf = ""
         if SYNC_FILE.exists():
             try:
@@ -1876,6 +1902,7 @@ class Gateway:
                 self.context = {}
 
     def _save_sync(self) -> None:
+        """Persist the acknowledged iLink checkpoint using atomic replacement."""
         self._atomic_write(SYNC_FILE, json.dumps({"buf": self.sync_buf}))
 
     def _mark_seen(self, msgid: str) -> None:
@@ -1891,6 +1918,16 @@ class Gateway:
             append_jsonl_line(SEEN_FILE, {"msgid": str(msgid)})
         except OSError:
             self.seen_msgids.discard(str(msgid))
+
+    def _commit_inbound_seen(self, msgid: str) -> None:
+        """Keep deduplication after the inbox or bridge spool is durable.
+
+        A failed secondary seen marker cannot undo an already committed
+        message. Startup reconstructs this evidence from both queue files.
+        """
+        self._mark_seen(msgid)
+        if msgid:
+            self.seen_msgids.add(str(msgid))
 
     def _route_for(self, msgid: str) -> dict:
         """Reply route from memory, or rebuilt from the inbox tail."""
@@ -2345,8 +2382,8 @@ class Gateway:
         """Handle a slash command. Returns:
         - None: not a command — caller proceeds with the normal flow.
         - "handled": command done, ack sent — caller returns early.
-        Never raises: on an unexpected error it logs and returns None so
-        the message falls back to the ordinary worker flow."""
+        Unexpected failures propagate so the session preserves its checkpoint;
+        a failed command must not fall back to ordinary worker execution."""
         try:
             parsed = parse_slash_command(text)
             if parsed is None:
@@ -2497,14 +2534,14 @@ class Gateway:
                     else:
                         ack = "派发失败：暂时无法登记副助手任务，请稍后再试。"
             elif name == "approvals":
-                ack = slash_approvals_text()
+                ack = slash_approvals_text(str(from_user), str(msg.get("group_id") or from_user))
             elif name in ("approve", "deny") or name in APPROVAL_LETTER_DECISIONS:
                 decided = parse_approval_slash(name, arg)
                 if decided is None:
                     ack = APPROVAL_USAGE
                 else:
                     num, decision = decided
-                    ack = slash_approval_decide_ack(num, decision, "weixin")
+                    ack = slash_approval_decide_ack(num, decision, "weixin", str(from_user), str(msg.get("group_id") or from_user))
             if ack is not None:
                 try:
                     await self._send_slash_ack(client, creds, msg, from_user, ack)
@@ -2515,9 +2552,9 @@ class Gateway:
                     log(f"slash ack send failed (command already handled): {ack_err!r}")
             log(f"slash /{name} handled for {from_user}")
             return "handled"
-        except Exception as e:  # never let a command break the inbound flow
+        except Exception as e:
             log(f"slash dispatch error: {e!r}")
-            return None
+            raise
 
     def _queue_notice(self, from_user, content, prefix):
         """Append one unbound outbox "send" row for a feedback notice.
@@ -2913,6 +2950,8 @@ class Gateway:
                 log(f"feedback watch failed (ignored): {e!r}")
 
     async def handle_inbound(self, client: httpx.AsyncClient, creds: dict, msg: dict) -> None:
+        if not isinstance(msg, dict):
+            raise MalformedInboundMessage("iLink message must be an object")
         owner_id = creds["user_id"]
         if msg.get("message_type") not in (None, 1):
             return  # only user messages
@@ -2929,7 +2968,9 @@ class Gateway:
             msgid = str(raw_msgid)
         else:
             msgid = ""
-        if msgid and msgid in self.seen_msgids:
+        core_binding = getattr(self, "_core_binding", None)
+        core_enabled = core_binding is not None and core_binding.enabled
+        if not core_enabled and msgid and str(msgid) in self.seen_msgids:
             return
         from_user = msg.get("from_user_id", "")
         if not owner_id:
@@ -2950,6 +2991,23 @@ class Gateway:
             resolved = self._resolve_quote(self._find_ref_qid(msg))
             if resolved:
                 text = text.replace("（引用：[消息]）", resolved)
+        core = getattr(self, "_core_binding", None)
+        if core is not None and core.enabled:
+            # The authenticated route is saved before accepting a core task.
+            if msgid:
+                self.context[msgid] = {"from_user_id": from_user,
+                    "group_id": msg.get("group_id", ""),
+                    "context_token": msg.get("context_token", ""),
+                    "client_id": f"muse-{uuid.uuid4().hex}"}
+                self._save_context()
+            core.receive(message_id=msgid, sender_id=from_user,
+                         chat_id=msg.get("group_id") or from_user,
+                         chat_type="group" if msg.get("group_id") else "single",
+                         text=text, context_token=msg.get("context_token", ""),
+                         media=[{"kind": item.get("kind")} for item in media])
+            self.msgs_received += 1
+            self.write_status()
+            return
         if not media:
             # Slash commands: intercepted after allowlist + dedupe,
             # before the inbox write — they never wake a worker.
@@ -2991,8 +3049,7 @@ class Gateway:
                     "/home/hatch/workspace/native-bridge/divert-weixin")):
             try:
                 self.append_jsonl(
-                    Path("/home/hatch/workspace/native-bridge/"
-                         "spool/weixin.jsonl"),
+                    QUOTE_SPOOL,
                     {"msgid": msgid, "text": text,
                      "from_user": from_user,
                      "ts": int(time.time())})
@@ -3011,7 +3068,7 @@ class Gateway:
                 log(f"native divert failed, using inbox: {e}")
         if not diverted:
             self.append_jsonl(INBOX, entry)
-        self._mark_seen(msgid)
+        self._commit_inbound_seen(msgid)
         # Scenario-aware arrival feedback: exactly one immediate
         # notice per message, chosen by queue/burst/media/stop
         # state (see _maybe_arrival_feedback). Never raises; queue
@@ -3622,7 +3679,7 @@ class Gateway:
                         "所以没有投递。需要的话告诉我再发。")
             elif "file not found" in err or "No such file" in err:
                 text = (f"⚠️ 文件「{name}」没能发出：原文件已经不在，"
-                        "这条已停止，没有另发说明。")
+                        "这条消息已停止重试，请重新提供可读取的文件。")
             elif "refusing to send" in err or "allowed directories" in err:
                 text = (f"⚠️ 文件「{name}」没能发出：路径不在允许发送的目录里，"
                         "已拒绝发送，说明文字也没有发出。")
@@ -4269,6 +4326,44 @@ class Gateway:
 
     # ---------- session ----------
 
+    async def _process_update_batch(self, client: httpx.AsyncClient,
+                                    creds: dict, response: dict) -> None:
+        """Commit a poll checkpoint only after every message is accounted for.
+
+        Local I/O, transport and unexpected failures retain the previous
+        checkpoint for replay. Only deterministic payload errors may be
+        quarantined; a failed quarantine write must also stop the batch.
+        Previously persisted messages are deduplicated when replayed.
+        """
+        messages = response.get("msgs") or []
+        if not isinstance(messages, list):
+            raise ValueError("getupdates msgs must be a list")
+        for message in messages:
+            try:
+                await self.handle_inbound(client, creds, message)
+            except MalformedInboundMessage as error:
+                msgid = ""
+                if isinstance(message, dict):
+                    msgid = str(message.get("message_id", "") or message.get("msgid", "") or "")
+                log(f"malformed inbound msgid={msgid or '<unknown>'}: {type(error).__name__}")
+                record = dict(message) if isinstance(message, dict) else {"raw": message}
+                record["error"] = f"{type(error).__name__}: {error}"
+                poison_path = (
+                    POISON_MESSAGES
+                    if POISON_MESSAGES != BASE / "state" / "poison_messages.jsonl"
+                    else STATE / "poison_messages.jsonl"
+                )
+                self.append_jsonl(poison_path, record)
+        new_buf = response.get("get_updates_buf")
+        if new_buf is not None:
+            previous_buf = self.sync_buf
+            self.sync_buf = new_buf
+            try:
+                self._save_sync()
+            except Exception:
+                self.sync_buf = previous_buf
+                raise
+
     async def run_session(self, client: httpx.AsyncClient, creds: dict) -> str:
         # best-effort start notification
         try:
@@ -4281,8 +4376,11 @@ class Gateway:
         self.last_error = ""
         log("session started; long-polling getupdates")
         self.write_status()
-        outbox_task = asyncio.create_task(self.outbox_loop(client, creds))
-        watch_task = asyncio.create_task(self.feedback_watch_loop())
+        core = getattr(self, "_core_binding", None)
+        outbox_task = asyncio.create_task(core.delivery_loop(self, client, creds)
+                                         if core is not None and core.enabled else self.outbox_loop(client, creds))
+        watch_task = asyncio.create_task(core.quiet_feedback()
+                                        if core is not None and core.enabled else self.feedback_watch_loop())
         failures = 0
         try:
             while True:
@@ -4338,36 +4436,7 @@ class Gateway:
                 failures = 0
                 self.reconnect_failures = 0
                 self._stale_hits = 0
-                new_buf = resp.get("get_updates_buf")
-                msgs = resp.get("msgs") or []
-                for msg in msgs:
-                    try:
-                        await self.handle_inbound(client, creds, msg)
-                    except Exception as e:
-                        # Isolate per-message failures so a deterministically
-                        # malformed message cannot wedge the sync cursor and
-                        # block all subsequent inbound traffic. Messages
-                        # written to inbox before a failure remain deduped via
-                        # seen_msgids; poison payloads are quarantined to
-                        # state/poison_messages.jsonl.
-                        msgid = ""
-                        if isinstance(msg, dict):
-                            msgid = str(msg.get("message_id", "") or msg.get("msgid", "") or "")
-                        log(f"handle_inbound failed for msgid={msgid or '<unknown>'}: {e}")
-                        record = dict(msg) if isinstance(msg, dict) else {"raw": msg}
-                        record["error"] = f"{type(e).__name__}: {e}"
-                        poison_path = (
-                            POISON_MESSAGES
-                            if POISON_MESSAGES != BASE / "state" / "poison_messages.jsonl"
-                            else STATE / "poison_messages.jsonl"
-                        )
-                        try:
-                            self.append_jsonl(poison_path, record)
-                        except Exception as qe:
-                            log(f"poison quarantine write failed for msgid={msgid or '<unknown>'}: {qe}")
-                if new_buf is not None:
-                    self.sync_buf = new_buf
-                    self._save_sync()
+                await self._process_update_batch(client, creds, resp)
         finally:
             outbox_task.cancel()
             watch_task.cancel()

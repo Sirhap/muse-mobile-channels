@@ -1096,7 +1096,7 @@ SLASH_HELP_TEXT = """【命令表】在聊天里直接发，网关当场回复�
 /queue 队列明细（冷通道和原生桥都列；两边都空才说空闲）
 /queue clear 清掉排队中未开工的消息（桥和冷通道一起清，正在跑的不动）
 /queue drop N 只删冷通道排队第 N 条；/queue drop 桥N 或 bN 删原生桥排队第 N 条
-/stop 取消正在跑的任务（冷通道在跑、后台续跑、原生桥进行中；还没开工的排队不动）。冷通道在下一次进度检查时停下并回一句已取消；原生桥回合下一轮直接取消，不再另发确认
+/stop 登记正在运行任务的取消请求（含后台续跑；未开工的排队不动）。助手在下一次进度检查时处理，原生桥在下一轮处理；登记成功不代表当前操作已经结束
 /subagent <任务> 登记副助手后台执行（别名 /副助手），名额满了会先排队；/subagent list 查、/subagent stop <编号> 停
 /new 记下换会话边界（别名 /新会话）：此刻不建新会话。下一条走原生桥的文字才会新建，这之前的对话不再带入
 /check 一次性自检，跑完即结束（别名 /自检）。原生桥要心跳新鲜且该渠道为 live 才算通过
@@ -1123,9 +1123,9 @@ def slash_help_text():
 
 # Receipts whose wording is the contract. Both gateways keep these
 # strings identical; the slash audit test compares them.
-SLASH_NEW_ACK = "已开启新会话。"
+SLASH_NEW_ACK = "已记下换会话请求。下一条进入原生桥的文字会开启新会话。"
 SLASH_NEW_FAIL_ACK = (
-    "换会话没记下：边界文件暂时写不了，请稍后再试。当前会话没有变。"
+    "换会话请求未保存，请稍后再试。当前会话没有变。"
 )
 
 
@@ -1269,20 +1269,29 @@ def slash_run_check(chan_label, state_dir, hook_state_dir):
 
     try:
         bkey = "weixin" if "weixin" in hook_state_dir.name else "wecom"
-        bmode = _read_json_file(
-            Path("/home/hatch/workspace/native-bridge/status.json"), {}) or {}
+        bridge_status_path = Path("/home/hatch/workspace/native-bridge/status.json")
+        bmode = _read_json_file(bridge_status_path, {}) or {}
+        bridge_state = _read_json_file(bridge_status_path.with_name("state.json"), {}) or {}
+        channel_state = (bridge_state.get("channels") or {}).get(bkey) or {}
         bts = bmode.get("ts")
-        balive = isinstance(bts, (int, float)) and (now - float(bts) <= 30)
+        balive = isinstance(bts, (int, float)) and (0 <= now - float(bts) <= 30)
         blive = (bmode.get("mode", {}) or {}).get(bkey) == "live"
-        if balive and blive:
-            bridge_detail = "运行中（live）"
-        elif balive:
-            bridge_detail = "运行中（shadow，未接管）"
-        else:
+        failures = channel_state.get("reconnect_failures") or 0
+        if channel_state.get("submission_pending"):
+            bridge_detail = "任务提交结果待核查，已暂停新任务；请由管理员核实原执行，勿重复提交"
+        elif channel_state.get("reconnect_exhausted"):
+            bridge_detail = f"自动重连已暂停（连续失败 {failures} 次），需检查凭证或由管理员恢复"
+        elif not balive:
             bridge_detail = "无心跳，桥可能未运行"
-        # A fresh heartbeat in shadow is not "all passed": that mode
-        # is not taking this channel's turns.
-        items.append(("原生桥", bool(balive and blive), bridge_detail))
+        elif not blive:
+            bridge_detail = "桥进程在线（shadow，未接管）"
+        elif failures:
+            bridge_detail = f"桥进程在线（live），连接连续失败 {failures} 次，尚未恢复"
+        else:
+            bridge_detail = "桥进程在线（live），连接未验证"
+        # The process heartbeat and live routing mode do not verify the
+        # platform transport. An actual connectivity probe is still required.
+        items.append(("原生桥", False, bridge_detail))
     except Exception:
         items.append(("原生桥", False, "状态不可读"))
 
@@ -1441,9 +1450,9 @@ def slash_stop_ack(cold_n, bridge_n, ok, fail):
         return f"取消没有登记上（{fail} 条失败），请稍后再试。"
     parts = [f"已登记取消 {ok} 条正在跑的消息。"]
     if cold_n:
-        parts.append("冷通道上的会在下一次进度检查时停下，并回你一句已取消。")
+        parts.append("助手会在下一次进度检查时处理取消，并回复确认。")
     if bridge_n:
-        parts.append("原生桥上的回合会在下一轮直接取消，不再另发一句确认。")
+        parts.append("原生桥会在下一轮处理取消请求，不再另发一句确认；当前操作可能尚未结束。")
     parts.append("排队中还没开工的不动。")
     text = "".join(parts)
     if fail:
@@ -1640,8 +1649,11 @@ def parse_approval_slash(name, arg):
     return (num, "allow_once")
 
 
-def slash_approvals_text():
-    items = _approval_items()
+def slash_approvals_text(operator_id="", chat_id=""):
+    """List only approvals the authenticated sender may inspect and decide."""
+    from mobile_channels.approvals import authorized_operator
+    items = {num: item for num, item in _approval_items().items()
+             if authorized_operator(item, "wecom", chat_id, operator_id)}
     pend = [(n, it) for n, it in
             sorted(items.items(), key=lambda kv: int(kv[0]))
             if it.get("status") == "pending"]
@@ -1690,11 +1702,19 @@ def _approval_pending_submission(num):
     return None
 
 
-def slash_approval_decide_ack(num, decision, channel):
+def slash_approval_decide_ack(num, decision, channel, operator_id="", chat_id=""):
+    """Record an authorized decision with its trusted inbound identity."""
+    from mobile_channels.approvals import decision_allowed
     items = _approval_items()
     it = items.get(str(num))
     if it is None:
         return f"没有找到审批 #{num}。发 /审批 看当前列表。"
+    decision_row = {"num": str(num), "decision": decision, "channel": channel,
+                    "operator_id": operator_id, "chat_id": chat_id, "ts": time.time()}
+    if not decision_allowed(it, decision_row, time.time()):
+        return "无法提交：操作者、会话或审批有效期未通过验证，请在原审批会话或 Muse 应用里处理。"
+    if it.get("status") == "decision_unknown":
+        return f"审批 #{num} 的提交结果待核查，请勿重复提交。"
     if it.get("status") != "pending":
         return f"审批 #{num} 已经处理过了。"
     label = {"allow_once": "批准（仅这次）", "allow_always": "批准（永久）",
@@ -1712,12 +1732,11 @@ def slash_approval_decide_ack(num, decision, channel):
                         f"等执行结果就行，不用重复提交。")
             wrote = _append_jsonl_file(
                 APPROVAL_RELAY_DIR / "decisions.jsonl",
-                {"num": str(num), "decision": decision,
-                 "channel": channel, "ts": time.time()})
+                decision_row)
     except OSError:
         wrote = False
     if wrote:
-        return f"已提交{label} #{num}：{it.get('who', '')}。执行结果马上发你。"
+        return f"已提交{label} #{num}：{it.get('who', '')}。审批中转确认后会通知你；当前尚未确认生效。"
     return "提交失败：暂时写不了审批指令，请稍后再试。"
 
 
@@ -1742,7 +1761,7 @@ APPROVAL_CARD_TEXT_FALLBACK = (
 )
 
 
-def approval_card_decide(task_id, event_key):
+def approval_card_decide(task_id, event_key, operator_id="", chat_id=""):
     """Decide an approval from a card click.
 
     Returns (card_title, ok) for the card update, or None when the
@@ -1762,20 +1781,26 @@ def approval_card_decide(task_id, event_key):
     # is then not a failure — show the decision that is actually in
     # effect and submit nothing again.
     it = _approval_items().get(num)
+    from mobile_channels.approvals import decision_allowed
+    if it is None or not decision_allowed(it, {"decision": decision, "channel": "wecom",
+                                               "operator_id": operator_id, "chat_id": chat_id}, time.time()):
+        return "无权处理或审批已过期 ❌", False
     if it is not None:
         status = str(it.get("status") or "")
         if status.startswith("decided:"):
             prev = status.split(":", 1)[1]
             if prev in APPROVAL_CARD_LABELS:
                 return APPROVAL_CARD_LABELS[prev], True
+        elif status == "decision_unknown":
+            return "提交结果待核查，勿重复决定", False
         elif status != "pending":
             return "已失效 ❌", False
         prev = _approval_pending_submission(num)
         if prev in APPROVAL_CARD_LABELS:
-            return APPROVAL_CARD_LABELS[prev], True
-    ack = slash_approval_decide_ack(num, decision, "wecom-card")
+            return "决定已登记，等待确认", True
+    ack = slash_approval_decide_ack(num, decision, "wecom-card", operator_id, chat_id)
     if ack.startswith("已提交"):
-        return APPROVAL_CARD_LABELS[decision], True
+        return "决定已登记，等待确认", True
     return "提交失败 ❌", False
 
 
@@ -1896,6 +1921,8 @@ class Gateway:
         self.reconnect_failures = 0
         self._subscribed = False
         self._acquire_instance_lock()
+        from mobile_channels.gateway import GatewayBinding
+        self._core_binding = GatewayBinding("wecom")
         self._load_persisted()
 
     def _acquire_instance_lock(self) -> None:
@@ -2467,7 +2494,7 @@ class Gateway:
         elif isinstance(resp, dict) and resp.get("errcode") not in (None, 0):
             log(f"slash ack send failed: errcode={resp.get('errcode')} err={resp.get('errmsg', '')}")
 
-    async def _slash_dispatch(self, text, chatid, chattype, msgid="", req_id=""):
+    async def _slash_dispatch(self, text, chatid, chattype, msgid="", req_id="", operator_id=""):
         """Handle a slash command. Returns:
         - None: not a command — caller proceeds with the normal flow.
         - "handled": command done — caller returns early.
@@ -2629,14 +2656,14 @@ class Gateway:
                     else:
                         ack = "派发失败：暂时无法登记副助手任务，请稍后再试。"
             elif name == "approvals":
-                ack = slash_approvals_text()
+                ack = slash_approvals_text(operator_id, str(chatid))
             elif name in ("approve", "deny") or name in APPROVAL_LETTER_DECISIONS:
                 decided = parse_approval_slash(name, arg)
                 if decided is None:
                     ack = APPROVAL_USAGE
                 else:
                     num, decision = decided
-                    ack = slash_approval_decide_ack(num, decision, "wecom")
+                    ack = slash_approval_decide_ack(num, decision, "wecom", operator_id, str(chatid))
         except Exception as e:  # a failed command falls back to the worker
             log(f"slash dispatch error: {e!r}")
             return None
@@ -2899,8 +2926,9 @@ class Gateway:
         body = _as_dict(_as_dict(frame).get("body"))
         req_id = _frame_headers(frame).get("req_id", "")
         msgid = body.get("msgid", "")
-        if msgid and str(msgid) in self.seen_msgids:
-            log(f"duplicate msgid {msgid}, skipped")
+        core_binding = getattr(self, "_core_binding", None)
+        core_enabled = core_binding is not None and core_binding.enabled
+        if not core_enabled and msgid and str(msgid) in self.seen_msgids:
             return
         msgtype = body.get("msgtype", "")
         # Parse like the OpenClaw plugin's message-parser: plain text, voice
@@ -2974,10 +3002,18 @@ class Gateway:
         chatid = body.get("chatid") or from_userid
         if not self._sender_allowed(str(from_userid or ""), "message"):
             return
+        core = getattr(self, "_core_binding", None)
+        if core is not None and core.enabled:
+            core.receive(message_id=str(msgid or ""), sender_id=str(from_userid or ""),
+                         chat_id=str(chatid or ""), chat_type=chattype,
+                         text=text, media=[{"kind": item.get("kind")} for item in media])
+            self.msgs_received += 1
+            self.write_status()
+            return
         if msgtype == "text" and not media:
             # Slash commands: intercepted after allowlist + dedupe,
             # before the inbox write — they never wake a worker.
-            slash = await self._slash_dispatch(text, chatid, chattype, msgid, req_id)
+            slash = await self._slash_dispatch(text, chatid, chattype, msgid, req_id, str(from_userid or ""))
             if slash == "handled":
                 self._mark_seen(msgid)
                 self.msgs_received += 1
@@ -3101,6 +3137,11 @@ class Gateway:
         self.write_status()
 
     async def handle_event_callback(self, frame: dict) -> None:
+        core = getattr(self, "_core_binding", None)
+        if core is not None and core.enabled:
+            # Legacy card/session events cannot mutate a different authority.
+            log("legacy event ignored: channel is owned by the core")
+            return
         body = _as_dict(_as_dict(frame).get("body"))
         req_id = _frame_headers(frame).get("req_id", "")
         event = _as_dict(body.get("event"))
@@ -3195,7 +3236,7 @@ class Gateway:
             # Approval cards: the click IS the decision — submit it
             # to the approval relay directly (no agent turn), and let
             # the card update below show the decision itself.
-            appr_result = approval_card_decide(task_id, event_key)
+            appr_result = approval_card_decide(task_id, event_key, str(from_userid or ""), str(body.get("chatid") or card.get("chatid") or from_userid or ""))
             if appr_result is not None:
                 decided = appr_result[0]
             if task_id:
@@ -3607,13 +3648,13 @@ class Gateway:
         name = Path(str(item.get("file_path") or "")).name or "文件"
         if "file not found" in err or "No such file" in err:
             text = (f"⚠️ 文件「{name}」没能发出：原文件已经不在，"
-                    "这条已停止，没有另发说明。")
+                    "这条消息已停止重试，请重新提供可读取的文件。")
         elif "not allowed" in err:
             text = (f"⚠️ 文件「{name}」没能发出：路径不在允许发送的目录里，"
                     "已拒绝发送。")
         elif "Permission denied" in err:
             text = (f"⚠️ 文件「{name}」没能发出：没有权限读取这个文件，"
-                    "这条已停止，没有另发说明。")
+                    "这条消息已停止重试，请重新提供可读取的文件。")
         else:
             text = f"⚠️ 有一条消息没能发出：{err[:160]}"
         await self._notify_file_failure(
@@ -4693,11 +4734,12 @@ class Gateway:
             self.last_error = ""
             log("subscribed OK; long connection established")
             self.write_status()
+            core = getattr(self, "_core_binding", None)
             tasks = [
                 asyncio.create_task(self.reader_loop()),
                 asyncio.create_task(self.heartbeat_loop()),
-                asyncio.create_task(self.outbox_loop()),
-                asyncio.create_task(self.feedback_watch_loop()),
+                asyncio.create_task(core.delivery_loop(self) if core is not None and core.enabled else self.outbox_loop()),
+                asyncio.create_task(core.quiet_feedback() if core is not None and core.enabled else self.feedback_watch_loop()),
             ]
             try:
                 done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)

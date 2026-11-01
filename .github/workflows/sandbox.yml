@@ -1,0 +1,20 @@
+name: Channel sandbox regression
+on:
+  push:
+  pull_request:
+jobs:
+  sandbox:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -e '.[dev]'
+      - run: python tests/run_core_regression.py
+        env:
+          TMPDIR: /tmp
+          PYTHONDONTWRITEBYTECODE: '1'

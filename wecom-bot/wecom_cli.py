@@ -163,6 +163,13 @@ def queue(item: dict) -> str:
 
 
 def main() -> int:
+    """Run a legacy command only while the channel remains in legacy mode."""
+    from mobile_channels.modes import lease_from_env, ModeError
+    try:
+        mode_lease = lease_from_env("wecom", "legacy")
+    except (ModeError, OSError, ValueError, KeyError, TypeError) as error:
+        print(f"legacy command disabled: {error}", file=sys.stderr)
+        return 2
     p = argparse.ArgumentParser(prog="wecom")
     sub = p.add_subparsers(dest="cmd", required=True)
 

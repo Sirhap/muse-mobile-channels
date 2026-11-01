@@ -65,7 +65,21 @@ iLink, WeCom via the official smart-robot long connection.
 收件钩子共用同一份状态目录。
 
 
+## 架构改造与本地工具
+
+新增 `mobile_channels/` 事务核心，提供会话隔离、任务所有权、结果与发件箱原子提交、投递核查及旧状态影子取证。默认仍由原网关、桥和钩子处理实际渠道；显式 core 模式可在沙箱接入实际文本回调与发送，尚未接管生产流量。
+
+使用 Python 3.12+ 安装本地工具：`python -m pip install -e '.[dev]'`。
+运行 `python tests/run_core_regression.py` 验证沙箱回归，或执行
+`python -m mobile_channels --help` 查看 CLI。实现边界、操作方法与后续迁移要求见
+[架构改造实现与验证](docs/core-refactoring-implementation-2026-11-01.md)，整体设计见
+[整体架构方案](docs/project-architecture-refactoring-plan.md)。
+
+实现进展、模式配置、权限变化和恢复命令见 [核心接入与切换记录](docs/core-integration-and-cutover-2026-11-01.md)。其中列明尚未完成的真实平台及兼容验收条件。
+
 ## 凭证（不进仓库）
+
+审批决策现要求显式会话/操作者授权；无来源范围时，需外部配置 `APPROVAL_ADMINS_JSON`，例如 `{"wecom":{"实际聊天ID":["管理员ID"]}}`。没有授权映射会拒绝决策，普通消息白名单不自动授予审批权。配置应保存在仓库外。
 
 本仓库不含任何凭证。两个网关各自从仓库外的 env 文件读凭证：
 

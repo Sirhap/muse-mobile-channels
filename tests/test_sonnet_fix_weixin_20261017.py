@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent.parent
 SBX = Path("/tmp/sonnet-fix-weixin-20261017")
@@ -299,7 +300,7 @@ def test_w3():
             if Path(path) == gw.INBOX:
                 inbox.append(obj)
                 gw.Gateway.append_jsonl(path, obj)
-            elif "spool" in Path(path).parts:
+            elif Path(path) == gw.QUOTE_SPOOL or "spool" in Path(path).parts:
                 # Never write to the production bridge spool from a
                 # test; record the divert instead.
                 diverted.append(obj)
@@ -471,7 +472,7 @@ def test_w7():
             if Path(path) == gw.INBOX:
                 inbox.append(obj)
                 gw.Gateway.append_jsonl(path, obj)
-            elif "spool" in Path(path).parts:
+            elif Path(path) == gw.QUOTE_SPOOL or "spool" in Path(path).parts:
                 # Never write to the production bridge spool from a
                 # test; record the divert instead.
                 diverted.append(obj)
@@ -504,7 +505,10 @@ def test_w7():
             await g.handle_inbound(None, creds, msg(123, "num-a"))
             await g.handle_inbound(None, creds, msg(123, "num-b"))
 
-        asyncio.run(run())
+        actual_exists = gw.os.path.exists
+        with patch.object(gw.os.path, "exists", side_effect=lambda path:
+                          str(path).endswith("/divert-weixin") or actual_exists(path)):
+            asyncio.run(run())
         texts = [row.get("text") for row in inbox]
         dtexts = [row.get("text") for row in diverted]
         check(
@@ -896,11 +900,13 @@ def test_w14():
         relay = gw.APPROVAL_RELAY_DIR
         relay.mkdir(parents=True, exist_ok=True)
         (relay / "state.json").write_text(json.dumps({
-            "items": {"1": {"status": "pending", "who": "bob", "what": "ship"}},
+            "items": {"1": {"status": "pending", "who": "bob", "what": "ship",
+                              "expires_ms": 9999999999999,
+                              "decision_scope": {"channel": "weixin", "chat_id": "sandbox-user", "operator_ids": ["sandbox-user"]}}},
         }), encoding="utf-8")
         parsed = gw.parse_approval_slash("a", "１")
         if parsed:
-            ack = gw.slash_approval_decide_ack(parsed[0], parsed[1], "weixin")
+            ack = gw.slash_approval_decide_ack(parsed[0], parsed[1], "weixin", "sandbox-user", "sandbox-user")
         else:
             ack = ""
         check(

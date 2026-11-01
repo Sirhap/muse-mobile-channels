@@ -25,16 +25,64 @@ this directory; otherwise shadow (outbox/inbox writes go to shadow/).
 Credentials: env NATIVE_TOKEN_JSON, else cookies.txt + vm_id.txt in
 ~/.config/native-bridge/ (auto-renew, primary), else token.json there.
 """
-import fcntl, hashlib, importlib.util, json, os, sys, threading, time, traceback
+import fcntl, hashlib, importlib.util, json, os, sys, threading, time, traceback, uuid
 from datetime import datetime, timezone
 
-BASE = "/home/hatch/workspace/native-bridge"
-sys.path.insert(0, "/home/hatch/workspace/native-probe")
-from gw2 import GW2  # noqa: E402
-from muse_cli.cli import fmt_event, is_reply  # noqa: E402
-from muse_cli.gateway import GatewayError  # noqa: E402
+BASE = os.environ.get("NATIVE_BRIDGE_HOME", "/home/hatch/workspace/native-bridge")
+# Explicit overrides remain available to existing integrations and sandbox tests.
+CFG = None
+GW2 = None
 
-CFG = json.load(open(os.path.join(BASE, "config.json")))
+
+def load_config(path=None):
+    """Load runtime channel configuration explicitly, without import-time I/O."""
+    global CFG
+    config_path = path or os.environ.get("NATIVE_BRIDGE_CONFIG") or os.path.join(BASE, "config.json")
+    with open(config_path, encoding="utf-8") as source:
+        config = json.load(source)
+    if not isinstance(config, dict) or not isinstance(config.get("channels"), dict):
+        raise ValueError("native bridge config requires a channels object")
+    CFG = config
+    return CFG
+
+
+def runtime_config():
+    """Return an injected configuration or load it on first runtime use."""
+    return CFG if CFG is not None else load_config()
+
+
+def gateway_class():
+    """Resolve the optional Muse client only when a connection is requested."""
+    global GW2
+    if GW2 is None:
+        probe_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "native-probe")
+        if probe_path not in sys.path:
+            sys.path.insert(0, probe_path)
+        try:
+            from gw2 import GW2 as client_class
+        except ImportError as exc:
+            raise RuntimeError("native bridge requires gw2 and the Muse SDK; set MUSE_CLI_SRC to the installed SDK source") from exc
+        GW2 = client_class
+    return GW2
+
+
+def fmt_event(event):
+    """Defer event formatting to the SDK at the actual platform boundary."""
+    from muse_cli.cli import fmt_event as format_event
+    return format_event(event)
+
+
+def __getattr__(name):
+    """Keep optional legacy SDK exports available without importing them eagerly."""
+    if name == "GatewayError":
+        from muse_cli.gateway import GatewayError
+        return GatewayError
+    if name == "is_reply":
+        from muse_cli.cli import is_reply
+        return is_reply
+    raise AttributeError(name)
+
+
 CONF_DIR = os.path.expanduser("~/.config/native-bridge")
 STATE_F = os.path.join(BASE, "state.json")
 STATUS_F = os.path.join(BASE, "status.json")
@@ -95,9 +143,9 @@ IDLE_ALERT_MIN_SECS = 3600    # LT2: min gap between idle-scan alerts
 # AUTH_FAIL_BACKOFF_SECS (a changed credential file retries at once),
 # and alert ONCE per credential set instead of hourly forever.
 AUTH_FAIL_BACKOFF_SECS = 600
-# Consecutive failed connect() attempts on one channel before that
-# channel parks. A failed episode is connect() raising, including a
-# refused WSS upgrade. connect() returning resets the count.
+# Consecutive failed connection/operation episodes before a channel parks.
+# A handshake alone is insufficient: a successful task poll, history scan,
+# or task submission resets the count.
 # Credential-class failures still pause AUTH_FAIL_BACKOFF_SECS and
 # still retry at once when the credential files change; they share
 # this same cap. After the cap, only a cred-file change or a
@@ -184,19 +232,41 @@ PREAMBLE = (
 PREAMBLE_FRESH = PREAMBLE
 
 _state_lock = threading.Lock()
+_status_lock = threading.Lock()
 
 
 def load_state():
+    """Read bridge state, closing its descriptor even for malformed JSON."""
     try:
-        return json.load(open(STATE_F))
-    except (OSError, ValueError):
+        with open(STATE_F, encoding="utf-8") as source:
+            state = json.load(source)
+        if not isinstance(state, dict) or not isinstance(state.get("channels"), dict):
+            raise ValueError("bridge state requires a channels object")
+        return state
+    except FileNotFoundError:
         return {"channels": {}}
 
 
 def save_state(st):
+    """Flush and close a temporary state file before atomic replacement."""
     tmp = STATE_F + ".tmp"
-    json.dump(st, open(tmp, "w"), ensure_ascii=False, indent=1)
-    os.replace(tmp, STATE_F)
+    try:
+        with open(tmp, "w", encoding="utf-8") as target:
+            os.fchmod(target.fileno(), 0o600)
+            json.dump(st, target, ensure_ascii=False, indent=1)
+            target.flush()
+            os.fsync(target.fileno())
+        os.replace(tmp, STATE_F)
+        directory = os.open(os.path.dirname(os.path.abspath(STATE_F)), os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
 
 
 def ch_state(st, ch):
@@ -204,8 +274,9 @@ def ch_state(st, ch):
         "session_id": None, "preamble_done": False,
         "spool_offset": 0, "spool_tombstones": [],
         "processed": 0, "fallbacks": 0, "cancels": 0,
-        "fallback_streak": 0, "last_fb_alert": 0,
-        "turns": [], "last_boundary_ts": None,
+        "fallback_streak": 0, "last_fb_alert": 0, "fallback_alerted": False,
+        "idle_failure_alerted": False,
+        "turns": [], "submission_pending": None, "recovery_queue": [], "last_boundary_ts": None,
         "rotate_main": False, "fresh_start": False,
         "fresh_session_id": None, "audit_fingerprints": [],
         "audit_blocks": 0, "audit_last_block": 0,
@@ -243,24 +314,25 @@ def spool_progress(cs, nbytes=0, tombstones=None):
 
 
 def write_status(extra, active=None):
-    try:
-        cur = json.load(open(STATUS_F))
-    except (OSError, ValueError):
-        cur = {}
-    cur.update(extra)
-    if active is not None:
-        # Per-channel merge: each channel worker refreshes only its
-        # own key of the shared "active" summary (todo 6), so the
-        # three workers never clobber each other's rows.
-        cur_active = cur.get("active")
-        if not isinstance(cur_active, dict):
-            cur_active = {}
-        cur_active.update(active)
-        cur["active"] = cur_active
-    cur["ts"] = int(time.time())
-    tmp = STATUS_F + ".tmp"
-    json.dump(cur, open(tmp, "w"), ensure_ascii=False, indent=1)
-    os.replace(tmp, STATUS_F)
+    """Atomically merge per-channel diagnostics under one local writer lock."""
+    with _status_lock:
+        try:
+            with open(STATUS_F, encoding="utf-8") as source:
+                cur = json.load(source)
+        except (OSError, ValueError):
+            cur = {}
+        cur.update(extra)
+        if active is not None:
+            cur_active = cur.get("active")
+            if not isinstance(cur_active, dict):
+                cur_active = {}
+            cur_active.update(active)
+            cur["active"] = cur_active
+        cur["ts"] = int(time.time())
+        tmp = STATUS_F + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as target:
+            json.dump(cur, target, ensure_ascii=False, indent=1)
+        os.replace(tmp, STATUS_F)
 
 
 def live_mode(ch):
@@ -317,13 +389,13 @@ def cred_stamp():
 
 def outbox_path(ch):
     if live_mode(ch):
-        return os.path.join(CFG["channels"][ch]["bot_state"], "outbox.jsonl")
+        return os.path.join(runtime_config()["channels"][ch]["bot_state"], "outbox.jsonl")
     return os.path.join(BASE, "shadow", f"{ch}-outbox.jsonl")
 
 
 def inbox_path(ch):
     if live_mode(ch):
-        return os.path.join(CFG["channels"][ch]["bot_state"], "inbox.jsonl")
+        return os.path.join(runtime_config()["channels"][ch]["bot_state"], "inbox.jsonl")
     return os.path.join(BASE, "shadow", f"{ch}-inbox.jsonl")
 
 
@@ -436,7 +508,7 @@ def outbox_result_ok(ch, row_id):
     """
     if not row_id or not live_mode(ch):
         return None
-    p = os.path.join(CFG["channels"][ch]["bot_state"],
+    p = os.path.join(runtime_config()["channels"][ch]["bot_state"],
                      "outbox_results.jsonl")
     try:
         with open(p, "rb") as f:
@@ -458,7 +530,7 @@ def outbox_result_ok(ch, row_id):
 
 
 def cancelled_ids(ch):
-    p = os.path.join(CFG["channels"][ch]["bot_state"], "cancelled.json")
+    p = os.path.join(runtime_config()["channels"][ch]["bot_state"], "cancelled.json")
     try:
         data = json.load(open(p))
         return {r.get("msgid") for r in data if isinstance(r, dict)}
@@ -499,11 +571,12 @@ def cookie_params():
 
 def connect():
     """Build a GW2 and prove it with a cheap call. Raises on failure."""
+    client_class = gateway_class()
     if not os.environ.get("NATIVE_TOKEN_JSON"):
         ck = cookie_params()
         if ck:
             try:
-                gw = GW2(cookies=ck[0], vm_id=ck[1])
+                gw = client_class(cookies=ck[0], vm_id=ck[1])
                 gw.call_json("sessions.list", timeout=15)
                 return gw
             except Exception as e:
@@ -511,7 +584,7 @@ def connect():
                       f"{type(e).__name__} {str(e)[:120]}", flush=True)
     tp = token_params()
     if tp:
-        gw = GW2(cookies="", vm_id=tp["vm_id"],
+        gw = client_class(cookies="", vm_id=tp["vm_id"],
                  access_token=tp["access_token"], hatch_token=tp["hatch_token"])
         gw.call_json("sessions.list", timeout=15)
         return gw
@@ -576,24 +649,52 @@ def _note_bridge_fallback(ch, msgid, text, ts):
         pass
 
 
+def _append_inbox_once(path, record):
+    """Commit one fallback per original message and route under the inbox lock."""
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    identity = (record.get("msgid"), record.get("from_user_id"),
+                record.get("chatid"), record.get("chattype"))
+    with open(path, "a+", encoding="utf-8") as target:
+        fcntl.flock(target, fcntl.LOCK_EX)
+        try:
+            target.seek(0)
+            for line in target:
+                try:
+                    previous = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(previous, dict) and identity == (
+                        previous.get("msgid"), previous.get("from_user_id"),
+                        previous.get("chatid"), previous.get("chattype")):
+                    return
+            target.seek(0, os.SEEK_END)
+            target.write(json.dumps(record, ensure_ascii=False) + "\n")
+            target.flush()
+            os.fsync(target.fileno())
+        finally:
+            fcntl.flock(target, fcntl.LOCK_UN)
+
+
 def fallback_to_inbox(ch, row, why):
-    cfg = CFG["channels"][ch]
+    cfg = runtime_config()["channels"][ch]
     msgid, text = row["msgid"], row.get("text", "")
     if ch == "weixin":
         rec = {"msgid": msgid, "ts": int(time.time()),
-               "from_user_id": cfg["from_user_id"], "group_id": "",
+               "from_user_id": row.get("from_user") or row.get("from_user_id") or cfg.get("from_user_id", ""),
+               "group_id": row.get("group_id", ""),
                "text": text, "media": [], "context_token": "", "raw": {},
                "via": "native-bridge-fallback", "fallback_why": why}
     elif ch == "wecom":
         rec = {"msgid": msgid, "ts": int(time.time()),
-               "chattype": "single", "chatid": cfg["chatid"],
-               "from_userid": cfg["from_userid"], "msgtype": "text",
+               "chattype": row.get("chattype") or "single",
+               "chatid": row.get("chatid") or cfg.get("chatid", ""),
+               "from_userid": row.get("from_userid") or cfg.get("from_userid", ""), "msgtype": "text",
                "text": text, "media": [], "auto_handled": False, "raw": {},
                "via": "native-bridge-fallback", "fallback_why": why}
     else:
         rec = {"msgid": msgid, "ts": int(time.time()), "text": text,
                "via": "native-bridge-fallback", "fallback_why": why}
-        append_jsonl(os.path.join(BASE, "shadow", f"{ch}-inbox.jsonl"), rec)
+        _append_inbox_once(os.path.join(BASE, "shadow", f"{ch}-inbox.jsonl"), rec)
         try:
             append_jsonl(os.path.join(BASE, "shadow",
                                       "bridge_fallback.jsonl"),
@@ -603,7 +704,9 @@ def fallback_to_inbox(ch, row, why):
         _note_bridge_fallback(ch, msgid, text, rec["ts"])
         print(f"[{ch}] FALLBACK msgid={msgid} why={why}", flush=True)
         return
-    append_jsonl(inbox_path(ch), rec)
+    if not (rec.get("from_user_id") if ch == "weixin" else rec.get("chatid")):
+        raise ValueError("Fallback requires an original or explicitly configured route")
+    _append_inbox_once(inbox_path(ch), rec)
     try:
         append_jsonl(os.path.join(os.path.dirname(inbox_path(ch)),
                                   "bridge_fallback.jsonl"),
@@ -853,6 +956,10 @@ def _ev_mid(ev):
     return p.get("message_id") or ev.get("message_id") or ""
 
 
+class SubmissionPersistenceError(RuntimeError):
+    """Reservation failed locally; no external execution may begin."""
+
+
 class ChannelWorker(threading.Thread):
     def __init__(self, ch):
         super().__init__(daemon=True, name=f"bridge-{ch}")
@@ -871,6 +978,7 @@ class ChannelWorker(threading.Thread):
         # tries connect() again; a parked flag left in state.json is
         # cleared below for the same reason.
         self._reconnect_failures = 0
+        self._next_connect_at = 0.0
         self._reconnect_exhausted = False
         self._reconnect_exhausted_stamp = None
         self._drop_persisted_reconnect_park()
@@ -894,21 +1002,25 @@ class ChannelWorker(threading.Thread):
             self.log("reconnect park clear failed; will still retry")
 
     def _note_reconnect_success(self):
-        """``connect()`` returned. The consecutive-failure count is 0."""
-        dirty = self._reconnect_failures or self._reconnect_exhausted
+        """A real bridge operation succeeded; release the outage retry budget."""
+        dirty = (self._reconnect_failures or self._reconnect_exhausted
+                 or self.cs().get("fallback_alerted") or self.cs().get("idle_failure_alerted"))
         self._reconnect_failures = 0
+        self._next_connect_at = 0.0
         self._reconnect_exhausted = False
         self._reconnect_exhausted_stamp = None
         self._clear_auth_block()
         if not dirty:
             return
         try:
-            self.update_cs(reconnect_failures=0, reconnect_exhausted=False)
+            self.update_cs(reconnect_failures=0, reconnect_exhausted=False,
+                           fallback_alerted=False, idle_failure_alerted=False,
+                           fallback_streak=0, idle_scan_fail_streak=0, idle_auth_alert_stamp=None)
         except Exception as e:
             self.log("reconnect counter save failed:", str(e)[:80])
 
     def _note_reconnect_failure(self, exc):
-        """Count one failed ``connect()`` episode toward the cap.
+        """Count one failed connection or bridge-operation episode toward the cap.
 
         Failed episode: ``connect()`` raised, including a refused WSS
         upgrade. Credential-class failures still take the 600s pause
@@ -920,19 +1032,40 @@ class ChannelWorker(threading.Thread):
             return
         self._note_connect_failure(exc)
         self._reconnect_failures += 1
+        self._next_connect_at = time.time() + min(5 * 2 ** (self._reconnect_failures - 1), 60)
         if self._reconnect_failures >= RECONNECT_MAX_ATTEMPTS:
             self._reconnect_exhausted = True
             self._reconnect_exhausted_stamp = cred_stamp()
             self.log(
                 "native-bridge reconnect exhausted after "
                 f"{RECONNECT_MAX_ATTEMPTS} consecutive failed "
-                "connection attempts; state=reconnect_exhausted")
+                "connection/operation attempts; state=reconnect_exhausted")
         try:
             self.update_cs(
                 reconnect_failures=self._reconnect_failures,
                 reconnect_exhausted=self._reconnect_exhausted)
         except Exception as e:
             self.log("reconnect counter save failed:", str(e)[:80])
+        if self._reconnect_exhausted:
+            self._notify_reconnect_pause()
+
+    def _notify_reconnect_pause(self):
+        """Report a parked bridge once, using only its existing bound route."""
+        cs = self.cs()
+        if cs.get("fallback_alerted") or cs.get("idle_failure_alerted"):
+            return
+        turns = cs.get("turns") or []
+        row = turns[0] if turns else (self.queue[0][0] if self.queue else None)
+        text = ("⚠️ 原生桥连续连接或操作失败 3 次，已暂停自动连接。"
+                "请检查网络或登录凭证；更新凭证或人工重启后可再次尝试。"
+                "已提交任务保留原记录，不因重连重新提交；"
+                "未提交消息可由备用通道处理。")
+        if self._send_alert_text(text, row):
+            try:
+                self.update_cs(idle_failure_alerted=True,
+                               idle_scan_last_alert=int(time.time()))
+            except Exception as error:
+                self.log("pause notice state save failed:", type(error).__name__)
 
     def _reconnect_exhausted_now(self):
         """True when this channel must not call ``connect()``.
@@ -945,6 +1078,7 @@ class ChannelWorker(threading.Thread):
             return False
         if self._reconnect_exhausted_stamp != cred_stamp():
             self._reconnect_failures = 0
+            self._next_connect_at = 0.0
             self._reconnect_exhausted = False
             self._reconnect_exhausted_stamp = None
             self._clear_auth_block()
@@ -967,13 +1101,15 @@ class ChannelWorker(threading.Thread):
         not made (auth backoff, or ``reconnect_exhausted`` with
         unchanged credential files) and must not be counted again.
 
-        Failed episode: ``connect()`` raised or the WSS upgrade
-        failed. Success: ``connect()`` returned, which resets the
-        consecutive counter.
+        A handshake does not reset the failure budget. The caller records
+        success only after its actual bridge operation succeeds.
         """
         if self._reconnect_exhausted_now():
+            self._notify_reconnect_pause()
             return None, None
         if self._auth_connect_blocked():
+            return None, None
+        if time.time() < self._next_connect_at:
             return None, None
         self.last_connect_try = time.time()
         try:
@@ -981,7 +1117,6 @@ class ChannelWorker(threading.Thread):
         except Exception as e:
             self._note_reconnect_failure(e)
             return None, e
-        self._note_reconnect_success()
         return gw, None
 
     def cs(self):
@@ -995,6 +1130,16 @@ class ChannelWorker(threading.Thread):
             c.update(kw)
             save_state(st)
 
+    def _consume_recovery(self, cs, row):
+        """Remove a recovered row in the same commit as its next owned state."""
+        identifier = row.get("_recovery_id")
+        if not identifier:
+            return {}
+        queue = cs.get("recovery_queue") or []
+        if not any(item.get("recovery_id") == identifier for item in queue):
+            raise RuntimeError("recovery queue identity is missing")
+        return {"recovery_queue": [item for item in queue if item.get("recovery_id") != identifier]}
+
     def _discard_queued(self, msgids, count_cancel=False, **state_updates):
         """先持久化删除区间，再从内存队列移除对应行。
 
@@ -1004,19 +1149,27 @@ class ChannelWorker(threading.Thread):
         cs = self.cs()
         ranges = list(cs.get("spool_tombstones", []))
         position = cs["spool_offset"]
-        keep, removed = [], []
+        keep, removed, recovery_ids = [], [], set()
+        removed_count = 0
         for row, nbytes in self.queue:
             position = spool_progress(
                 {"spool_offset": position, "spool_tombstones": ranges}
             )["spool_offset"]
             end = position + nbytes
             if row.get("msgid") in msgids:
-                removed.append([position, end])
+                removed_count += 1
+                if row.get("_recovery_id"):
+                    recovery_ids.add(row["_recovery_id"])
+                elif nbytes:
+                    removed.append([position, end])
             else:
                 keep.append((row, nbytes))
             position = end
         if count_cancel:
-            state_updates["cancels"] = cs["cancels"] + len(removed)
+            state_updates["cancels"] = cs["cancels"] + removed_count
+        if recovery_ids:
+            state_updates["recovery_queue"] = [item for item in cs.get("recovery_queue", [])
+                                                if item.get("recovery_id") not in recovery_ids]
         state_updates.update(spool_progress(cs, tombstones=ranges + removed))
         self.update_cs(**state_updates)
         self.queue = keep
@@ -1075,7 +1228,7 @@ class ChannelWorker(threading.Thread):
         d = self.gw.call_json("session.start", body={
             "method": "/api/session/start",
             "params": {"origin": "fresh", "lifecycle": "persistent",
-                       "title": CFG["channels"][self.ch]["session_title"]}})
+                       "title": runtime_config()["channels"][self.ch]["session_title"]}})
         return d.get("session_id")
 
     def session_for(self, cs):
@@ -1159,10 +1312,6 @@ class ChannelWorker(threading.Thread):
         text = row.get("text", "")
         if preamble:
             text = preamble + text
-        self.gw._open("chat.stream", body={
-            "items": [{"type": "text", "text": text}], "node_id": NODE_ID,
-            "capabilities": {}, "session_id": sid})
-        self.update_cs(preamble_done=True)
         turn = {"msgid": row["msgid"], "lane": "main", "session_id": sid,
                 "baseline": baseline, "sent_at": int(time.time()),
                 "text": row.get("text", ""),
@@ -1186,9 +1335,57 @@ class ChannelWorker(threading.Thread):
                 "activity_dirty": False, "history_dirty": False,
                 "hist_seen_seq": baseline, "last_event_prog": 0,
                 "last_prog_at": 0}
-        self.log(f"turn sent msgid={row['msgid']} "
-                 f"baseline={baseline}")
+        self._reserve_submission(row, turn)
+        self.gw._open("chat.stream", body={
+            "items": [{"type": "text", "text": text}], "node_id": NODE_ID,
+            "capabilities": {}, "session_id": sid})
         return turn
+
+    def _reserve_submission(self, row, turn, kind="turn"):
+        """Durably own the spool prefix before an externally uncertain send.
+
+        A crash immediately after this commit is ambiguous, even if no bytes
+        actually left the process. Preserve evidence rather than execute twice.
+        """
+        cs = self.cs()
+        if cs.get("submission_pending"):
+            raise RuntimeError("an earlier bridge submission requires reconciliation")
+        nbytes = 0
+        if self.queue and self.queue[0][0].get("msgid") == row.get("msgid"):
+            nbytes = self.queue[0][1]
+        pending = {"phase": "submission_unknown", "kind": kind,
+                   "row": dict(row), "turn": dict(turn), "nbytes": nbytes,
+                   "spool_start": cs["spool_offset"], "notice_queued": False}
+        try:
+            snapshot = {"active": [{"msgid": mid, "lane": turn.get("lane", "main"),
+                                      "phase": "submission_unknown", "secs": 0}
+                                     for mid in turn.get("ids") or [row["msgid"]]],
+                        "queued": [item.get("msgid") for item, _size in self.queue[1:]],
+                        "updated": int(time.time())}
+            self.update_cs(submission_pending=pending, queue_snapshot=snapshot,
+                           **self._consume_recovery(cs, row), **spool_progress(cs, nbytes))
+        except Exception as error:
+            raise SubmissionPersistenceError("submission reservation was not confirmed") from error
+        if nbytes:
+            self.queue.pop(0)
+
+    def _hold_submission(self):
+        """Keep an ambiguous session reserved and notify its original route once.
+
+        Old Muse streams expose no durable request/run correlation here. A
+        later history row is not sufficient evidence to release or retry it.
+        """
+        pending = self.cs().get("submission_pending")
+        if not pending:
+            return False
+        if not pending.get("notice_queued"):
+            text = ("⚠️ 这条任务的提交结果尚未确认，已暂停该渠道的原生提交。"
+                    "为避免重复执行，不会自动重试或转交备用通道；"
+                    "需要主会话核查原任务。取消或换会话请求不会自动解除此保护。")
+            if self._send_alert_text(text, pending.get("row")):
+                pending["notice_queued"] = True
+                self.update_cs(submission_pending=pending)
+        return True
 
     def progress_notice(self, turn, age):
         """One progress message for a long-running turn, so a
@@ -1469,7 +1666,8 @@ class ChannelWorker(threading.Thread):
                                   body={"session_id": turn["session_id"]},
                                   timeout=15)
             except Exception as e:
-                self.log("cancel call failed:", str(e)[:100])
+                self.log("cancel result unknown:", type(e).__name__)
+                raise
             self.log(f"turn cancelled msgid={turn['msgid']}")
             return "cancelled"
         # LT2 gate: with the flag off, everything below is exactly
@@ -1633,7 +1831,7 @@ class ChannelWorker(threading.Thread):
         configured owner of that channel.
         """
         route = route or {}
-        cfg = CFG["channels"][self.ch]
+        cfg = runtime_config()["channels"][self.ch]
         if self.ch == "weixin":
             return {"to_user_id": route.get("from_user")
                     or cfg.get("from_user_id", "")}
@@ -1693,52 +1891,31 @@ class ChannelWorker(threading.Thread):
             self.log(f"idle push key={str(key)[:12]} rows={len(rows)}")
 
     def _note_idle_scan_failure(self, cs, exc):
-        """LT2 (gated): bookkeep one idle-scan failure. A dead
-        session used to spam "idle scan failed: session not found"
-        into the journal every ~20s forever, unnoticed; other
-        failures were equally silent. Session-not-found invalidates
-        the stored sid (the scan then skips itself, since sid is
-        None) and does NOT count towards the streak; other errors
-        accumulate idle_scan_fail_streak, and at >= threshold (with
-        an hourly cap) raise ONE visible alert through the channel
-        outbox. Returns nothing; callers just drop the connection."""
-        err = f"{type(exc).__name__} {str(exc)[:100]}"
+        """Record idle failures, notifying once per unresolved outage/credential."""
         if is_session_not_found(exc):
-            self._invalidate_session(f"idle scan: {err}")
+            self._invalidate_session("idle scan: session unavailable")
             return
-        streak = (cs.get("idle_scan_fail_streak") or 0) + 1
-        kw = {"idle_scan_fail_streak": streak}
+        current = self.cs()
+        streak = (current.get("idle_scan_fail_streak") or 0) + 1
+        self.update_cs(idle_scan_fail_streak=streak)
         if is_auth_failure(exc):
-            # Credential is dead: retrying cannot heal it, and an
-            # hourly alert forever is spam. Alert once per credential
-            # set (the stamp is re-armed when the files change or a
-            # scan succeeds again); connect attempts back off via
-            # _note_connect_failure in the caller.
             stamp = cred_stamp()
-            if cs.get("idle_auth_alert_stamp") != stamp:
-                kw["idle_auth_alert_stamp"] = stamp
-                kw["idle_scan_last_alert"] = int(time.time())
-                self.update_cs(**kw)
-                self._send_alert_text(
-                    "⚠️ 原生桥登录凭证已失效，空闲扫描与主动推送已暂停"
-                    "（普通问答不受影响）；需要重新导出 muse.ai 凭证"
-                    "才能恢复，这条只提醒这一次，不再每小时重复。")
-                self.log(f"idle scan auth alert sent streak={streak}")
-            else:
-                self.update_cs(**kw)
+            if (current.get("idle_auth_alert_stamp") == stamp
+                    or current.get("idle_failure_alerted") or current.get("fallback_alerted")):
+                return
+            text = ("⚠️ 原生桥登录验证失败，原生问答、空闲扫描和主动推送可能受影响。"
+                    "请检查或重新导出登录凭证；未提交消息可由备用通道处理。"
+                    "本次故障只提醒一次，凭证更新或实际恢复后重新计数。")
+            if self._send_alert_text(text):
+                self.update_cs(idle_auth_alert_stamp=stamp, idle_failure_alerted=True,
+                               idle_scan_last_alert=int(time.time()))
             return
-        alert = streak >= IDLE_FAIL_ALERT_STREAK and \
-            time.time() - (cs.get("idle_scan_last_alert") or 0) \
-            >= IDLE_ALERT_MIN_SECS
-        if alert:
-            kw["idle_scan_last_alert"] = int(time.time())
-        self.update_cs(**kw)
-        if alert:
-            self._send_alert_text(
-                "⚠️ 原生桥空闲扫描连续失败 "
-                f"{streak} 次，主动推送可能受影响；"
-                "我会继续重试，你不用管。")
-            self.log(f"idle scan alert sent streak={streak}")
+        if streak >= IDLE_FAIL_ALERT_STREAK and not (current.get("idle_failure_alerted") or current.get("fallback_alerted")):
+            text = ("⚠️ 原生桥暂时无法查询任务状态，主动推送可能延迟。"
+                    "连续连接或操作失败达到 3 次后会暂停，需检查网络或凭证；"
+                    "已提交任务保留原记录，不因重连重新提交。")
+            if self._send_alert_text(text):
+                self.update_cs(idle_failure_alerted=True, idle_scan_last_alert=int(time.time()))
 
     def idle_push_scan(self, cs):
         """While no bridge turn is open, watch the channel's own
@@ -1777,10 +1954,12 @@ class ChannelWorker(threading.Thread):
         except Exception as e:
             self.log("idle scan failed:", type(e).__name__,
                      str(e)[:100])
+            self._note_reconnect_failure(e)
             self.drop_gw()
             if gated:
                 self._note_idle_scan_failure(cs, e)
             return
+        self._note_reconnect_success()
         if gated and (cs.get("idle_scan_fail_streak")
                       or cs.get("idle_auth_alert_stamp")):
             self.update_cs(idle_scan_fail_streak=0,
@@ -1830,7 +2009,15 @@ class ChannelWorker(threading.Thread):
         because they leave the turns list."""
         now = time.time()
         rows = []
-        for t in self.cs().get("turns") or []:
+        state = self.cs()
+        pending = state.get("submission_pending")
+        if pending:
+            turn = pending["turn"]
+            return [{"text": "提交结果待核查", "phase": "submission_unknown",
+                     "msgid": pending["row"]["msgid"],
+                     "run_secs": max(0, int(now - turn.get("sent_at", now))),
+                     "idle_secs": 0}]
+        for t in state.get("turns") or []:
             sent = t.get("sent_at")
             last = float(sent) if isinstance(sent, (int, float)) else now
             for act in reversed(t.get("activities") or []):
@@ -1857,7 +2044,7 @@ class ChannelWorker(threading.Thread):
 
     def run(self):
         ch = self.ch
-        cfg = CFG["channels"][ch]
+        cfg = runtime_config()["channels"][ch]
         spool = os.path.join(BASE, "spool", f"{ch}.jsonl")
         open(spool, "a").close()
         # Baseline the /new boundary at startup: boundaries already on
@@ -1887,6 +2074,12 @@ class ChannelWorker(threading.Thread):
     def step(self, spool, boundary_f):
         ch = self.ch
         cs = self.cs()
+        if self._hold_submission():
+            return
+        recovered = cs.get("recovery_queue") or []
+        queued_ids = {row.get("_recovery_id") for row, _size in self.queue}
+        self.queue[:0] = [(dict(item["row"], _recovery_id=item["recovery_id"]), 0)
+                         for item in recovered if item["recovery_id"] not in queued_ids]
         bts = read_signal_ts(boundary_f)
         if bts is not None and cs["last_boundary_ts"] is not None \
                 and bts > cs["last_boundary_ts"]:
@@ -1926,12 +2119,15 @@ class ChannelWorker(threading.Thread):
             for turn in turns:
                 try:
                     outcome = self.poll_turn(turn)
+                    self._note_reconnect_success()
                 except Exception as e:
                     self.log(f"poll failed msgid={turn['msgid']}: "
                              f"{str(e)[:100]}; will retry")
+                    self._note_reconnect_failure(e)
                     self.drop_gw()
                     alive.append(turn)
-                    continue
+                    alive.extend(turns[turns.index(turn) + 1:])
+                    break
                 if outcome != "running":
                     # The turn is closing — done / cancelled /
                     # abnormal end all funnel through poll_turn's
@@ -2086,20 +2282,18 @@ class ChannelWorker(threading.Thread):
     def note_fallback(self, row, nbytes):
         """Bookkeep one pre-send fallback. A bridge whose credentials
         died would otherwise degrade to the slow cold path SILENTLY,
-        forever — so a streak of >=3 fallbacks raises ONE user-visible
-        alert per hour through the channel's own outbox."""
+        forever — so a streak of >=3 fallbacks raises one user-visible
+        alert per unresolved outage through the channel's own outbox."""
         cs = self.cs()
         streak = cs.get("fallback_streak", 0) + 1
         kw = {"fallbacks": cs["fallbacks"] + 1,
               **spool_progress(cs, nbytes),
-              "fallback_streak": streak}
-        alert = streak >= 3 and \
-            time.time() - cs.get("last_fb_alert", 0) >= 3600
-        if alert:
-            kw["last_fb_alert"] = int(time.time())
+              "fallback_streak": streak, **self._consume_recovery(cs, row)}
+        alert = streak >= 3 and not (cs.get("fallback_alerted", False)
+                                    or cs.get("idle_failure_alerted", False))
         self.update_cs(**kw)
-        if alert:
-            self._send_fb_alert(row, streak)
+        if alert and self._send_fb_alert(row, streak):
+            self.update_cs(last_fb_alert=int(time.time()), fallback_alerted=True)
 
     def _send_alert_text(self, text, row=None):
         """Write one visible alert row into this channel's outbox
@@ -2109,7 +2303,7 @@ class ChannelWorker(threading.Thread):
         including the gateway's parked-retry handling downstream —
         instead of inventing a second one. row, when given, supplies
         the live route; otherwise the channel config does."""
-        rid = f"bridgealert-{int(time.time())}"
+        rid = f"bridgealert-{uuid.uuid4().hex}"
         try:
             if live_mode(self.ch):
                 # Gateways read the body from "content" ONLY (every
@@ -2122,20 +2316,20 @@ class ChannelWorker(threading.Thread):
                        "text": text, "proactive": True}
                 if self.ch == "wecom":
                     cid = (row or {}).get("chatid") or \
-                        CFG["channels"][self.ch].get("chatid", "")
+                        runtime_config()["channels"][self.ch].get("chatid", "")
                     if not cid:
-                        return
+                        return False
                     out["chatid"] = cid
                     out["chattype"] = (row or {}).get("chattype",
                                                       "single")
                 else:
                     to = (row or {}).get("from_user") or \
-                        CFG["channels"][self.ch].get("from_user_id", "")
+                        runtime_config()["channels"][self.ch].get("from_user_id", "")
                     if not to:
-                        return
+                        return False
                     out["to_user_id"] = to
                 append_jsonl(os.path.join(
-                    CFG["channels"][self.ch]["bot_state"], "outbox.jsonl"),
+                    runtime_config()["channels"][self.ch]["bot_state"], "outbox.jsonl"),
                     out)
             else:
                 append_jsonl(os.path.join(BASE, "shadow",
@@ -2143,15 +2337,18 @@ class ChannelWorker(threading.Thread):
                              {"id": rid, "mode": "send",
                               "content": text, "text": text,
                               "proactive": True})
+            return True
         except Exception as e:
             self.log(f"alert send failed: {str(e)[:80]}")
+            return False
 
     def _send_fb_alert(self, row, streak):
-        text = ("⚠️ 原生通道暂时连不上（已连续失败 "
-                f"{streak} 次），消息改走备用通道处理，回复会慢一些；"
-                "我会自动重连，你不用管。")
-        self._send_alert_text(text, row)
-        self.log(f"fallback alert sent streak={streak}")
+        """Describe one outage without promising unlimited reconnection or recovery."""
+        text = ("⚠️ 原生通道暂时不可用，尚未提交的消息已转交备用通道，"
+                "回复可能延迟。连续失败最多尝试 3 次，之后暂停；"
+                "需要检查网络或登录凭证，更新凭证或人工重启后可再次尝试。"
+                "已提交任务保留原记录，不因重连重新提交。")
+        return self._send_alert_text(text, row)
 
     def _silence_merged(self, mid):
         """Close a merged message out on the gateway side.
@@ -2166,7 +2363,7 @@ class ChannelWorker(threading.Thread):
         if self.ch in FEEDBACK_CLEAR_CHANNELS:
             try:
                 append_jsonl(os.path.join(
-                    CFG["channels"][self.ch]["bot_state"],
+                    runtime_config()["channels"][self.ch]["bot_state"],
                     "feedback_clear.jsonl"), {"msgid": mid})
                 return
             except Exception as e:
@@ -2175,50 +2372,39 @@ class ChannelWorker(threading.Thread):
         deliver_reply(self.ch, mid, MERGE_POINTER_TEXT)
 
     def _merge_into_active(self):
-        """Fold every queued row into the running turn (MERGE_CHANNELS
-        only). The official client steers a running turn with new
-        messages, and the protocol allows it: a second chat.stream on
-        the same session appends the user message to the SAME turn and
-        one combined reply follows (probed live 2026-10-08, session
-        204287b5: msg2 landed as a user event 2s after sending, before
-        any assistant event). Only while the turn's reply has not
-        started streaming — reply_started is refreshed by poll_turn
-        every step — after that, rows keep waiting FIFO. A failed
-        merge send leaves the row queued (plain FIFO for it)."""
+        """Persist each optional legacy merge before opening its stream.
+
+        A timed-out merge cannot stay queued for another submission. Keep the
+        original active turn and the new message reserved until reconciliation.
+        """
         cs = self.cs()
-        if not cs["turns"]:
+        if cs.get("submission_pending") or not cs["turns"]:
             return
-        turn = cs["turns"][0]
-        if turn.get("reply_started"):
+        turn = dict(cs["turns"][0])
+        if turn.get("reply_started") or not self.ensure_gw():
             return
-        if not self.ensure_gw():
-            return
-        ids = list(turn.get("ids") or [turn["msgid"]])
-        merged = False
         while self.queue:
-            row, nbytes = self.queue[0]
+            row, _nbytes = self.queue[0]
+            merged_turn = dict(turn, ids=list(turn.get("ids") or [turn["msgid"]]) + [row["msgid"]])
+            self._reserve_submission(row, merged_turn, kind="merge")
             try:
                 self.gw._open("chat.stream", body={
-                    "items": [{"type": "text",
-                               "text": row.get("text", "")}],
+                    "items": [{"type": "text", "text": row.get("text", "")}],
                     "node_id": NODE_ID, "capabilities": {},
                     "session_id": turn["session_id"]})
-            except Exception as e:
-                self.log(f"merge failed msgid={row.get('msgid')}: "
-                         f"{type(e).__name__} {str(e)[:100]}; stays queued")
-                break
-            self.queue.pop(0)
-            ids.append(row["msgid"])
-            cur = self.cs()
-            self.update_cs(**spool_progress(cur, nbytes))
-            self.log(f"merged msgid={row['msgid']} into turn "
-                     f"msgid={turn['msgid']}")
-            merged = True
-        if merged:
-            turn["ids"] = ids
-            self.update_cs(turns=[turn] + list(cs["turns"][1:]))
+                current = self.cs()
+                self.update_cs(turns=[merged_turn] + list(current["turns"][1:]),
+                               submission_pending=None)
+            except Exception as error:
+                self.log("merge submission requires reconciliation:", type(error).__name__)
+                self.drop_gw()
+                return
+            turn = merged_turn
 
     def _start_next(self):
+        """Submit once; only errors before reservation may use the fallback."""
+        if self._hold_submission():
+            return
         row, nbytes = self.queue[0]
         # Every turn starts on a FRESH connection (see drop_gw): the
         # history read inside start_turn doubles as the liveness proof
@@ -2236,12 +2422,20 @@ class ChannelWorker(threading.Thread):
             self.drop_gw()
             if not self.ensure_gw():
                 fallback_to_inbox(self.ch, row, "connect_or_auth_failed")
-                self.queue.pop(0)
                 self.note_fallback(row, nbytes)
+                self.queue.pop(0)
                 return
             try:
                 turn = self.start_turn(row, self.cs())
             except Exception as e:
+                if self.cs().get("submission_pending"):
+                    self.log("submission requires reconciliation:", type(e).__name__)
+                    self.drop_gw()
+                    return
+                # Failure to persist an intent is local storage failure, not
+                # proof that another writer can safely take over this row.
+                if isinstance(e, SubmissionPersistenceError):
+                    raise
                 self.log(f"pre-send failure msgid={row.get('msgid')}: "
                          f"{type(e).__name__} {str(e)[:120]}")
                 if not healed and longtask_mode(self.ch) \
@@ -2252,29 +2446,57 @@ class ChannelWorker(threading.Thread):
                         f"pre-send msgid={row.get('msgid')}")
                     self.drop_gw()
                     continue
+                self._note_reconnect_failure(e)
                 fallback_to_inbox(self.ch, row,
                                   f"presend_{type(e).__name__}")
-                self.queue.pop(0)
                 self.note_fallback(row, nbytes)
+                self.queue.pop(0)
                 self.drop_gw()
                 return
             break
-        self.queue.pop(0)
         cs = self.cs()
         turns = list(cs["turns"]) + [turn]
-        self.update_cs(turns=turns, **spool_progress(cs, nbytes))
+        if cs.get("submission_pending"):
+            try:
+                self.update_cs(turns=turns, preamble_done=True, submission_pending=None)
+            except Exception as error:
+                self.log("submission confirmation save failed:", type(error).__name__)
+                self.drop_gw()
+                return
+        else:
+            # Compatibility seam for adapters that provide start_turn directly.
+            self.update_cs(turns=turns, **self._consume_recovery(cs, row), **spool_progress(cs, nbytes))
+            self.queue.pop(0)
+        self._note_reconnect_success()
 
 
 def cmd_daemon():
-    write_status({"pid": os.getpid(), "started": int(time.time()),
-                  "mode": {ch: ("live" if live_mode(ch) else "shadow")
-                           for ch in CFG["channels"]}})
-    workers = [ChannelWorker(ch) for ch in CFG["channels"]]
-    for w in workers:
-        w.start()
-    print("native-bridge daemon up", flush=True)
-    while True:
-        time.sleep(3600)
+    """Own bridge state and legacy channel modes for the daemon lifetime."""
+    from contextlib import ExitStack
+    from pathlib import Path
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    from mobile_channels.recovery import bridge_lock
+    from mobile_channels.modes import lease_from_env
+    with ExitStack() as resources:
+        resources.enter_context(bridge_lock(Path(BASE)))
+        channels = []
+        for channel in runtime_config()["channels"]:
+            lease = lease_from_env(channel)
+            if lease is not None:
+                resources.enter_context(lease)
+                if lease.mode != "legacy":
+                    continue
+            channels.append(channel)
+        write_status({"pid": os.getpid(), "started": int(time.time()),
+                      "mode": {ch: ("live" if live_mode(ch) else "shadow") for ch in channels}})
+        workers = [ChannelWorker(channel) for channel in channels]
+        for worker in workers:
+            worker.start()
+        print("native-bridge daemon up", flush=True)
+        while True:
+            time.sleep(3600)
 
 
 def cmd_enqueue(argv):

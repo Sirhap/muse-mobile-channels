@@ -69,7 +69,9 @@ def seed_relay(gateway, relay_dir):
     relay_dir.mkdir(parents=True, exist_ok=True)
     items = {
         str(n): {"approval_id": f"aid-{n}", "who": "Shell command",
-                 "what": "命令：echo hi", "status": "pending"}
+                 "what": "命令：echo hi", "status": "pending", "expires_ms": 9999999999999,
+                 "decision_scope": {"channel": "weixin" if gateway is wx else "wecom",
+                                    "chat_id": "user" if gateway is wx else "chat", "operator_ids": ["user"]}}
         for n in range(15, 45)
     }
     (relay_dir / "state.json").write_text(
@@ -115,7 +117,7 @@ async def dispatch_weixin(text):
 async def dispatch_wecom(text):
     """Run the real WeCom slash handler with no network send."""
     sink = _WcSink()
-    result = await wc.Gateway._slash_dispatch(sink, text, "chat", "single")
+    result = await wc.Gateway._slash_dispatch(sink, text, "chat", "single", operator_id="user")
     return result, sink.acks
 
 
