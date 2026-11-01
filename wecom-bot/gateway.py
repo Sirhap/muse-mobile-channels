@@ -54,6 +54,10 @@ if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
 from channel_common import (  # noqa: E402
+    bridge_diversion_state,
+    bridge_route_lock,
+    bridge_message_exists,
+    mark_bridge_fallback,
     SEND_MAX_ATTEMPTS,
     allocate_subagent_id,
     append_jsonl as append_jsonl_line,
@@ -3067,23 +3071,30 @@ class Gateway:
             # so the bridge's bound reply finishes the stream in place
             # exactly like a worker reply. Any divert failure (or the
             # bridge itself failing pre-send) falls back to the inbox.
-            diverted = False
-            if (msgid and msgtype == "text" and not media
-                    and chattype == "single"
-                    and os.path.exists(
-                        "/home/hatch/workspace/native-bridge/divert-wecom")):
-                try:
-                    self.append_jsonl(
-                        BRIDGE_SPOOL,
-                        {"msgid": msgid, "text": text,
-                         "chatid": chatid, "chattype": chattype,
-                         "ts": int(time.time())})
-                    diverted = True
-                    log(f"msg {msgid} diverted to native bridge")
-                except Exception as e:
-                    log(f"native divert failed, using inbox: {e}")
-            if not diverted:
-                self.append_jsonl(INBOX, entry)
+            def persist_route():
+                """Choose and persist the destination while bridge execution is locked."""
+                base = BRIDGE_SPOOL.parent.parent if BRIDGE_SPOOL.parent.name == "spool" else BRIDGE_SPOOL.parent
+                eligible = bool(msgid and msgtype == "text" and not media and chattype == "single"
+                                and os.path.exists(base / "divert-wecom"))
+                if not eligible:
+                    self.append_jsonl(INBOX, entry)
+                    return False
+                with bridge_route_lock(base, "wecom"):
+                    if bridge_message_exists(INBOX, BRIDGE_SPOOL, str(msgid), "wecom", chatid):
+                        return False
+                    latch = base / ".fallback-wecom"
+                    use_spool = eligible and not latch.exists() and bridge_diversion_state(
+                        base / "status.json", base / "state.json", BRIDGE_SPOOL, "wecom") != "unavailable"
+                    if use_spool:
+                        self.append_jsonl(BRIDGE_SPOOL, {"msgid": msgid, "text": text,
+                            "chatid": chatid, "chattype": chattype, "ts": int(time.time())})
+                    else:
+                        if eligible:
+                            mark_bridge_fallback(base, "wecom")
+                        self.append_jsonl(INBOX, entry)
+                    return use_spool
+
+            diverted = await asyncio.to_thread(persist_route)
             self._commit_inbound_seen(msgid)
             if not diverted:
                 # Cold-lane soft ack DISABLED (2026-10-09, user order

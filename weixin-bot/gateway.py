@@ -38,6 +38,10 @@ if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
 from channel_common import (  # noqa: E402
+    bridge_diversion_state,
+    bridge_route_lock,
+    bridge_message_exists,
+    mark_bridge_fallback,
     allocate_subagent_id,
     exclusive_file_lock,
     append_jsonl as append_jsonl_line,
@@ -3045,31 +3049,34 @@ class Gateway:
         # formal reply lands in this gateway's outbox as usual, and any
         # bridge failure falls back to the inbox below (cold-start path).
         # Media and group messages keep the inbox path.
-        diverted = False
-        if (msgid and not media and not msg.get("group_id")
-                and os.path.exists(
-                    "/home/hatch/workspace/native-bridge/divert-weixin")):
+        def persist_route():
+            """Choose and persist the destination while bridge execution is locked."""
+            base = QUOTE_SPOOL.parent.parent if QUOTE_SPOOL.parent.name == "spool" else QUOTE_SPOOL.parent
+            eligible = bool(msgid and not media and not msg.get("group_id") and os.path.exists(base / "divert-weixin"))
+            if not eligible:
+                self.append_jsonl(INBOX, entry)
+                return False
+            with bridge_route_lock(base, "weixin"):
+                if bridge_message_exists(INBOX, QUOTE_SPOOL, str(msgid), "weixin", from_user):
+                    return False
+                latch = base / ".fallback-weixin"
+                use_spool = eligible and not latch.exists() and bridge_diversion_state(
+                    base / "status.json", base / "state.json", QUOTE_SPOOL, "weixin") != "unavailable"
+                if use_spool:
+                    self.append_jsonl(QUOTE_SPOOL, {"msgid": msgid, "text": text,
+                        "from_user": from_user, "ts": int(time.time())})
+                else:
+                    if eligible:
+                        mark_bridge_fallback(base, "weixin")
+                    self.append_jsonl(INBOX, entry)
+                return use_spool
+
+        diverted = await asyncio.to_thread(persist_route)
+        if diverted:
             try:
-                self.append_jsonl(
-                    QUOTE_SPOOL,
-                    {"msgid": msgid, "text": text,
-                     "from_user": from_user,
-                     "ts": int(time.time())})
-                diverted = True
-                log(f"msg {msgid} diverted to native bridge")
-                # Keep the original payload for diverted messages
-                # (quote-structure debugging, 2026-10-11). Fail-
-                # silent: a retention failure must not break the
-                # divert that just succeeded.
-                try:
-                    self.append_jsonl(DIVERTED_RAW, entry)
-                except Exception as e:
-                    log(f"diverted raw retention failed for "
-                        f"{msgid}: {e}")
+                self.append_jsonl(DIVERTED_RAW, entry)
             except Exception as e:
-                log(f"native divert failed, using inbox: {e}")
-        if not diverted:
-            self.append_jsonl(INBOX, entry)
+                log(f"diverted raw retention failed for {msgid}: {e}")
         self._commit_inbound_seen(msgid)
         # Scenario-aware arrival feedback: exactly one immediate
         # notice per message, chosen by queue/burst/media/stop

@@ -27,6 +27,7 @@ Credentials: env NATIVE_TOKEN_JSON, else cookies.txt + vm_id.txt in
 """
 import fcntl, hashlib, importlib.util, json, os, sys, threading, time, traceback, uuid
 from datetime import datetime, timezone
+from pathlib import Path
 
 BASE = os.environ.get("NATIVE_BRIDGE_HOME", "/home/hatch/workspace/native-bridge")
 # Explicit overrides remain available to existing integrations and sandbox tests.
@@ -328,6 +329,11 @@ def write_status(extra, active=None):
                 cur_active = {}
             cur_active.update(active)
             cur["active"] = cur_active
+            heartbeats = cur.get("worker_heartbeat")
+            if not isinstance(heartbeats, dict):
+                heartbeats = {}
+            heartbeats.update({channel: int(time.time()) for channel in active})
+            cur["worker_heartbeat"] = heartbeats
         cur["ts"] = int(time.time())
         tmp = STATUS_F + ".tmp"
         with open(tmp, "w", encoding="utf-8") as target:
@@ -677,6 +683,11 @@ def _append_inbox_once(path, record):
 
 def fallback_to_inbox(ch, row, why):
     cfg = runtime_config()["channels"][ch]
+    if ch in ("weixin", "wecom"):
+        common = _load_channel_common()
+        if common is None:
+            raise RuntimeError("channel routing guard unavailable")
+        common.mark_bridge_fallback(Path(BASE), ch)
     msgid, text = row["msgid"], row.get("text", "")
     if ch == "weixin":
         rec = {"msgid": msgid, "ts": int(time.time()),
@@ -2054,8 +2065,10 @@ class ChannelWorker(threading.Thread):
             init = read_signal_ts(cfg.get("boundary_file"))
             self.update_cs(last_boundary_ts=init if init is not None else 0)
         while True:
+            step_ok = False
             try:
                 self.step(spool, cfg.get("boundary_file"))
+                step_ok = True
             except Exception:
                 traceback.print_exc()
             try:
@@ -2063,7 +2076,7 @@ class ChannelWorker(threading.Thread):
                 # cadence (todo 6): the old stale-ts gate raced the
                 # supervisor's own status writes and in practice only
                 # one channel's summary ever landed.
-                if time.time() - getattr(self, "_active_written_at",
+                if step_ok and time.time() - getattr(self, "_active_written_at",
                                          0) >= 15:
                     self._active_written_at = time.time()
                     write_status({}, active={ch: self._active_summary()})
@@ -2072,6 +2085,15 @@ class ChannelWorker(threading.Thread):
             time.sleep(POLL_SECS)
 
     def step(self, spool, boundary_f):
+        """Hold the channel routing lock across state checks and external calls."""
+        common = _load_channel_common()
+        with common.bridge_route_lock(Path(BASE), self.ch) if self.ch in ("weixin", "wecom") else common.exclusive_file_lock(Path(BASE) / (".route-" + self.ch + ".lock")):
+            if self.ch in ("weixin", "wecom") and os.path.exists(os.path.join(BASE, ".fallback-" + self.ch)):
+                return
+            self._step_locked(spool, boundary_f)
+
+    def _step_locked(self, spool, boundary_f):
+        """Process one iteration under the shared channel ownership lock."""
         ch = self.ch
         cs = self.cs()
         if self._hold_submission():
@@ -2401,6 +2423,21 @@ class ChannelWorker(threading.Thread):
                 return
             turn = merged_turn
 
+    def _fallback_is_safe(self, row, nbytes):
+        """Do not switch lanes while any earlier bridge work would be stranded."""
+        cs = self.cs()
+        if len(self.queue) > 1:
+            return False
+        recovered = cs.get("recovery_queue") or []
+        remaining = [entry for entry in recovered if entry.get("recovery_id") != row.get("_recovery_id")]
+        if remaining:
+            return False
+        spool = os.path.join(BASE, "spool", f"{self.ch}.jsonl")
+        try:
+            return os.path.getsize(spool) <= cs["spool_offset"] + nbytes
+        except OSError:
+            return False
+
     def _start_next(self):
         """Submit once; only errors before reservation may use the fallback."""
         if self._hold_submission():
@@ -2421,6 +2458,9 @@ class ChannelWorker(threading.Thread):
         while True:
             self.drop_gw()
             if not self.ensure_gw():
+                if self.ch in ("weixin", "wecom") and not self._fallback_is_safe(row, nbytes):
+                    self.log("fallback deferred: bridge backlog requires recovery")
+                    return
                 fallback_to_inbox(self.ch, row, "connect_or_auth_failed")
                 self.note_fallback(row, nbytes)
                 self.queue.pop(0)
@@ -2447,6 +2487,10 @@ class ChannelWorker(threading.Thread):
                     self.drop_gw()
                     continue
                 self._note_reconnect_failure(e)
+                if self.ch in ("weixin", "wecom") and not self._fallback_is_safe(row, nbytes):
+                    self.log("fallback deferred: bridge backlog requires recovery")
+                    self.drop_gw()
+                    return
                 fallback_to_inbox(self.ch, row,
                                   f"presend_{type(e).__name__}")
                 self.note_fallback(row, nbytes)

@@ -35,6 +35,7 @@ CHECKS = (
     'tests/test_tunnel_relay.py',
     'tests/test_bridge_runtime.py',
     'tests/test_bridge_reconnect_policy.py',
+    'tests/test_bridge_diversion_health.py',
     'tests/test_bridge_submission_recovery.py',
     'tests/test_bridge_check_health.py',
     'tests/test_weixin_inbound_checkpoint.py',
