@@ -61,10 +61,7 @@ class GatewayBinding:
                                      (item.task_id, str(message_id), context_token, json.dumps(media or [], ensure_ascii=False)))
             reply = self._command(store, item, text, bool(media))
             if reply is not None:
-                task = store.task(item.task_id)
-                store.connection.execute("UPDATE tasks SET state='succeeded',result=? WHERE id=?", (reply, item.task_id))
-                store.connection.execute('INSERT INTO outbound_messages(id,task_id,conversation_id,generation,text,created_at) VALUES (?,?,?,?,?,?)',
-                                         (uuid.uuid4().hex, item.task_id, item.conversation_id, task['generation'], reply, store.clock()))
+                store.complete_command(item.task_id, reply)
             return item
 
     def _command(self, store, item, text: str, has_media: bool) -> str | None:

@@ -58,22 +58,9 @@ def inspect_pending(base: Path, channel: str) -> dict:
 
 
 def _save_state(base: Path, state: dict) -> None:
-    """Commit state and its audit together, syncing the rename before success."""
-    temporary = base / f'.recovery-{uuid.uuid4().hex}.tmp'
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    try:
-        with os.fdopen(descriptor, 'w', encoding='utf-8') as target:
-            json.dump(state, target, ensure_ascii=False, indent=1)
-            target.flush()
-            os.fsync(target.fileno())
-        os.replace(temporary, base / 'state.json')
-        directory = os.open(base, os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
-    finally:
-        temporary.unlink(missing_ok=True)
+    """Persist the state and audit through the shared durable file primitive."""
+    from .files import atomic_text
+    atomic_text(base / 'state.json', json.dumps(state, ensure_ascii=False, indent=1))
 
 
 def resolve_pending(base: Path, channel: str, *, msgid: str, session_id: str,

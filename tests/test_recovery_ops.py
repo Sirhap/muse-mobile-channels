@@ -66,7 +66,7 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(self.read()['submission_pending'], self.pending)
 
     def test_write_failure_preserves_original_pending_and_audit(self):
-        with patch('mobile_channels.recovery.os.replace', side_effect=OSError('disk full')):
+        with patch('mobile_channels.files.os.replace', side_effect=OSError('disk full')):
             with self.assertRaises(OSError):
                 self.resolve()
         self.assertEqual(self.read()['submission_pending'], self.pending)

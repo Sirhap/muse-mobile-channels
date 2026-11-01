@@ -16,6 +16,10 @@ CREATE TABLE IF NOT EXISTS outbound_parts (
     UNIQUE(outbound_id,part_index)
 );
 CREATE INDEX IF NOT EXISTS delivery_queue ON outbound_parts(state,retry_at);
+CREATE TABLE IF NOT EXISTS outbound_rendered_payloads (
+    part_id TEXT PRIMARY KEY REFERENCES outbound_parts(id),
+    text TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS outbound_attempts (
     part_id TEXT NOT NULL REFERENCES outbound_parts(id), token INTEGER NOT NULL,
     owner TEXT NOT NULL, started_at REAL NOT NULL, outcome TEXT NOT NULL,
@@ -123,7 +127,8 @@ class DeliveryStore:
         with self.store.transaction():
             self._expire()
             row = self.connection.execute(
-                "SELECT p.*,c.channel,c.account_id,c.chat_type,c.chat_id,m.generation "
+                "SELECT p.*,c.channel,c.account_id,c.chat_type,c.chat_id,m.generation, "
+                "c.generation AS current_generation "
                 "FROM outbound_parts p JOIN outbound_messages m ON m.id=p.outbound_id "
                 "JOIN conversations c ON c.id=m.conversation_id JOIN tasks task ON task.id=m.task_id "
                 "WHERE p.state IN ('pending','retry_wait') AND p.retry_at<=? "
@@ -141,6 +146,20 @@ class DeliveryStore:
             ).fetchone()
             if row is None:
                 return None
+            rendered = self.connection.execute(
+                "SELECT text FROM outbound_rendered_payloads WHERE part_id=?", (row["id"],)
+            ).fetchone()
+            if rendered is None:
+                # Preserve payloads already attempted by earlier versions. New
+                # parts acquire their source label once, immediately before IO.
+                text = row["text"]
+                if (row["token"] == 0 and row["part_index"] == 0
+                        and row["generation"] < row["current_generation"]):
+                    text = "补充此前对话的结果：\n" + text
+                self.connection.execute("INSERT INTO outbound_rendered_payloads VALUES (?,?)",
+                                        (row["id"], text))
+            else:
+                text = rendered["text"]
             token = row["token"] + 1
             self.connection.execute(
                 "UPDATE outbound_parts SET state='sending',owner=?,token=?,lease_until=? WHERE id=?",
@@ -151,7 +170,7 @@ class DeliveryStore:
                 (row["id"], token, owner, self.store.clock(), "sending"),
             )
             self._aggregate(row["outbound_id"])
-            return DeliveryClaim(row["id"], row["outbound_id"], owner, token, row["text"],
+            return DeliveryClaim(row["id"], row["outbound_id"], owner, token, text,
                                  row["channel"], row["account_id"], row["chat_type"], row["chat_id"],
                                  row["generation"])
 

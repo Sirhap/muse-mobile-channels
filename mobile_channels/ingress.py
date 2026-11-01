@@ -7,6 +7,18 @@ from .models import InboundMessage, IngestResult
 from .storage import Store
 
 
+class IngressRejected(Exception):
+    """A deterministic incoming-content rejection, safe to record and skip."""
+
+
+class IngressValidationError(IngressRejected, ValueError):
+    """Authenticated transport content lacks a supported identity or shape."""
+
+
+class IngressAuthorizationError(IngressRejected, PermissionError):
+    """A valid transport sender is outside this core account's allowlist."""
+
+
 class CoreIngress:
     """Bind an authenticated account and allowlist before accepting user content."""
 
@@ -28,14 +40,17 @@ class CoreIngress:
         references and legacy commands require their own explicit adapter; they
         must not silently be converted to a text task by this entrypoint.
         """
+        if not all(isinstance(value, str) and value.strip() for value in
+                   (message_id, sender_id, chat_id)):
+            raise IngressValidationError('message, sender and conversation identities are required')
         if sender_id not in self.allowed_senders:
-            raise PermissionError('sender is not authorized for this account')
+            raise IngressAuthorizationError('sender is not authorized for this account')
         if chat_type not in ('single', 'group'):
-            raise ValueError('chat_type must be single or group')
+            raise IngressValidationError('chat_type must be single or group')
         if not isinstance(text, str) or not text.strip():
-            raise ValueError('nonempty text is required')
+            raise IngressValidationError('nonempty text is required')
         if self.channel == 'weixin' and chat_type != 'single':
-            raise ValueError('the iLink adapter currently supports private conversations only')
+            raise IngressValidationError('the iLink adapter currently supports private conversations only')
         return self.store.ingest(InboundMessage(
             self.channel, self.account_id, chat_type, chat_id,
             message_id, sender_id, text, received_at,

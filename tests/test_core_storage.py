@@ -29,6 +29,66 @@ class StorageTests(unittest.TestCase):
         self.store = Store(self.path, clock=lambda: self.now)
         self.addCleanup(self.store.close)
 
+    def test_platform_cancel_requires_evidence_and_preserves_completion(self):
+        """Platform facts require fenced ownership and cannot erase a saved result."""
+        item = self.store.ingest(message('external-cancel'))
+        claim = self.store.claim('worker')
+        self.store.begin_submission(claim)
+        self.store.mark_submitted(claim, 'original-run')
+        with self.assertRaises(StateError):
+            self.store.confirm_cancel(claim)
+        with self.assertRaises(ValueError):
+            self.store.confirm_platform_cancel(claim, '')
+        self.store.complete(claim, 'already complete')
+        with self.assertRaises(OwnershipError):
+            self.store.confirm_platform_cancel(claim, 'late_platform_cancel')
+        self.assertEqual(self.store.task(item.task_id)['state'], 'succeeded')
+
+    def test_platform_cancel_rejects_stale_and_unsubmitted_worker(self):
+        """Old worker evidence and unsubmitted claims cannot cancel another attempt."""
+        item = self.store.ingest(message('fenced-cancel'))
+        old = self.store.claim('old', lease_seconds=10)
+        with self.assertRaises(StateError):
+            self.store.confirm_platform_cancel(old, 'platform_cancelled')
+        self.store.begin_submission(old)
+        self.now += 11
+        recovered = self.store.claim_reconciliation(item.task_id, 'new')
+        with self.assertRaises(OwnershipError):
+            self.store.confirm_platform_cancel(old, 'platform_cancelled')
+        self.store.confirm_platform_cancel(recovered, 'platform_cancelled')
+        self.assertEqual(self.store.task(item.task_id)['state'], 'cancelled')
+
+    def test_complete_command_commits_result_outbox_and_event_atomically(self):
+        """Local command receipts bind the current generation and share Store invariants."""
+        item = self.store.ingest(message('command'))
+        self.store.new_generation(item.conversation_id)
+        with self.store.transaction():
+            outbound = self.store.complete_command(item.task_id, 'command done')
+        row = self.store.connection.execute('SELECT * FROM outbound_messages WHERE id=?', (outbound,)).fetchone()
+        self.assertEqual((row['generation'], row['conversation_id'], row['text']),
+                         (1, item.conversation_id, 'command done'))
+        self.assertEqual(self.store.task(item.task_id)['state'], 'succeeded')
+        self.assertEqual(self.store.task(item.task_id)['generation'], 1)
+        self.assertEqual(self.store.connection.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND event='command_succeeded'",
+            (item.task_id,)).fetchone()[0], 1)
+        with self.assertRaises(StateError):
+            self.store.complete_command(item.task_id, 'duplicate')
+
+    def test_complete_command_rejects_claimed_task_and_rolls_back_write_failure(self):
+        """A local command cannot steal work or commit without its outbound result."""
+        item = self.store.ingest(message('claimed-command'))
+        self.store.claim('worker')
+        with self.assertRaises(StateError):
+            self.store.complete_command(item.task_id, 'not allowed')
+        other = self.store.ingest(message('write-failure', chat='bob'))
+        self.store.connection.execute("CREATE TRIGGER fail_command BEFORE INSERT ON outbound_messages "
+                                      "BEGIN SELECT RAISE(ABORT,'simulated failure'); END")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.store.complete_command(other.task_id, 'lost reply')
+        self.assertEqual(self.store.task(other.task_id)['state'], 'queued')
+        self.assertEqual(self.store.connection.execute('SELECT COUNT(*) FROM outbound_messages').fetchone()[0], 0)
+
     def test_connection_pragmas_and_schema_survive_reopen(self):
         """Durability and referential integrity are configured for every connection."""
         with Store(self.path) as reopened:

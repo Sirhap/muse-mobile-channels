@@ -368,6 +368,21 @@ class Store:
             )
             self._event(claim.task_id, "submitted")
 
+    def _complete_result(self, row: sqlite3.Row, text: str, event: str) -> str:
+        """Save a result, bound outbox and audit within the caller's transaction."""
+        outbound_id = _identifier()
+        self.connection.execute(
+            "INSERT INTO outbound_messages(id,task_id,conversation_id,generation,text,created_at) "
+            "VALUES (?,?,?,?,?,?)",
+            (outbound_id, row["id"], row["conversation_id"], row["generation"], text, self.clock()),
+        )
+        self.connection.execute(
+            "UPDATE tasks SET state='succeeded',result=?,owner=NULL,lease_until=NULL WHERE id=?",
+            (text, row["id"]),
+        )
+        self._event(row["id"], event)
+        return outbound_id
+
     def complete(self, claim: Claim, text: str) -> str:
         """Commit execution result and bound outbox together, using fenced ownership."""
         if not isinstance(text, str):
@@ -376,18 +391,31 @@ class Store:
             row = self._owned(claim)
             if row["state"] not in ("running", "reconciling"):
                 raise StateError("cannot complete an unsubmitted task")
-            outbound_id = _identifier()
+            return self._complete_result(row, text, "succeeded")
+
+    def complete_command(self, task_id: str, text: str) -> str:
+        """Complete an unclaimed local command atomically, without an executor.
+
+        Call inside the ingress transaction so command effects, route metadata,
+        task result and outbox either all commit or all roll back together.
+        """
+        if not isinstance(text, str):
+            raise ValueError("command result must be a string")
+        with self._transaction():
+            row = self.connection.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+            if row is None:
+                raise KeyError(task_id)
+            if row["state"] != "queued" or row["attempt_id"] is not None:
+                raise StateError("only unclaimed commands without execution attempts can complete locally")
+            # /new advances generation within this same ingress transaction.
+            # Its immediate receipt belongs to the new context, unlike a late
+            # result from an execution that began in an earlier generation.
             self.connection.execute(
-                "INSERT INTO outbound_messages(id,task_id,conversation_id,generation,text,created_at) "
-                "VALUES (?,?,?,?,?,?)",
-                (outbound_id, claim.task_id, row["conversation_id"], row["generation"], text, self.clock()),
+                "UPDATE tasks SET generation=(SELECT generation FROM conversations WHERE id=tasks.conversation_id) "
+                "WHERE id=?", (task_id,),
             )
-            self.connection.execute(
-                "UPDATE tasks SET state='succeeded',result=?,owner=NULL,lease_until=NULL WHERE id=?",
-                (text, claim.task_id),
-            )
-            self._event(claim.task_id, "succeeded")
-            return outbound_id
+            row = self.connection.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+            return self._complete_result(row, text, "command_succeeded")
 
     def fail(self, claim: Claim, evidence: str) -> None:
         """Record a confirmed execution failure; absence of a heartbeat is insufficient."""
@@ -431,6 +459,24 @@ class Store:
                 "UPDATE tasks SET state='cancelled',owner=NULL,lease_until=NULL WHERE id=?", (claim.task_id,)
             )
             self._event(claim.task_id, "cancelled")
+
+    def confirm_platform_cancel(self, claim: Claim, evidence: str) -> None:
+        """Save the original run's confirmed cancellation, including external UI stops.
+
+        A platform terminal event is independent of a local cancel request.
+        The adapter must correlate the evidence with this attempt's original run;
+        fenced ownership still prevents stale events replacing a saved result.
+        """
+        if not isinstance(evidence, str) or not evidence.strip():
+            raise ValueError("platform cancellation evidence is required")
+        with self._transaction():
+            row = self._owned(claim)
+            if row["state"] not in ("running", "reconciling"):
+                raise StateError("platform cancellation requires a submitted or uncertain task")
+            self.connection.execute(
+                "UPDATE tasks SET state='cancelled',owner=NULL,lease_until=NULL WHERE id=?", (claim.task_id,)
+            )
+            self._event(claim.task_id, "platform_cancelled", evidence)
 
     def task(self, task_id: str) -> dict:
         """Return a detached task snapshot for diagnostics and adapters."""

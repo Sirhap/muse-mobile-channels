@@ -103,7 +103,7 @@ class CoreRunner:
         elif outcome.state == 'failed' and outcome.evidence:
             self.store.fail(claim, outcome.evidence)
         elif outcome.state == 'cancelled' and outcome.evidence:
-            self.store.confirm_cancel(claim)
+            self.store.confirm_platform_cancel(claim, outcome.evidence)
         elif outcome.state not in ('running', 'unknown'):
             raise ValueError('executor returned an outcome without required evidence')
         return outcome.state

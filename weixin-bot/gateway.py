@@ -58,6 +58,8 @@ from channel_common import (  # noqa: E402
     write_offset,
     read_offset,
 )
+from mobile_channels.ingress import IngressRejected  # noqa: E402
+
 from inbound_media import (  # noqa: E402
     INBOUND_MEDIA_MAX_BYTES,
     InboundMediaTooLarge,
@@ -4332,7 +4334,8 @@ class Gateway:
 
         Local I/O, transport and unexpected failures retain the previous
         checkpoint for replay. Only deterministic payload errors may be
-        quarantined; a failed quarantine write must also stop the batch.
+        quarantined, including explicit core validation/authorization rejections;
+        a failed quarantine write must also stop the batch.
         Previously persisted messages are deduplicated when replayed.
         """
         messages = response.get("msgs") or []
@@ -4341,7 +4344,7 @@ class Gateway:
         for message in messages:
             try:
                 await self.handle_inbound(client, creds, message)
-            except MalformedInboundMessage as error:
+            except (MalformedInboundMessage, IngressRejected) as error:
                 msgid = ""
                 if isinstance(message, dict):
                     msgid = str(message.get("message_id", "") or message.get("msgid", "") or "")

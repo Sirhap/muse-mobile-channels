@@ -32,6 +32,35 @@ class RuntimeTests(unittest.TestCase):
         """Use the validated ingress rather than creating task rows directly."""
         return self.ingress.receive(mid, sender, chat, 'single', 'question')
 
+    def test_platform_cancellation_without_local_request_releases_session(self):
+        """A terminal event from Muse UI cancellation is valid without phone /stop."""
+        first = self.receive()
+        runner = CoreRunner(self.store, self.executor, 'worker')
+        self.assertEqual(runner.tick(), 'accepted')
+        self.executor.query.return_value = ExecutionOutcome('cancelled', evidence='platform_run_cancelled')
+        self.assertEqual(runner.tick(), 'cancelled')
+        task = self.store.task(first.task_id)
+        self.assertEqual((task['state'], task['cancel_requested']), ('cancelled', 0))
+        event = self.store.connection.execute(
+            "SELECT evidence FROM task_events WHERE task_id=? AND event='platform_cancelled'",
+            (first.task_id,)).fetchone()
+        self.assertEqual(event['evidence'], 'platform_run_cancelled')
+        next_task = self.receive('next')
+        self.assertEqual(runner.tick(), 'accepted')
+        self.assertEqual(self.store.task(next_task.task_id)['state'], 'running')
+
+    def test_platform_cancel_is_recovered_after_worker_restart(self):
+        """Lease recovery accepts the original run's cancelled terminal evidence."""
+        first = self.receive()
+        runner = CoreRunner(self.store, self.executor, 'first', lease_seconds=10)
+        runner.tick()
+        self.now += 11
+        self.executor.query.return_value = ExecutionOutcome('cancelled', evidence='platform_run_cancelled')
+        with Store(self.path, clock=lambda: self.now) as reopened:
+            self.assertEqual(CoreRunner(reopened, self.executor, 'second').tick(), 'cancelled')
+            self.assertEqual(reopened.task(first.task_id)['state'], 'cancelled')
+        self.executor.submit.assert_called_once()
+
     def test_full_ingress_execution_delivery_and_dedup(self):
         """A real task progresses once and its answer retains the original route."""
         task = self.receive()
