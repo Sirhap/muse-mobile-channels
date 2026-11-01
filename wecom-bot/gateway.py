@@ -1127,7 +1127,7 @@ def slash_help_text():
 
 # Receipts whose wording is the contract. Both gateways keep these
 # strings identical; the slash audit test compares them.
-SLASH_NEW_ACK = "已记下换会话请求。下一条进入原生桥的文字会开启新会话。"
+SLASH_NEW_ACK = "已开启新会话。"
 SLASH_NEW_FAIL_ACK = (
     "换会话请求未保存，请稍后再试。当前会话没有变。"
 )
