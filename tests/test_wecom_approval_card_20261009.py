@@ -43,6 +43,7 @@ SBX = Path("/tmp/wecom-apprcard-sbx")
 shutil.rmtree(SBX, ignore_errors=True)
 SBX.mkdir(parents=True)
 os.environ["HOME"] = str(SBX)
+os.environ["APPROVAL_ADMINS_JSON"] = json.dumps({"wecom": {"testuser": ["testuser"]}})
 
 spec = importlib.util.spec_from_file_location(
     "wcgw_appr", ROOT / "wecom-bot" / "gateway.py")
@@ -70,28 +71,28 @@ wc.APPROVAL_RELAY_DIR = RELAY_DIR
 (RELAY_DIR / "state.json").write_text(json.dumps({
     "next_num": 4,
     "items": {"3": {"approval_id": "aid-3", "who": "Shell command",
-                    "what": "命令：git push", "status": "pending"}},
+                    "expires_ms": 9999999999999, "what": "命令：git push", "status": "pending"}},
 }), encoding="utf-8")
 
 # ---------- (a)-(c) helper level ----------
-res = wc.approval_card_decide("appr-3", "appr_once")
-check("a: appr_once label", res == ("已批准·仅这次 ✅", True))
+res = wc.approval_card_decide("appr-3", "appr_once", "testuser", "testuser")
+check("a: appr_once label", res == ("决定已登记，等待确认", True))
 rows = read_jsonl(RELAY_DIR / "decisions.jsonl")
 check("a: one decision row", len(rows) == 1
       and rows[0]["num"] == "3"
       and rows[0]["decision"] == "allow_once"
       and rows[0]["channel"] == "wecom-card")
 
-res = wc.approval_card_decide("appr-999", "appr_deny")
-check("b: unknown num fails", res == ("提交失败 ❌", False))
+res = wc.approval_card_decide("appr-999", "appr_deny", "testuser", "testuser")
+check("b: unknown num fails", res == ("无权处理或审批已过期 ❌", False))
 check("b: nothing appended", len(read_jsonl(RELAY_DIR / "decisions.jsonl")) == 1)
 
 check("c: ordinary card untouched",
-      wc.approval_card_decide("optcard-test-1", "btn_confirm") is None)
+      wc.approval_card_decide("optcard-test-1", "btn_confirm", "testuser", "testuser") is None)
 check("c: confirm key on appr card untouched",
-      wc.approval_card_decide("appr-3", "btn_confirm") is None)
+      wc.approval_card_decide("appr-3", "btn_confirm", "testuser", "testuser") is None)
 check("c: bad task id untouched",
-      wc.approval_card_decide("appr-x", "appr_once") is None)
+      wc.approval_card_decide("appr-x", "appr_once", "testuser", "testuser") is None)
 
 # ---------- (f)-(g) idempotency ----------
 _orig_state_text = (RELAY_DIR / "state.json").read_text(encoding="utf-8")
@@ -100,35 +101,35 @@ _orig_state_text = (RELAY_DIR / "state.json").read_text(encoding="utf-8")
     "next_num": 8,
     "items": {
         "5": {"approval_id": "aid-5", "who": "Shell command",
-              "what": "命令：git push", "status": "decided:allow_always"},
+              "expires_ms": 9999999999999, "what": "命令：git push", "status": "decided:allow_always"},
         "6": {"approval_id": "aid-6", "who": "Shell command",
-              "what": "命令：git push", "status": "gone"},
+              "expires_ms": 9999999999999, "what": "命令：git push", "status": "gone"},
         "7": {"approval_id": "aid-7", "who": "Shell command",
-              "what": "命令：git push", "status": "pending"},
+              "expires_ms": 9999999999999, "what": "命令：git push", "status": "pending"},
     }}), encoding="utf-8")
 before_rows = len(read_jsonl(RELAY_DIR / "decisions.jsonl"))
-res = wc.approval_card_decide("appr-5", "appr_once")
+res = wc.approval_card_decide("appr-5", "appr_once", "testuser", "testuser")
 check("f: already-decided click shows in-effect decision",
       res == ("已批准·永久 ✅", True))
 check("f: already-decided click appends nothing",
       len(read_jsonl(RELAY_DIR / "decisions.jsonl")) == before_rows)
-res = wc.approval_card_decide("appr-6", "appr_once")
+res = wc.approval_card_decide("appr-6", "appr_once", "testuser", "testuser")
 check("f: gone approval click fails as expired",
       res == ("已失效 ❌", False))
 check("f: gone click appends nothing",
       len(read_jsonl(RELAY_DIR / "decisions.jsonl")) == before_rows)
 
 (RELAY_DIR / "decisions.jsonl").write_text("", encoding="utf-8")
-ack = wc.slash_approval_decide_ack("7", "allow_always", "wecom")
+ack = wc.slash_approval_decide_ack("7", "allow_always", "wecom", "testuser", "testuser")
 check("g: first submit appended", ack.startswith("已提交")
       and len(read_jsonl(RELAY_DIR / "decisions.jsonl")) == 1)
-ack = wc.slash_approval_decide_ack("7", "allow_once", "wecom")
+ack = wc.slash_approval_decide_ack("7", "allow_once", "wecom", "testuser", "testuser")
 check("g: second submit blocked as already-submitted",
       "已提交过" in ack
       and len(read_jsonl(RELAY_DIR / "decisions.jsonl")) == 1)
-res = wc.approval_card_decide("appr-7", "appr_deny")
+res = wc.approval_card_decide("appr-7", "appr_deny", "testuser", "testuser")
 check("g: card click shows first submission, appends nothing",
-      res == ("已批准·永久 ✅", True)
+      res == ("决定已登记，等待确认", True)
       and len(read_jsonl(RELAY_DIR / "decisions.jsonl")) == 1)
 
 (RELAY_DIR / "state.json").write_text(_orig_state_text, encoding="utf-8")
@@ -216,7 +217,7 @@ async def scenario_d():
                if f["body"].get("response_type") == "update_template_card"]
     check("d: card updated to decision label", len(updates) == 1
           and updates[0]["body"]["template_card"]["main_title"]["title"]
-          == "已批准·永久 ✅")
+          == "决定已登记，等待确认")
     check("d: card registry marked", g.cards["appr-3"]["status"] == "appr_always")
 
 

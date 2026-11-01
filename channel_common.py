@@ -619,6 +619,104 @@ def pid_alive(pid: int) -> bool:
     return True
 
 
+def bridge_route_lock(base: Path, channel: str):
+    """Serialize one channel's bridge execution and gateway handoff decisions."""
+    if channel not in ("weixin", "wecom"):
+        raise ValueError("unsupported channel")
+    return exclusive_file_lock(base / (".route-" + channel + ".lock"))
+
+
+def mark_bridge_fallback(base: Path, channel: str) -> None:
+    """Persist a fail-closed latch before moving any work to the hook lane."""
+    base.mkdir(parents=True, exist_ok=True)
+    path = base / (".fallback-" + channel)
+    with path.open("a") as handle:
+        handle.flush()
+        os.fsync(handle.fileno())
+    directory = os.open(base, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+def bridge_message_exists(inbox: Path, spool: Path, msgid: str, channel: str, route: str) -> bool:
+    """Check both durable lanes while holding the channel routing lock.
+
+    Incomplete or corrupt records prevent an unsafe second handoff.
+    """
+    found = False
+    for path in (inbox, spool):
+        try:
+            data = path.read_bytes()
+        except FileNotFoundError:
+            continue
+        if data and not data.endswith(b"\n"):
+            raise ValueError("incomplete routing queue")
+        for line in data.splitlines():
+            try:
+                row = json.loads(line)
+            except (ValueError, UnicodeError) as exc:
+                raise ValueError("corrupt routing queue") from exc
+            if not isinstance(row, dict):
+                raise ValueError("invalid routing record")
+            origin = (row.get("from_user_id") or row.get("from_user")) if channel == "weixin" else row.get("chatid")
+            if str(row.get("msgid") or "") == msgid and origin == route:
+                found = True
+    return found
+
+
+def bridge_diversion_state(status_path: Path, state_path: Path, spool_path: Path,
+                           channel: str, now: float | None = None, max_age: float = 45) -> str:
+    """Select bridge, safe fallback, or hold using durable per-channel evidence.
+
+    A missing/corrupt state, ambiguous execution or queued spool is held on the
+    bridge path. Health is advisory and cannot eliminate failure after checking.
+    """
+    if channel not in ("weixin", "wecom"):
+        return "blocked"
+    try:
+        with state_path.open(encoding="utf-8") as source:
+            state = json.load(source)
+        channels = state["channels"]
+        if not isinstance(channels, dict):
+            return "blocked"
+        cs = channels[channel]
+        if not isinstance(cs, dict):
+            return "blocked"
+        turns = cs.get("turns", [])
+        recovered = cs.get("recovery_queue", [])
+        offset = cs.get("spool_offset", 0)
+        if not isinstance(turns, list) or not isinstance(recovered, list) or type(offset) is not int or offset < 0:
+            return "blocked"
+        if cs.get("submission_pending"):
+            return "blocked"
+        try:
+            size = spool_path.stat().st_size
+        except FileNotFoundError:
+            size = 0
+        if offset > size:
+            return "blocked"
+        backlog = offset < size or bool(recovered)
+        try:
+            with status_path.open(encoding="utf-8") as source:
+                status = json.load(source)
+            heartbeat = status["worker_heartbeat"][channel]
+            pid = status["pid"]
+            current = time.time() if now is None else now
+            alive = (type(pid) is int and pid > 0 and pid_alive(pid)
+                     and type(heartbeat) in (int, float) and 0 <= current - heartbeat <= max_age
+                     and status["mode"][channel] == "live"
+                     and not cs.get("reconnect_exhausted"))
+        except (OSError, ValueError, TypeError, KeyError, AttributeError):
+            alive = False
+        if alive:
+            return "ready"
+        return "blocked" if turns or backlog else "unavailable"
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return "blocked"
+
+
 def read_pid_file(path: Path) -> int | None:
     """Integer pid stored in path, or None."""
     try:

@@ -18,6 +18,7 @@ for 60 seconds."""
 import base64
 import os
 import select
+import selectors
 import socket
 import sys
 import threading
@@ -56,31 +57,36 @@ def proxy_target():
 
 
 def connect_via_proxy(hostname):
+    """Open a CONNECT tunnel, releasing its socket if the handshake fails."""
     phost, pport, auth = proxy_target()
     upstream = socket.create_connection((phost, pport), timeout=20)
-    lines = [
-        f"CONNECT {hostname}:7844 HTTP/1.1",
-        f"Host: {hostname}:7844",
-    ]
-    if auth:
-        lines.append(f"Proxy-Authorization: Basic {auth}")
-    upstream.sendall(("\r\n".join(lines) + "\r\n\r\n").encode())
-    buf = b""
-    while b"\r\n\r\n" not in buf:
-        chunk = upstream.recv(4096)
-        if not chunk:
-            raise ConnectionError("proxy closed during CONNECT")
-        buf += chunk
-        if len(buf) > 65536:
-            raise ConnectionError("proxy CONNECT response too large")
-    status = buf.split(b"\r\n", 1)[0].decode(errors="ignore")
-    if " 200" not in status:
-        raise ConnectionError(f"proxy CONNECT failed: {status}")
-    rest = buf.split(b"\r\n\r\n", 1)[1]
-    if rest:
-        # Should not happen for a tunnel endpoint, but keep bytes safe.
-        raise ConnectionError("unexpected bytes after CONNECT response")
-    return upstream
+    try:
+        lines = [
+            f"CONNECT {hostname}:7844 HTTP/1.1",
+            f"Host: {hostname}:7844",
+        ]
+        if auth:
+            lines.append(f"Proxy-Authorization: Basic {auth}")
+        upstream.sendall(("\r\n".join(lines) + "\r\n\r\n").encode())
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = upstream.recv(4096)
+            if not chunk:
+                raise ConnectionError("proxy closed during CONNECT")
+            buf += chunk
+            if len(buf) > 65536:
+                raise ConnectionError("proxy CONNECT response too large")
+        status = buf.split(b"\r\n", 1)[0].decode(errors="ignore")
+        if " 200" not in status:
+            raise ConnectionError(f"proxy CONNECT failed: {status}")
+        rest = buf.split(b"\r\n\r\n", 1)[1]
+        if rest:
+            # Should not happen for a tunnel endpoint, but keep bytes safe.
+            raise ConnectionError("unexpected bytes after CONNECT response")
+        return upstream
+    except BaseException:
+        upstream.close()
+        raise
 
 
 def splice(a, b):
@@ -127,23 +133,55 @@ def handle(client, forced_host=None):
             pass
 
 
+def serve_listeners(bindings):
+    """Bind all required ports before accepting; fail as one supervised service.
+
+    Listener ownership stays in this thread. Only connected clients are handed
+    to workers, so bind/select/accept errors cannot hide in a daemon thread.
+    """
+    listeners = []
+    with selectors.DefaultSelector() as selector:
+        try:
+            for port, forced_host in bindings:
+                srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                listeners.append(srv)
+                srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                srv.bind(("127.0.0.1", port))
+                srv.listen(128)
+                srv.setblocking(False)
+                selector.register(srv, selectors.EVENT_READ, forced_host)
+            for port, forced_host in bindings:
+                print(f"relay: listening on 127.0.0.1:{port} -> {forced_host or 'by-dest-ip'}", flush=True)
+            while True:
+                for key, _ in selector.select():
+                    try:
+                        client, _ = key.fileobj.accept()
+                    except BlockingIOError:
+                        # Readiness may expire before accept; a later poll retries.
+                        continue
+                    try:
+                        client.setblocking(True)
+                        threading.Thread(target=handle, args=(client, key.data), daemon=True).start()
+                    except BaseException:
+                        client.close()
+                        raise
+        finally:
+            for srv in listeners:
+                srv.close()
+
+
 def serve(port, forced_host=None):
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(("127.0.0.1", port))
-    srv.listen(128)
-    print(f"relay: listening on 127.0.0.1:{port} -> {forced_host or 'by-dest-ip'}", flush=True)
-    while True:
-        client, _ = srv.accept()
-        threading.Thread(target=handle, args=(client, forced_host), daemon=True).start()
+    """Serve one listener through the same supervised event loop."""
+    serve_listeners(((port, forced_host),))
 
 
 def main():
-    # Extra listeners used with iptables DNAT from the edge fake IPs:
-    # .34 -> 17844 (region1), .35 -> 17845 (region2). Port encodes the target.
-    threading.Thread(target=serve, args=(17844, "region1.v2.argotunnel.com"), daemon=True).start()
-    threading.Thread(target=serve, args=(17845, "region2.v2.argotunnel.com"), daemon=True).start()
-    serve(LISTEN_PORT)
+    """Start both region listeners and the legacy destination-IP listener."""
+    serve_listeners((
+        (17844, REGION_HOSTS[0]),
+        (17845, REGION_HOSTS[1]),
+        (LISTEN_PORT, None),
+    ))
 
 
 if __name__ == "__main__":
