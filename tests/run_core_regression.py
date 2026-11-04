@@ -49,6 +49,11 @@ CHECKS = (
     'tests/test_death_watch_activity.py',
     'tests/test_worker_death_signal_20261015.py',
     'tests/test_worker_lifecycle_scenario.py',
+    'tests/test_worker_registration_history.py',
+    'tests/test_worker_verdict_binding.py',
+    'tests/test_hook_unknown_worker.py',
+    'tests/test_gateway_worker_review.py',
+    'tests/test_death_watch_reconcile.py',
     'tests/test_sonnet_fix_weixin_20261017.py',
 )
 

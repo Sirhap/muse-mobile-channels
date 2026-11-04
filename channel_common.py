@@ -504,95 +504,164 @@ def _load_cancel_rows(path: Path) -> list:
     return [{"msgid": text, "ts": time.time()} for text in seen]
 
 
-def _merge_worker_activity(path: Path, msgids: list[str], now: float,
-                             source: str, run_id: str | None = None,
-                             progress: str | None = None,
-                             hold_secs: float | None = None,
-                             handoff: bool | None = None) -> dict:
-    """Read-merge-write worker_activity.json under a lock.
+class WorkerOwnershipError(ValueError):
+    """The requested worker no longer owns this message's activity record."""
 
-    The file is the worker's own activity ledger for the death watch
-    (see death_watch_activity.py, source 2/3/4): ``{msgid: {"ts":
-    epoch, "source": str, "run_id": str|None, "progress": str|None,
-    "hold_until": epoch|None, "handoff": bool|None,
-    "handoff_at": epoch|None}}``. Records written by older writers
-    (a bare epoch, or a dict without run_id) are preserved as-is
-    apart from the fields this call sets. A corrupt existing file
-    is replaced by a fresh map: the ledger is a liveness hint, not
-    history, and self-healing beats wedging every later write.
-    Returns the records written, keyed by msgid.
+
+def _worker_record(raw: object) -> dict:
+    """Copy one current activity record without mutating nested history lists."""
+    return dict(raw) if isinstance(raw, dict) else {}
+
+
+def _check_worker_owner(record: dict, run_id: str | None) -> None:
+    """Reject explicit mismatches and require identity after execution takeover."""
+    current = record.get("run_id")
+    if run_id is not None and run_id != current:
+        raise WorkerOwnershipError("worker run does not own the activity record")
+    if record.get("requires_run_id") and not run_id:
+        raise WorkerOwnershipError("worker run id is required after takeover")
+
+
+def _registered_worker_record(raw: object, run_id: str, now: float) -> dict:
+    """Renew the same registration or archive a replaced execution's claims."""
+    if not isinstance(run_id, str) or not run_id.strip():
+        raise ValueError("worker registration requires a nonempty run id")
+    record = _worker_record(raw)
+    current_run = record.get("run_id")
+    retired = list(record.get("retired_run_ids") or [])
+    previous = list(record.get("previous_runs") or [])
+    if run_id in retired or any(
+            isinstance(item, dict) and item.get("run_id") == run_id
+            for item in previous):
+        raise WorkerOwnershipError("retired worker run cannot register again")
+    if current_run == run_id:
+        record.setdefault("registered_at", record.get("ts", now))
+        record["registration_seen_at"] = now
+        return record
+    if record:
+        fields = ("run_id", "ts", "source", "registered_at", "registration_seen_at",
+                  "progress", "hold_until", "handoff", "handoff_at")
+        snapshot = {key: record[key] for key in fields if key in record}
+        snapshot["replaced_at"] = now
+        previous.append(snapshot)
+    if isinstance(current_run, str) and current_run and current_run not in retired:
+        retired.append(current_run)
+    replacement = {"ts": now, "source": "worker-register", "run_id": run_id,
+                   "registered_at": now, "registration_seen_at": now}
+    if previous:
+        replacement["previous_runs"] = previous[-8:]
+    if retired:
+        replacement.update(retired_run_ids=retired, requires_run_id=True)
+    return replacement
+
+
+def _write_worker_activity(path: Path, data: dict) -> None:
+    """Commit private ownership state before any dependent heartbeat operation."""
+    atomic_write_text(path, json.dumps(data, ensure_ascii=False), mode=0o600)
+    directory = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+@contextmanager
+def worker_activity_registration(path: Path, msgids: list[str],
+                                 run_id: str | None, now: float):
+    """Hold ownership across batch registration and the caller's heartbeat I/O.
+
+    Every message is validated before writing the single transaction. A legacy
+    caller without a run id may restart its heartbeat only before any takeover;
+    it does not create activity or claim a new execution. Same-run renewals update
+    registration metadata, never the real-activity timestamp.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = path.with_name("worker_activity.lock")
-    written: dict = {}
-    with lock_path.open("a+") as lock_handle:
+    with path.with_name("worker_activity.lock").open("a+") as lock_handle:
         fcntl.flock(lock_handle, fcntl.LOCK_EX)
         try:
             data = load_json_dict(path)
+            written = {}
             for msgid in msgids:
                 mid = str(msgid)
                 raw = data.get(mid)
-                rec = dict(raw) if isinstance(raw, dict) else {}
-                rec["ts"] = now
-                rec["source"] = source
-                if run_id:
-                    rec["run_id"] = run_id
-                if progress is not None:
-                    rec["progress"] = progress
-                if hold_secs is not None:
-                    if hold_secs > 0:
-                        rec["hold_until"] = now + float(hold_secs)
-                    else:
-                        rec.pop("hold_until", None)
-                if handoff is not None:
-                    if handoff:
-                        rec["handoff"] = True
-                        rec["handoff_at"] = now
-                    else:
-                        rec.pop("handoff", None)
-                        rec.pop("handoff_at", None)
-                data[mid] = rec
-                written[mid] = rec
-            atomic_write_text(path, json.dumps(data, ensure_ascii=False))
+                if run_id is None:
+                    _check_worker_owner(_worker_record(raw), None)
+                else:
+                    written[mid] = _registered_worker_record(raw, run_id, now)
+            if written:
+                data.update(written)
+                _write_worker_activity(path, data)
+            yield written
         finally:
             fcntl.flock(lock_handle, fcntl.LOCK_UN)
-    return written
 
 
 def register_worker_activity(path: Path, msgids: list[str],
                              run_id: str, now: float) -> dict:
-    """Batch-start self-registration (todo 21, route C mapping a).
+    """Register the current attempt while preserving bounded previous snapshots."""
+    with worker_activity_registration(path, msgids, run_id, now) as records:
+        return records
 
-    The worker copies the run_id from its own first message header;
-    that run_id is the key the platform-check runbook resolves
-    against agent.agents spawn metadata.
+
+@contextmanager
+def worker_activity_owner(path: Path, msgids: list[str], run_id: str | None):
+    """Validate current ownership without registering or refreshing activity.
+
+    Callers may stop heartbeat feedback while holding this lock. A stale worker
+    cannot acquire ownership through a stop request, even with a new run id.
     """
-    return _merge_worker_activity(
-        path, msgids, now, source="worker-register", run_id=run_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.with_name("worker_activity.lock").open("a+") as lock_handle:
+        fcntl.flock(lock_handle, fcntl.LOCK_EX)
+        try:
+            data = load_json_dict(path)
+            for msgid in msgids:
+                _check_worker_owner(_worker_record(data.get(str(msgid))), run_id)
+            yield
+        finally:
+            fcntl.flock(lock_handle, fcntl.LOCK_UN)
 
 
 def update_worker_activity(path: Path, msgid: str, now: float,
                            progress: str | None = None,
                            hold_secs: float | None = None,
-                           handoff: bool | None = None) -> dict:
-    """One beat (optionally with progress text), one hold write,
-    or one handoff write.
+                           handoff: bool | None = None,
+                           run_id: str | None = None) -> dict:
+    """Write real beat, progress, declared silence or handoff for the owning run.
 
-    hold_secs > 0 declares "I will be silent this long on purpose";
-    hold_secs == 0 clears an earlier declaration. handoff=True
-    declares "this batch was handed to the main session on purpose";
-    the death watch treats a fresh handoff like a hold (see
-    death_watch_activity.py source 4), and handoff=False clears it.
+    The optional run id keeps existing single-attempt clients compatible. After
+    any takeover it is mandatory, so an old worker cannot refresh its successor's
+    activity. Detailed history is diagnostic data and never current liveness.
     """
-    if handoff is not None:
-        source = "worker-handoff"
-    elif hold_secs is not None:
-        source = "worker-hold"
-    else:
-        source = "worker-beat"
-    return _merge_worker_activity(
-        path, [msgid], now, source=source, progress=progress,
-        hold_secs=hold_secs, handoff=handoff)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.with_name("worker_activity.lock").open("a+") as lock_handle:
+        fcntl.flock(lock_handle, fcntl.LOCK_EX)
+        try:
+            data = load_json_dict(path)
+            mid = str(msgid)
+            record = _worker_record(data.get(mid))
+            _check_worker_owner(record, run_id)
+            source = ("worker-handoff" if handoff is not None else
+                      "worker-hold" if hold_secs is not None else "worker-beat")
+            record.update(ts=now, source=source)
+            if progress is not None:
+                record["progress"] = progress
+            if hold_secs is not None:
+                if hold_secs > 0:
+                    record["hold_until"] = now + float(hold_secs)
+                else:
+                    record.pop("hold_until", None)
+            if handoff is not None:
+                if handoff:
+                    record.update(handoff=True, handoff_at=now)
+                else:
+                    record.pop("handoff", None)
+                    record.pop("handoff_at", None)
+            data[mid] = record
+            _write_worker_activity(path, data)
+            return {mid: record}
+        finally:
+            fcntl.flock(lock_handle, fcntl.LOCK_UN)
 
 
 def trim_mapping(items: list[tuple[str, object]], cap: int, pinned: set[str]) -> dict:

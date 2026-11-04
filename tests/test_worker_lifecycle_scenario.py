@@ -85,9 +85,9 @@ class WorkerLifecycleTests(unittest.TestCase):
                 first = self.run_cli(cli, START, "heartbeat-start", "--msgids", "m1",
                                      "--run-id", RUN)
                 first.assert_called_once()
-                self.run_cli(cli, START + 120, "worker-activity", "--msgid", "m1",
+                self.run_cli(cli, START + 120, "worker-activity", "--msgid", "m1", "--run-id", RUN,
                              "--beat", "--progress", "等待长工具完成")
-                self.run_cli(cli, START + 180, "worker-activity", "--msgid", "m1",
+                self.run_cli(cli, START + 180, "worker-activity", "--msgid", "m1", "--run-id", RUN,
                              "--hold-secs", "2400")
                 renewed = self.run_cli(cli, START + 780, "heartbeat-start", "--msgids", "m1",
                                        "--run-id", RUN)
@@ -96,6 +96,8 @@ class WorkerLifecycleTests(unittest.TestCase):
                 self.assertEqual(ledger["run_id"], RUN)
                 self.assertEqual(ledger["progress"], "等待长工具完成")
                 self.assertEqual(ledger["hold_until"], START + 2580)
+                self.assertEqual(ledger["ts"], START + 180)
+                self.assertEqual(ledger["registration_seen_at"], START + 780)
 
                 info = self.assess(cli, START + 960, terminal=True)
                 self.assertTrue(info["alive"])
@@ -103,9 +105,9 @@ class WorkerLifecycleTests(unittest.TestCase):
                 self.assertEqual(info["source"], "worker-hold")
                 # Even stale registration must not defeat the still-live declared silence.
                 self.assertEqual(self.assess(cli, START + 2500)["source"], "worker-hold")
-                self.run_cli(cli, START + 2581, "worker-activity", "--msgid", "m1",
+                self.run_cli(cli, START + 2581, "worker-activity", "--msgid", "m1", "--run-id", RUN,
                              "--hold-secs", "0")
-                self.run_cli(cli, START + 2590, "worker-activity", "--msgid", "m1",
+                self.run_cli(cli, START + 2590, "worker-activity", "--msgid", "m1", "--run-id", RUN,
                              "--beat", "--progress", "整理主会话交接")
                 self.run_cli(cli, START + 2700, "reply", "--msgid", "m1", "--text",
                              "已登记移交，等待主会话处理，尚未完成。")
@@ -114,7 +116,7 @@ class WorkerLifecycleTests(unittest.TestCase):
                 self.assertEqual(rows[0]["mode"], "reply")
                 self.assertEqual(rows[0]["msgid"], "m1")
                 self.assertTrue(rows[0]["id"])
-                self.run_cli(cli, START + 2700, "worker-activity", "--msgid", "m1", "--handoff")
+                self.run_cli(cli, START + 2700, "worker-activity", "--msgid", "m1", "--run-id", RUN, "--handoff")
                 info = self.assess(cli, START + 7000, terminal=True)
                 self.assertTrue(info["alive"])
                 self.assertEqual(info["source"], "worker-handoff")
@@ -131,9 +133,9 @@ class WorkerLifecycleTests(unittest.TestCase):
             with self.subTest(channel=channel), tempfile.TemporaryDirectory() as temporary:
                 cli = self.make_cli(Path(temporary), channel)
                 self.run_cli(cli, START, "heartbeat-start", "--msgids", "m1", "--run-id", RUN)
-                self.run_cli(cli, START + 120, "worker-activity", "--msgid", "m1",
+                self.run_cli(cli, START + 120, "worker-activity", "--msgid", "m1", "--run-id", RUN,
                              "--beat", "--progress", "准备长工具")
-                self.run_cli(cli, START + 180, "worker-activity", "--msgid", "m1",
+                self.run_cli(cli, START + 180, "worker-activity", "--msgid", "m1", "--run-id", RUN,
                              "--hold-secs", "900")
                 self.assertTrue(self.assess(cli, START + 1000)["alive"])
                 # A heartbeat file's fresh mtime does not replace actual worker activity.

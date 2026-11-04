@@ -357,7 +357,7 @@ def _worker_view(raw: object) -> dict:
 
 
 def _run_mismatch(raw: dict, registered: str | None) -> bool:
-    """Same ignore rule as ``probe._platform_hit``."""
+    """Distinguish two explicit unequal runs from an absent run binding."""
     verdict_run = raw.get("run_id")
     return bool(
         registered
@@ -378,6 +378,10 @@ def _verdict_label(raw: object, registered: str | None, now: float) -> str:
         return "absent"
     if not isinstance(raw, dict):
         return "invalid"
+    verdict_run = raw.get("run_id")
+    if (not isinstance(registered, str) or not registered.strip()
+            or not isinstance(verdict_run, str) or not verdict_run.strip()):
+        return "unbound"
     if _run_mismatch(raw, registered):
         return "run_mismatch"
     checked = probe.epoch_of(raw.get("checked_at"))
@@ -612,7 +616,7 @@ def _leak_kind(labels: list[str], has_registration: bool) -> str:
         return "verdict_unknown_while_silent"
     if any(label.startswith("other:") for label in labels):
         return "verdict_other_while_silent"
-    stale_marks = ("missing_checked_at", "invalid", "missing_status")
+    stale_marks = ("missing_checked_at", "invalid", "missing_status", "unbound")
     if any(
         label in stale_marks or label.startswith("stale:")
         or label.startswith("future:")

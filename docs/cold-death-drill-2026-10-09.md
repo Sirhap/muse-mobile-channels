@@ -1,5 +1,7 @@
 # 冷通道判死演练计划（DEATH_WATCH_SECS=1800）
 
+2026-11-04 更新：下文保留历史演练与当时策略，不能当作当前“静默即续跑／取消”的验收标准。新策略将无可靠平台终态的任务置为待核查；当前验收及 `recovery_attempts.json` 处理以 [长任务待核查说明](task-interruption-review-2026-11-04.md) 和 `tests/test_hook_unknown_worker.py` 为准。历史演练脚本中的旧静默预期不代表当前产品行为。
+
 **STOP. Do not run this drill until the boss authorizes it in writing.**
 Do not run it against the live hatch while preparing, reviewing, or merging
 this plan. This file is the plan. `ops/cold_death_drill.py` defaults off,

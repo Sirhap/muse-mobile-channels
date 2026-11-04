@@ -109,7 +109,7 @@ systemd 单元。
 
 - `hooks/scripts/weixin-inbox.sh`、`hooks/scripts/wecom-inbox.sh` — 轮询
   网关收件箱、把消息攒批，并监管正在干活的 worker：排队、抢占、防饿死、
-  丢消息对账，以及由 worker 内部心跳支撑的失败即停。唤醒载荷在
+  丢消息对账，以及依据真实活动与平台执行状态的任务监管。唤醒载荷在
   30000 字符预算内带同会话历史（最近回合用原文、更早的用摘要）。
   两个渠道的历史互相隔离。
 - `hooks/definitions/weixin-inbox.json`、`hooks/definitions/wecom-inbox.json`
@@ -126,7 +126,13 @@ systemd 单元。
 
 冷通道死亡监视（收件钩子里的 `DEATH_WATCH_SECS=1800`）在恢复或取消
 一个沉默批次之前，会先核查桥和 worker 的真实活动：有新鲜信号就按住
-批次不处理；探针缺失或读不到不算活着。演练方案见
+批次不处理；探针缺失或读不到只能说明状态未知，不能据此续跑或取消。
+无可靠终态时记录 `worker_review.json` 并提醒接手，保留原任务且不阻挡新消息。
+只有当前登记的 `run_id` 对应新鲜平台终态，才走一次自动续跑及后续停止流程。
+worker 的每次 beat、hold、handoff 都应带本次 `--run-id`；同一 run 的
+心跳续期不替代真实活动。处理说明与 Muse 实测见
+[任务待核查修复说明](docs/task-interruption-review-2026-11-04.md)。
+演练方案见
 `docs/cold-death-drill-2026-10-09.md`。`ops/cold_death_drill.py` 只能
 在沙箱里跑。企微在线二次判定植入点是
 `ops/cold_death_live_second_judgment.py`；只有 `DEATH_WATCH_LIVE_PLANT=1`

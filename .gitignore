@@ -18,6 +18,7 @@
 !/pyproject.toml
 !/channel_common.py
 !/credential_health.py
+!/worker_supervision.py
 !/inbound_media.py
 !/death_watch_activity.py
 !/hooks/
