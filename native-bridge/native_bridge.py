@@ -182,31 +182,17 @@ AUTO_ROTATE_TURNS = 80
 AUTO_ROTATE_AGE = 7 * 86400
 NODE_ID = "native-bridge"
 
-# --- /new exit audit (P4, 2026-10-08) ---------------------------------
-# When the user rotates with /new, the fresh session must not leak the
-# previous session's content (the behavioural preamble clause was
-# removed by the user on 2026-10-14; this audit is the bridge-side
-# backstop that remains). At the moment session_for
-# creates the /new session, the OLD session's history is fingerprinted
-# into a frozen corpus (hashes only — the old text itself is never
-# persisted). Replies of THAT fresh session are checked in
-# deliver_reply before delivery: any verbatim fragment of
-# AUDIT_WINDOW+ normalized chars matching the corpus blocks the reply.
-# The audit is bound to the exact fresh session id recorded in state
-# (fresh_session_id): ordinary continued sessions and auto-rotated
-# sessions (80 turns / 7 days) never match it — session_for clears
-# fresh_session_id on any non-/new rotation, so the audit lapses as
-# soon as the fresh session is itself auto-rotated away.
-AUDIT_WINDOW = 24           # min verbatim fragment length that blocks
-AUDIT_STEP = 1              # step 1: ANY >=WINDOW fragment is detected,
-                            # regardless of alignment
-AUDIT_HISTORY_LIMIT = 100   # old-session events pulled at rotation
-AUDIT_MAX_FINGERPRINTS = 8000   # corpus cap; when exceeded, the newest
-                                # old-session content is kept (older
-                                # messages drop out first)
-AUDIT_BLOCK_TEXT = (
-    "⚠️ 这条回复引用了上一会话的内容，已按新会话规则拦截。"
-    "请换个问法，或把需要的背景在新会话里重新发我。")
+# --- /new exit audit REMOVED 2026-11-05 ---------------------------------
+# The P4 (2026-10-08) audit that blocked a fresh-session reply when it
+# carried a >=24-char verbatim fragment of the previous session was
+# removed at the user's explicit instruction ("去掉", 2026-11-05).
+# The user had already removed the behavioural preamble clause on
+# 2026-10-14; this removal deletes the blocking backstop itself, so
+# deliver_reply no longer swaps any reply for a block notice.
+# A fresh session still does not automatically carry old-session
+# context (session_for starts a new session id); only the
+# interception is gone. Old audit state fields in state.json are
+# left untouched as history and are never consulted.
 
 PREAMBLE = (
     "【渠道桥接说明】你正在通过桥接程序回复手机渠道上的用户。"
@@ -469,7 +455,7 @@ def _progress_list_line(ch, msgid):
         return None
     if current is None:
         return f"清单 {len(items)}/{len(items)} ✓"
-    cur = _normalize_audit_text(current)
+    cur = " ".join(current.split())
     if len(cur) > PROGRESS_LIST_ITEM_MAX:
         cur = cur[:PROGRESS_LIST_ITEM_MAX] + "…"
     return f"清单 {done}/{len(items)}：{cur}"
@@ -728,104 +714,12 @@ def fallback_to_inbox(ch, row, why):
     print(f"[{ch}] FALLBACK msgid={msgid} why={why}", flush=True)
 
 
-def _normalize_audit_text(text):
-    """Whitespace-normalize for the audit: collapse every run of
-    whitespace (incl. newlines) to a single space and strip."""
-    return " ".join((text or "").split())
-
-
-def _audit_windows(text):
-    """Fingerprint hashes of every AUDIT_WINDOW-char window of the
-    normalized text (step AUDIT_STEP). Hashes only — the underlying
-    text is never stored anywhere by the audit."""
-    norm = _normalize_audit_text(text)
-    if len(norm) < AUDIT_WINDOW:
-        return set()
-    return {hashlib.sha256(
-        norm[i:i + AUDIT_WINDOW].encode("utf-8")).hexdigest()[:16]
-        for i in range(0, len(norm) - AUDIT_WINDOW + 1, AUDIT_STEP)}
-
-
-def build_audit_corpus(events):
-    """Frozen fingerprint corpus from an OLD session's history events
-    (user + assistant messages both count). Returns a sorted list of
-    window hashes, capped at AUDIT_MAX_FINGERPRINTS; the cap keeps the
-    NEWEST old-session content (messages are folded in newest-first,
-    so the limit drops the oldest material)."""
-    texts = []
-    for ev in sorted(events or [], key=lambda e: e.get("seq", 0)):
-        if ev.get("event_name") not in ("message.user",
-                                        "message.assistant"):
-            continue
-        t = fmt_event(ev).get("text", "")
-        if t and t.strip():
-            texts.append(t)
-    fps = set()
-    for t in reversed(texts):
-        norm = _normalize_audit_text(t)
-        for i in range(0, len(norm) - AUDIT_WINDOW + 1, AUDIT_STEP):
-            if len(fps) >= AUDIT_MAX_FINGERPRINTS:
-                return sorted(fps)
-            fps.add(hashlib.sha256(
-                norm[i:i + AUDIT_WINDOW].encode("utf-8")
-            ).hexdigest()[:16])
-    return sorted(fps)
-
-
-def audit_reply(text, fingerprints):
-    """Return AUDIT_WINDOW when the reply carries a verbatim fragment
-    of >= AUDIT_WINDOW normalized chars present in the fingerprint
-    corpus, else 0. [[FILE:...]] lines and the block notice itself
-    never participate; shorter overlaps (< AUDIT_WINDOW) and
-    paraphrases (no long verbatim run) pass by construction."""
-    if not text or not fingerprints:
-        return 0
-    if text.strip() == AUDIT_BLOCK_TEXT:
-        return 0
-    kept = [ln for ln in text.splitlines()
-            if not (ln.strip().startswith("[[FILE:")
-                    and ln.strip().endswith("]]"))]
-    fps = _audit_windows("\n".join(kept))
-    if not fps:
-        return 0
-    return AUDIT_WINDOW if fps & set(fingerprints) else 0
-
-
-def _audit_gate(ch, text):
-    """True when this channel's reply must be blocked: the channel's
-    CURRENT session is the recorded /new fresh session and the reply
-    hits the frozen corpus. On a hit, bumps audit_blocks /
-    audit_last_block in state and logs audit_blocked with the
-    fragment length only (never the matched text)."""
-    with _state_lock:
-        cs = ch_state(load_state(), ch)
-        fresh_sid = cs.get("fresh_session_id")
-        if not fresh_sid or fresh_sid != cs.get("session_id"):
-            return False
-        fps = cs.get("audit_fingerprints") or []
-        if not fps:
-            return False
-        if not audit_reply(text, fps):
-            return False
-        st = load_state()
-        c = ch_state(st, ch)
-        c["audit_blocks"] = (c.get("audit_blocks") or 0) + 1
-        c["audit_last_block"] = int(time.time())
-        blocks = c["audit_blocks"]
-        save_state(st)
-    print(f"[{ch}] audit_blocked frag_len={AUDIT_WINDOW} "
-          f"blocks={blocks}", flush=True)
-    return True
-
-
 def deliver_reply(ch, msgid, text):
-    """/new exit audit first (fresh sessions only; see _audit_gate):
-    a blocked reply is never delivered — the fixed block notice goes
-    out in its place (and no [[FILE:]] rows either). Everything else
-    is delivered by _deliver_reply_raw unchanged."""
-    if _audit_gate(ch, text):
-        _deliver_reply_raw(ch, msgid, AUDIT_BLOCK_TEXT)
-        return
+    """Deliver a formal reply unchanged.
+
+    The /new exit audit was removed 2026-11-05 at the user's
+    instruction, so no reply is ever swapped for a block notice here.
+    """
     _deliver_reply_raw(ch, msgid, text)
 
 
@@ -1263,39 +1157,19 @@ class ChannelWorker(threading.Thread):
                 self._session_from_stored = False
         if rotate or not sid:
             fresh = bool(cs.get("fresh_start")) and bool(sid)
-            old_sid = sid if fresh else None
             sid = self.new_session()
-            # /new exit audit (P4): at THIS moment — and only here —
-            # fingerprint the just-retired OLD session's history into
-            # the frozen corpus. The corpus is frozen at rotation:
-            # nothing the user says in the NEW session ever enters it,
-            # so a legitimate restatement in the new session can only
-            # be blocked by a long verbatim fragment of the OLD one.
-            # Only hashes are stored; the old text is never persisted.
-            # Any non-/new rotation (first session, auto-rotate)
-            # clears the binding, so the audit lapses with the fresh
-            # session it was bound to.
-            fingerprints = []
-            if old_sid:
-                try:
-                    evs = self.history_events(
-                        old_sid, limit=AUDIT_HISTORY_LIMIT)
-                    fingerprints = build_audit_corpus(evs)
-                    self.log(f"audit corpus built old_sid={old_sid} "
-                             f"fingerprints={len(fingerprints)}")
-                except Exception as e:
-                    self.log("audit corpus build failed:",
-                             type(e).__name__, str(e)[:100],
-                             "; audit corpus empty")
-                    fingerprints = []
+            # /new exit audit removed 2026-11-05: no fingerprint
+            # corpus is built here any more, and no reply is gated
+            # on old-session fragments. A fresh session still gets
+            # a new session id; it simply is not audited.
             st = dict(cs["session_started"])
             st["main"] = int(time.time())
             tn = dict(cs["session_turns"])
             tn["main"] = 0
             self.update_cs(session_id=sid, preamble_done=False,
                            rotate_main=False, fresh_start=False,
-                           fresh_session_id=sid if fresh else None,
-                           audit_fingerprints=fingerprints,
+                           fresh_session_id=None,
+                           audit_fingerprints=[],
                            idle_push_seq=0,
                            session_started=st, session_turns=tn)
             return sid, (PREAMBLE_FRESH if fresh else PREAMBLE)
@@ -1304,8 +1178,7 @@ class ChannelWorker(threading.Thread):
     def _invalidate_session(self, why):
         """LT2 self-heal: forget a server-dead stored session id so
         the next start builds a fresh session instead of reusing a
-        corpse (and so the idle scan stops hammering it). Clears the
-        /new audit binding with it — it referred to the dead sid."""
+        corpse (and so the idle scan stops hammering it)."""
         self.log(f"session dead -> healing ({why})")
         self.update_cs(session_id=None, preamble_done=False,
                        fresh_session_id=None, audit_fingerprints=[],
