@@ -1,103 +1,52 @@
-# 导出 Muse token（桥凭证恢复）
+# Muse 桥凭证恢复与 token 导出
 
-脚本：[`get-muse-token.js`](./get-muse-token.js)（同目录）。这是一段跑在
-浏览器控制台里的代码片段，不是 Node 脚本，不要用 `node` 执行。
+桥使用 `cookies.txt` + `vm_id.txt` 作为主路径，在 Cookie 会话仍有效时换取连接 token；`token.json` 是回退路径。审批中继只使用 Cookie。设置了 `NATIVE_TOKEN_JSON` 时，桥优先使用环境 token，跳过磁盘 Cookie 和 token 文件。
 
-## 什么时候需要它
+Cookie 和 token 都可能被服务端提前作废。文件里的 `exp` 或 Cookie 名义过期时间只能作为参考，不能保证还能使用一天、一周或一个月；缺少平台有效期时标记为未知，不按导出日期推算。
 
-桥（`native_bridge.py`）连 Muse 平台用两套凭证，优先级在 `connect()` 里：
+## 推荐恢复方式：浏览器扩展导出全套凭证
 
-1. 环境变量 `NATIVE_TOKEN_JSON`（临时注入时）；
-2. `~/.config/native-bridge/cookies.txt` + `vm_id.txt`（主力，可自动续期）；
-3. `~/.config/native-bridge/token.json`（回退，字段就是本脚本的输出）。
+1. 用户本人按 [扩展安装说明](muse-cred-extension/README.md) 安装扩展；如果拿到的是扩展源码 ZIP，先解压，再加载其中含 `manifest.json` 的目录。扩展安装包与后续导出的凭证 ZIP 是两份不同文件。
+2. 在自己的浏览器登录 <https://muse.ai>，确认目标 VM 的会话可正常打开，再点击扩展。
+3. 确认 Cookie、VM ID 和 token 均读取成功，下载 `muse-credentials.zip`。如有部分读取失败，先解决错误，不把不完整压缩包当成恢复成功。
+4. 通过环境支持的安全文件投递方式将压缩包交给 Muse，不把内容贴进聊天、日志或仓库。
+5. Muse 先把压缩包解到临时目录，确认只有预期的 `cookies.txt`、`vm_id.txt`、`token.json`，核对两个 VM ID 与预期一致、导出时间是本次。VM 不一致时停止安装并向用户确认，不自动切到另一个 VM。
+6. 在仓库外备份现有凭证，备份目录设为 `0700`；将三份文件安装到 `~/.config/native-bridge/`，目录 `0700`、文件 `0600`。部署配置了 `NATIVE_BRIDGE_CREDENTIALS` 时，以该目录为准。需要修改服务环境中的 `NATIVE_TOKEN_JSON` 时先检查其是否仍覆盖新文件，不输出其值。
+7. 执行下面的只读验活，再完成真实消息验收。凭证文件变化会允许连接重新尝试，但不代表认证已通过，也不自动解除备用通道接管或处理未知提交；恢复切流按 [桥故障恢复说明](../docs/bridge-failover-2026-11-01.md) 操作。
 
-当 cookies 被服务端失效——桥日志出现 `auth/check -> 401
-hatchAdmissionInvalidated`、旧 token WSS 403、各渠道
-`idle_scan_fail_streak` 涨上去——而你手边有已登录的 muse.ai 浏览器时，
-用本脚本导出一份新 token JSON 顶上。2026-10-14 就这样恢复过一次。
+```bash
+~/muse-test-venv/bin/python ~/workspace/native-bridge/check_credentials.py --source all --json
+```
 
-只想恢复 cookies 主力路径（或一次性导出 `cookies.txt` + `vm_id.txt` + `token.json` 全套凭证）：由于 `muse.ai` 的登录 Cookie 带有 `HttpOnly` 标记，页面控制台 JS 无法读取，请直接使用同目录下的跨浏览器扩展 [`muse-cred-extension`](./muse-cred-extension/README.md)（兼容 Chrome / Edge / Firefox）；本脚本只解决纯控制台导出 `token.json` 这一路。
+验活会分别检查桥 Cookie 的 `sessions.list`、桥 token 的 `sessions.list` 和审批 Cookie 的 `egress.approvals`。token 检查遵循 `NATIVE_TOKEN_JSON` 优先，否则读 `token.json`；环境覆盖存在时，不代表磁盘 token 已验证。诊断仅输出状态、来源和检查时间等脱敏字段，不输出凭证或审批正文；缺 SDK、缺文件或认证失败都需要处理，不能用另一项通过来掩盖。
 
-## 使用步骤
+**认证通过之后**，让用户在每个启用的渠道发一条普通问题，记录入站 msgid、正式回复队列 ID 及对应投递 `ok=true`；这表示网关确认平台接收，不表示用户已读。再确认审批查询成功、失败计数已归零。完整步骤见 [Muse 凭证健康实测清单](../docs/bridge-credential-health-muse-cases.md)。
 
-分工先说清：这段脚本**只能由用户本人在自己已登录的浏览器里执行**，
-靠的是用户自己的登录态，Muse 没有这个登录态、无法代跑；用户导出
-后把结果以文件形式交给 Muse，安装和验证由 Muse 在本机完成。
+如果以后提示桥凭证失效，让用户重新登录 Muse，用扩展导出新的 `muse-credentials.zip`，再次以文件交给 Muse，重复备份、核对、安装和两阶段验收；不要只等到名义过期日再处理。
 
-### 第一段：用户本人执行（在自己的浏览器里）
+## 备用方式：控制台只导出 token
 
-1. 浏览器打开 <https://muse.ai>，确认是已登录状态（能看到自己的会话）。
-2. 按 `F12` 打开开发者工具，切到 **Console（控制台）**页签。
-   - 浏览器若提示粘贴保护，按提示手动输入 `allow pasting` 后再粘贴
-     （Chrome 的防自欺粘贴机制，只需第一次）。
-3. 把 `get-muse-token.js` **整段**粘贴进控制台，回车。
-4. 成功时控制台打印一段 JSON 并显示 `✅ 已复制到剪贴板`，内容形如：
+脚本 [`get-muse-token.js`](get-muse-token.js) 是浏览器控制台片段，不能用 Node 执行。它通过浏览器现有登录态请求 token，无法读取 `HttpOnly` Cookie，不能生成 `cookies.txt`。单换 token 可能恢复桥的回退路径，但不能恢复审批中继，也不能证明 Cookie 恢复。
 
-   ```json
-   {
-     "vm_id": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
-     "access_token": "...",
-     "hatch_token": "...",
-     "issued_at": "2026-10-14T11:15:46.000Z",
-     "issued_at_local": "2026/10/14 19:15:46",
-     "exp": null
-   }
-   ```
+用户本人在已登录 muse.ai 页面的开发者工具 Console 中运行整份脚本；如浏览器提示粘贴保护，应先确认自己理解并信任脚本。成功后把 JSON 存为 `token.json` 并以文件交给 Muse，不发送聊天明文。Muse 按上述流程备份、核对预期 VM、安装为 `0600`；VM 不一致时停止，不自动覆盖 `vm_id.txt`。仅检查这一来源可执行：
 
-5. 把这段 JSON 存成一个文件（例如 `token.json`），**以文件形式交给
-   Muse**（走文件投递，不要贴进聊天明文）。
+```bash
+~/muse-test-venv/bin/python ~/workspace/native-bridge/check_credentials.py --source token --json
+```
 
-### 第二段：Muse 接手（在本机安装与验证）
+| 字段 | 说明 |
+| --- | --- |
+| `vm_id` | 目标 VM，必须与预期一致 |
+| `access_token`、`hatch_token` | 实际连接凭证，不应显示在诊断或聊天中 |
+| `issued_at`、`issued_at_local` | 签发时间，用于核对新旧，不是到期时间 |
+| `exp` | 平台提供的名义到期时间；缺失为 `null`，实际也可能提前失效 |
 
-6. Muse 收到文件后安装到桥：先备份旧凭证
-   `cp -a ~/.config/native-bridge/token.json ~/.config/native-bridge/token.json.bak`
-   （旧文件可能已失效，备份只为回滚对照），再把新文件放到
-   `~/.config/native-bridge/token.json` 并 `chmod 600`。装入前核对
-   两点：输出 JSON 里的 `vm_id` 与预期 VM 一致；`issued_at` 与导出
-   时刻一致（别把旧的一份又贴回来）。若输出的 vm_id 与现文件不同，
-   同步更新 `vm_id.txt`。
-7. 验证：桥靠凭证文件的 cred_stamp 变化自动感知，一般**无需重启**，
-   三渠道 `idle_scan_fail_streak` 会自行清零。想要立刻实证，用桥
-   自己的 `connect()` 验活（只打印成败、不打印凭证值）：
+## 出错与安全
 
-   ```bash
-   ~/muse-test-venv/bin/python ~/workspace/cred-replace-2026-10-14/verify.py
-   # 期望输出：CONNECT_OK sessions.list passed
-   ```
+- `auth/check` 没返回 token：确认页面已登录、目标会话可用后重新导出。
+- `/api/session` 没返回 VM ID：等待目标 VM 就绪；不要猜测 ID。
+- 控制台 `Failed to fetch`：确认执行上下文是 muse.ai 页面。
+- token 验证通过但 Cookie 或审批仍失败：重新用扩展导出全套凭证，检查实际凭证目录及环境覆盖；不要重复换 token 来冒充整套恢复。
+- 网络失败与认证失败分别排查；进程 active、心跳新鲜、网关 connected 和文件非空都不能单独证明凭证有效。
 
-## 输出字段
-
-| 字段 | 来源 | 说明 |
-| --- | --- | --- |
-| `vm_id` | `/api/session` | 当前 VM 的 id，桥据此拼 WSS 地址 |
-| `access_token` | `/api/auth/check` | 平台 access token |
-| `hatch_token` | `/api/hatch/token` | 桥连 VM 用的 JWT，`connect()` 必需 |
-| `issued_at` | hatch_token 的 `iat` | 签发时刻（UTC ISO），用来核对新旧 |
-| `issued_at_local` | 同上 | 签发时刻的本地时间字符串 |
-| `exp` | hatch_token 的 `exp` | 过期时刻（epoch 秒），平台不给时为 `null` |
-
-桥的 `connect()` 实际只取 `vm_id`、`access_token`、`hatch_token` 三个
-字段，其余是给人核对用的。
-
-## 出错对照
-
-- `auth/check 没返回 access_token，可能未登录`：当前页未登录或登录态
-  已过期，先在页面上正常登录再重跑。
-- `session 没返回 vm_id（VM 可能在重启）`：等 VM 起来、页面能正常打开
-  会话后再重跑。
-- 控制台报 `Failed to fetch` / 跨域错误：确认控制台是在 muse.ai 页面的
-  上下文里打开的（脚本用的是相对路径 `/api/...`，在别的站点页面跑必然
-  失败）。
-- 装完桥仍旧 401：多半是贴回了旧 JSON 或存错路径；核对 `issued_at`
-  是不是刚刚这次导出的时刻、路径是不是
-  `~/.config/native-bridge/token.json`。
-
-## 安全须知
-
-- 输出的 JSON 是**等同登录凭证**的真 token：只存本机
-  `~/.config/native-bridge/token.json`（0600），不要贴进聊天、issue、
-  截图或任何会入仓/同步的位置；交给 Muse 时用文件投递，
-  别经第三方渠道。
-- 本脚本本身不含任何凭证，可以正常入仓和分享；要防的是它的**输出**。
-- token 会被服务端失效或到期，失效就重跑本脚本导出一份新的，不需要
-  改任何代码。
+导出文件等同登录凭证，只在用户和目标 Muse 环境之间安全交接，保存在仓库外的私有目录。脚本及扩展源码可以分享，实际凭证压缩包不能作为安装包分享或提交。

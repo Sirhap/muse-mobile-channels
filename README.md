@@ -31,8 +31,9 @@ iLink, WeCom via the official smart-robot long connection.
 - `wecom-bot/` — 企业微信智能机器人网关（长连接 WebSocket）：网关本体、
   命令行工具，systemd 单元 `wecom-bot.service`。
 - `native-bridge/` — 原生桥：把网关收到的消息送进 Muse 会话；桥的
-  cookie / token 凭证可自动续期，失效时的恢复办法见
-  `native-bridge/get-muse-token.md`。
+  Cookie 会话仍有效时可重新换取连接 token，静态 token 不会自行续期。
+  失效恢复见 [凭证恢复说明](native-bridge/get-muse-token.md)，
+  分来源验活与真实收发见 [Muse 实测清单](docs/bridge-credential-health-muse-cases.md)。
 - `channel-restore/` — 双网关自愈：定时重装被冲掉的 systemd 单元并
   拉起服务，自带存活探针与心跳清单（`HEARTBEAT.md`）。
 - `cloudflare-tunnel-plugin/` — Cloudflare 隧道插件：给 Muse 一个

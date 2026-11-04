@@ -84,6 +84,7 @@ class BridgeRuntimeTests(unittest.TestCase):
         """A supplied client bypasses optional SDK imports for contract tests."""
         bridge = load_bridge()
         bridge.GW2 = MagicMock()
+        bridge.GW2.return_value.call_json.return_value = {"sessions": []}
         token = {'vm_id': 'sandbox', 'access_token': 'unused', 'hatch_token': 'unused'}
         with patch.dict('os.environ', {'NATIVE_TOKEN_JSON': json.dumps(token)}):
             gateway = bridge.connect()

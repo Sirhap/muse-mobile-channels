@@ -34,6 +34,8 @@ CHECKS = (
     'tests/test_shadow_inventory.py',
     'tests/test_tunnel_relay.py',
     'tests/test_bridge_runtime.py',
+    'tests/test_bridge_credential_health.py',
+    'tests/test_credential_diagnostics.py',
     'tests/test_bridge_reconnect_policy.py',
     'tests/test_bridge_diversion_health.py',
     'tests/test_bridge_submission_recovery.py',
@@ -43,8 +45,10 @@ CHECKS = (
     'tests/test_wecom_durable_handoff.py',
     'tests/test_bridge_queue_recovery.py',
     'tests/test_approval_notify_resilience.py',
+    'tests/test_approval_credential_health.py',
     'tests/test_death_watch_activity.py',
     'tests/test_worker_death_signal_20261015.py',
+    'tests/test_worker_lifecycle_scenario.py',
     'tests/test_sonnet_fix_weixin_20261017.py',
 )
 

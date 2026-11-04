@@ -17,6 +17,7 @@ _ROOT = str(Path(__file__).resolve().parents[1])
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 from channel_common import exclusive_file_lock
+from credential_health import append_health_notice_once, credential_fingerprint, failure_kind
 from mobile_channels.approvals import decision_allowed
 from mobile_channels.modes import lease_from_env, ModeError
 
@@ -29,6 +30,8 @@ STATUS_F = os.path.join(BASE, "status.json")
 DECISIONS_F = os.path.join(BASE, "decisions.jsonl")
 OFFSET_F = os.path.join(BASE, "decisions.offset")
 POLL_SECS = 20
+AUTH_RETRY_SECS = 600
+MAX_CONNECT_FAILURES = 3
 STICKY_DECISION_SECS = 30 * 60  # prefer_source sticky window
 CHANNEL_ORDER = ("weixin", "wecom")
 TEST = os.environ.get("APPROVAL_RELAY_TEST") == "1"
@@ -200,7 +203,7 @@ def resolve_notify_channels(item=None, explicit=None):
     return both
 
 
-def notify(text, tag, approval=None, channels=None, item=None):
+def notify(text, tag, approval=None, channels=None, item=None, event_id=None):
     """Push a notice to selected channels (prefer_source_else_both).
 
     ``channels`` if given is used as-is (after normalizing); otherwise
@@ -209,6 +212,8 @@ def notify(text, tag, approval=None, channels=None, item=None):
     template card instead of plain text. WeChat keeps the text form.
     The text is kept on the card row as fallback/audit content.
     Missing evidence still notifies both channels.
+    ``event_id`` gives health retries a stable id per target; ordinary approval
+    notifications keep their existing randomly generated ids.
 
     各通道写入独立处理，单渠道部署也能收到通知。全部目标写入
     失败时抛出 OSError，调用方保留未通知状态，等待下一轮重试。
@@ -234,7 +239,9 @@ def notify(text, tag, approval=None, channels=None, item=None):
     last_error = None
     for ch in targets:
         cfg = CHANNELS[ch]
-        row = {"id": f"appr-{tag}-{uuid.uuid4().hex[:8]}",
+        row_id = (f"appr-health-{event_id}-{ch}" if event_id is not None
+                  else f"appr-{tag}-{uuid.uuid4().hex[:8]}")
+        row = {"id": row_id,
                "queued_at": int(time.time()), "content": text}
         if ch == "wecom" and approval is not None:
             row["mode"] = "send_card"
@@ -255,13 +262,16 @@ def notify(text, tag, approval=None, channels=None, item=None):
             if TEST:
                 path = os.path.join(BASE, "shadow", f"{ch}-outbox.jsonl")
                 os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "a", encoding="utf-8") as output:
-                fcntl.flock(output, fcntl.LOCK_EX)
-                output.write(json.dumps(row, ensure_ascii=False) + "\n")
-                output.flush()
-                os.fsync(output.fileno())
+            if event_id is not None:
+                append_health_notice_once(path, row)
+            else:
+                with open(path, "a", encoding="utf-8") as output:
+                    fcntl.flock(output, fcntl.LOCK_EX)
+                    output.write(json.dumps(row, ensure_ascii=False) + "\n")
+                    output.flush()
+                    os.fsync(output.fileno())
             queued = True
-        except (OSError, ModeError) as exc:
+        except (OSError, ValueError, ModeError) as exc:
             last_error = exc
             log("notify write disabled or failed", ch, type(exc).__name__)
         finally:
@@ -547,11 +557,14 @@ def connect():
     cookies = load_cookies(os.path.join(CONF, "cookies.txt"))
     with open(os.path.join(CONF, "vm_id.txt"), encoding="utf-8") as source:
         vm_id = source.read().strip()
+    if not isinstance(cookies, str) or not cookies.strip() or not vm_id:
+        raise ValueError("approval credentials are empty")
     return GW2(cookies=cookies, vm_id=vm_id)
 
 
-def poll_once(gw, st):
-    d = gw.call_json("egress.approvals", timeout=20)
+def poll_once(gw, st, response=None):
+    """Process approvals, optionally using a separately verified read response."""
+    d = gw.call_json("egress.approvals", timeout=20) if response is None else response
     pending = d.get("pending_approvals") or d.get("pending") or []
     live_ids = set()
     for a in pending:
@@ -753,22 +766,141 @@ def cycle():
         _cycle_locked()
 
 
+def _credential_health(st):
+    """Load retry ownership, resetting the budget only when used files change."""
+    stamp = credential_fingerprint(CONF, ("cookies.txt", "vm_id.txt"))
+    health = st.setdefault("credential_health", {})
+    if not isinstance(health, dict):
+        raise ValueError("invalid approval credential health state")
+    if health.get("fingerprint") != stamp:
+        old_outage = bool(health.get("outage_active"))
+        last_verified = health.get("last_verified_at")
+        pending = health.get("pending_notices", [])
+        health.clear()
+        health.update(fingerprint=stamp, state="unknown", failures=0,
+                      reconnect_exhausted=False, next_attempt_at=0,
+                      last_verified_at=last_verified, outage_active=old_outage,
+                      pending_notices=pending, incident_id=uuid.uuid4().hex,
+                      failure_notice_created=False, failure_kind=None)
+        save_state(st)
+    return health
+
+
+def _health_notice(health, text, phase):
+    """Retain a stable event until an outbox accepts it, including after restart."""
+    health.setdefault("pending_notices", []).append({
+        "id": f"{health['incident_id']}-{phase}", "text": text,
+    })
+
+
+def _connection_failed(st, health, exc, now):
+    """Persist bounded retries without storing potentially sensitive exceptions."""
+    kind = failure_kind(exc)
+    if not health.get("outage_active"):
+        health["incident_id"] = uuid.uuid4().hex
+        health["failure_notice_created"] = False
+    count = int(health.get("failures", 0)) + 1
+    delay = AUTH_RETRY_SECS if kind in {"auth", "configuration"} else (5 if count == 1 else 10)
+    health.update(state="failed", failure_kind=kind, failures=count,
+                  reconnect_exhausted=count >= MAX_CONNECT_FAILURES,
+                  next_attempt_at=now + delay, outage_active=True)
+    if not health.get("failure_notice_created"):
+        if kind == "auth":
+            text = ("审批监听认证失败，当前无法读取或提交审批。请在已登录 Muse 的浏览器安装凭证扩展，"
+                    "重新导出完整 muse-credentials.zip 文件交给 Muse 安装并验活；只更新 token 无法恢复审批监听。"
+                    "重试有次数上限，之后等待 Cookie 或 VM 凭证文件更新。")
+        elif kind == "configuration":
+            text = ("审批监听凭证文件缺失或格式无效。请把浏览器扩展导出的完整 muse-credentials.zip "
+                    "文件交给 Muse 核对并安装；只更新 token 无法恢复审批监听。重试有次数上限。")
+        else:
+            text = ("审批监听连接异常，尚不能确认是凭证问题。将有限重试，连续失败 3 次后暂停；"
+                    "请让 Muse 检查网络、依赖和连接状态，排除问题后通过受控运维方式恢复。")
+        _health_notice(health, text, "failed")
+        health["failure_notice_created"] = True
+    save_state(st)
+
+
+def _connection_verified(st, health, now):
+    """Record a real approval-list RPC independently of later local processing."""
+    if health.get("outage_active"):
+        _health_notice(health, "审批监听认证和审批列表读取已恢复；聊天收发仍需实际消息验证。", "recovered")
+    health.update(state="healthy", failure_kind=None, failures=0,
+                  reconnect_exhausted=False, next_attempt_at=0,
+                  last_verified_at=now, outage_active=False)
+    save_state(st)
+
+
+def _flush_health_notices(st, health):
+    """Retry outbox writes separately from transport health and keep stable ids."""
+    notices = health.setdefault("pending_notices", [])
+    while notices:
+        event = notices[0]
+        save_state(st)
+        try:
+            notify(event["text"], "credential", event_id=event["id"])
+        except Exception as exc:
+            log("credential health notice not queued", type(exc).__name__)
+            return
+        notices.pop(0)
+        save_state(st)
+
+
+def _health_status(health):
+    """Expose verification evidence, never credential values or exception text."""
+    state = health.get("state")
+    missing = any(not Path(CONF, name).is_file() for name in ("cookies.txt", "vm_id.txt"))
+    status = ("healthy" if state == "healthy" else
+              "missing" if missing else "failed" if state == "failed" else "unknown")
+    return {"status": status, "failure_kind": health.get("failure_kind"),
+            "failures": health.get("failures", 0),
+            "reconnect_exhausted": health.get("reconnect_exhausted", False),
+            "next_attempt_at": health.get("next_attempt_at", 0),
+            "last_verified_at": health.get("last_verified_at")}
+
+
 def _cycle_locked():
     """Run one cycle while holding the relay process lock."""
     st = load_state()
+    health = _credential_health(st)
     gw = None
+    n, err = -1, None
+    now = time.time()
     try:
-        gw = connect()
-        n = poll_once(gw, st)
-        consume_decisions(gw, st)
-        err = None
-    except Exception as e:
-        n, err = -1, f"{type(e).__name__}: {str(e)[:150]}"
-        log("cycle error", err)
+        if not health.get("reconnect_exhausted") and now >= health.get("next_attempt_at", 0):
+            try:
+                gw = connect()
+                response = gw.call_json("egress.approvals", timeout=20)
+                if not isinstance(response, dict):
+                    raise ValueError("invalid approval-list response")
+                if response.get("error") or response.get("ok") is False:
+                    raise RuntimeError("approval-list request was rejected")
+            except Exception as exc:
+                _connection_failed(st, health, exc, now)
+                err = f"approval connection failed ({health['failure_kind']})"
+            else:
+                _connection_verified(st, health, now)
+                try:
+                    n = poll_once(gw, st, response=response)
+                    consume_decisions(gw, st)
+                except Exception as exc:
+                    err = f"approval processing failed ({type(exc).__name__})"
+        elif health.get("state") == "failed":
+            err = f"approval connection paused ({health.get('failure_kind', 'unknown')})"
     finally:
         if gw is not None:
-            gw.close()
-    _atomic_text(STATUS_F, json.dumps({"ts": int(time.time()), "pending": n, "last_error": err}))
+            try:
+                gw.close()
+            except Exception as exc:
+                log("gateway close failed", type(exc).__name__)
+    _flush_health_notices(st, health)
+    if err:
+        log("cycle error", err)
+    _atomic_text(STATUS_F, json.dumps({
+        "ts": int(time.time()), "pending": n, "last_error": err,
+        "credential_sources": {"cookies": _health_status(health)},
+        "active_source": "cookies" if health.get("state") == "healthy" else None,
+        "last_verified_at": health.get("last_verified_at"),
+    }))
 
 
 def main():
