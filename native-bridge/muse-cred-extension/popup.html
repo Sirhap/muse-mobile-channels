@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Muse 桥凭证导出工具</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <header class="header">
+    <div class="title-row">
+      <div class="brand">
+        <img src="icons/icon-32.png" alt="Muse" class="brand-icon" width="22" height="22" />
+        <h1>Muse 桥凭证导出</h1>
+      </div>
+      <span id="status-badge" class="badge badge-idle">待命</span>
+    </div>
+    <p class="subtitle">直接读取浏览器底层 Cookie（含 <code>HttpOnly</code>）与 Token</p>
+  </header>
+
+  <main class="container">
+    <div class="controls">
+      <button id="btn-fetch" class="btn btn-primary">🔄 重新读取当前登录态</button>
+      <div class="format-row">
+        <label for="cookie-format"><code>cookies.txt</code> 格式：</label>
+        <select id="cookie-format">
+          <option value="netscape" selected>Netscape 标准格式（推荐）</option>
+          <option value="header">Header 单行格式 (k=v; ...)</option>
+        </select>
+      </div>
+    </div>
+
+    <div id="status-box" class="status-box hidden"></div>
+
+    <section class="card">
+      <div class="card-header">
+        <span class="card-title">1. 主力凭证：<code>cookies.txt</code></span>
+        <span id="cookie-stats" class="meta">未读取</span>
+      </div>
+      <div class="btn-group">
+        <button id="btn-dl-cookies" class="btn btn-secondary" disabled>💾 下载 cookies.txt</button>
+        <button id="btn-cp-cookies" class="btn btn-ghost" disabled>📋 复制内容</button>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="card-header">
+        <span class="card-title">2. 虚拟机标识：<code>vm_id.txt</code></span>
+        <span id="vmid-stats" class="meta">未读取</span>
+      </div>
+      <div class="btn-group">
+        <button id="btn-dl-vmid" class="btn btn-secondary" disabled>💾 下载 vm_id.txt</button>
+        <button id="btn-cp-vmid" class="btn btn-ghost" disabled>📋 复制 vm_id</button>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="card-header">
+        <span class="card-title">3. 回退凭证：<code>token.json</code></span>
+        <span id="token-stats" class="meta">未读取</span>
+      </div>
+      <div class="btn-group">
+        <button id="btn-dl-token" class="btn btn-secondary" disabled>💾 下载 token.json</button>
+        <button id="btn-cp-token" class="btn btn-ghost" disabled>📋 复制 JSON</button>
+      </div>
+    </section>
+
+    <button id="btn-dl-all" class="btn btn-accent" disabled>
+      📦 一键打包下载 ZIP (muse-credentials.zip)
+    </button>
+
+    <details class="preview-panel">
+      <summary>查看脱敏摘要与落盘命令提示</summary>
+      <pre id="summary-output">请先打开并登录 https://muse.ai</pre>
+    </details>
+  </main>
+
+  <script src="popup.js"></script>
+</body>
+</html>

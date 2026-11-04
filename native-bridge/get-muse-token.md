@@ -16,8 +16,7 @@ hatchAdmissionInvalidated`、旧 token WSS 403、各渠道
 `idle_scan_fail_streak` 涨上去——而你手边有已登录的 muse.ai 浏览器时，
 用本脚本导出一份新 token JSON 顶上。2026-10-14 就这样恢复过一次。
 
-只想恢复 cookies 主力路径是另一件事：从已登录的 muse.ai 重新导出
-cookies 存回 `cookies.txt`；本脚本只解决 token.json 这一路。
+只想恢复 cookies 主力路径（或一次性导出 `cookies.txt` + `vm_id.txt` + `token.json` 全套凭证）：由于 `muse.ai` 的登录 Cookie 带有 `HttpOnly` 标记，页面控制台 JS 无法读取，请直接使用同目录下的跨浏览器扩展 [`muse-cred-extension`](./muse-cred-extension/README.md)（兼容 Chrome / Edge / Firefox）；本脚本只解决纯控制台导出 `token.json` 这一路。
 
 ## 使用步骤
 

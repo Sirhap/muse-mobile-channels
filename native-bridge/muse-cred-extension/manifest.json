@@ -1,0 +1,37 @@
+{
+  "manifest_version": 3,
+  "name": "Muse Bridge Credential Exporter",
+  "version": "1.0.0",
+  "description": "一键导出 muse.ai 的 cookies.txt（含 HttpOnly）、vm_id.txt 与 token.json，兼容 Chrome、Edge 与 Firefox。",
+  "permissions": [
+    "cookies",
+    "tabs",
+    "scripting"
+  ],
+  "host_permissions": [
+    "https://muse.ai/*",
+    "https://*.muse.ai/*"
+  ],
+  "icons": {
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
+  "action": {
+    "default_title": "导出 Muse 桥凭证",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png",
+      "48": "icons/icon-48.png",
+      "128": "icons/icon-128.png"
+    }
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "muse-cred-exporter@muse.ai",
+      "strict_min_version": "109.0"
+    }
+  }
+}
