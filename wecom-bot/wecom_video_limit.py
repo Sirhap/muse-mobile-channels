@@ -10,7 +10,9 @@ so the gateway can tell the user and skip the upload.
 from __future__ import annotations
 
 import hashlib
+import os
 import subprocess
+import uuid
 from pathlib import Path
 
 # Hard cap observed live (DEF-wecom-video-10mb): 10,541,549 bytes was
@@ -95,26 +97,35 @@ def _cached_kind(path: Path) -> str:
 
 
 def _run_ffmpeg(cmd: list[str], out: Path) -> str:
-    """Run one ffmpeg command.
+    """Run one ffmpeg command atomically via a temporary file.
 
     Returns ``ok``, ``unreadable`` (the input cannot be opened; further
     rungs will fail the same way), or ``failed``.
     """
+    tmp_out = out.with_name(f".{out.stem}.tmp.{os.getpid()}.{uuid.uuid4().hex}{out.suffix}")
+    run_cmd = [str(tmp_out) if arg == str(out) else arg for arg in cmd]
     try:
         result = subprocess.run(
-            cmd, capture_output=True, timeout=_FFMPEG_TIMEOUT_SECS,
+            run_cmd, capture_output=True, timeout=_FFMPEG_TIMEOUT_SECS,
         )
     except subprocess.TimeoutExpired:
         _log(f"ffmpeg timed out writing {out.name}")
+        _discard(tmp_out)
         _discard(out)
         return "failed"
     except OSError as exc:
         _log(f"ffmpeg could not start: {exc}")
+        _discard(tmp_out)
         _discard(out)
         return "failed"
-    if result.returncode == 0 and out.exists() and out.stat().st_size > 0:
-        return "ok"
+    if result.returncode == 0 and tmp_out.exists() and tmp_out.stat().st_size > 0:
+        try:
+            os.replace(tmp_out, out)
+            return "ok"
+        except OSError as exc:
+            _log(f"ffmpeg atomic replace failed: {exc}")
     err = result.stderr.decode("utf-8", "replace")
+    _discard(tmp_out)
     _discard(out)
     if "Error opening input" in err or "Invalid data found" in err:
         _log(f"ffmpeg cannot read input: {err[-200:]}")

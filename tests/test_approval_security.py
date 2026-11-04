@@ -191,6 +191,17 @@ class ApprovalSecurityTests(unittest.TestCase):
         gateway.call_json.assert_not_called()
         self.assertEqual(self.base.joinpath('decisions.offset').read_text(), '0')
 
+    def test_scoped_item_never_falls_back_to_global_admins(self):
+        """An explicit private decision_scope cannot be bypassed by an admin in another chat or channel."""
+        from mobile_channels.approvals import authorized_operator
+        scoped_item = self.state['items']['1']
+        admins = {'wecom': {'other-room': ['bob']}, 'weixin': {'room': ['alice']}}
+        self.assertFalse(authorized_operator(scoped_item, 'wecom', 'other-room', 'bob', admins))
+        self.assertFalse(authorized_operator(scoped_item, 'weixin', 'room', 'alice', admins))
+        self.assertFalse(authorized_operator({'decision_scope': {}}, 'wecom', 'other-room', 'bob', admins))
+        self.assertTrue(authorized_operator(scoped_item, 'wecom', 'room', 'alice', admins))
+        self.assertTrue(authorized_operator({'expires_ms': 9999999999999}, 'wecom', 'other-room', 'bob', admins))
+
 
 class CoreApprovalTests(unittest.TestCase):
     def setUp(self):

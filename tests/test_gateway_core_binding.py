@@ -329,6 +329,44 @@ class GatewayCoreBindingTests(unittest.IsolatedAsyncioTestCase):
         await self.inbound('wecom', sender='intruder')
         self.assertEqual(self.rows('tasks'), [])
 
+    async def test_stop_command_cancels_queued_tasks_immediately(self):
+        """A /stop command immediately cancels queued tasks in the same conversation without cancelling itself."""
+        await self.inbound('wecom', identifier='queued-1', text='first job')
+        await self.inbound('wecom', identifier='queued-2', text='second job')
+        await self.inbound('wecom', identifier='stop-cmd', text='/stop')
+        tasks = {row['id']: row for row in self.rows('tasks')}
+        self.assertEqual(len(tasks), 3)
+        cancelled = [row for row in tasks.values() if row['state'] == 'cancelled']
+        succeeded = [row for row in tasks.values() if row['state'] == 'succeeded']
+        self.assertEqual(len(cancelled), 2)
+        self.assertEqual(len(succeeded), 1)
+        self.assertIn('2 个活动任务', self.rows('outbound_messages')[0]['text'])
+
+    async def test_empty_text_without_media_is_rejected_not_queued_as_attachment(self):
+        """Empty text without media raises IngressValidationError instead of queuing a bogus [附件] task."""
+        from mobile_channels.ingress import IngressValidationError
+        binding = self.gateways['wecom']._core_binding
+        with self.assertRaises(IngressValidationError):
+            binding.receive(
+                message_id='empty-no-media',
+                sender_id='alice',
+                chat_id='alice',
+                chat_type='single',
+                text='',
+                media=None,
+            )
+        self.assertEqual(self.rows('tasks'), [])
+        item = binding.receive(
+            message_id='whitespace-with-media',
+            sender_id='alice',
+            chat_id='alice',
+            chat_type='single',
+            text='   ',
+            media=[{'type': 'file', 'name': 'doc.pdf'}],
+        )
+        self.assertTrue(item.created)
+        self.assertIn('附件信息已保存', self.rows('outbound_messages')[0]['text'])
+
 
 if __name__ == '__main__':
     unittest.main()

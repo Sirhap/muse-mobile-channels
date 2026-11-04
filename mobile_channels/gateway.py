@@ -54,7 +54,8 @@ class GatewayBinding:
         """
         with Store(self.database) as store, store.transaction():
             ingress = CoreIngress(store, self.channel, self.account_id, self.settings['allowed_senders'])
-            item = ingress.receive(str(message_id), sender_id, chat_id, chat_type, text or '[附件]')
+            effective_text = text if (isinstance(text, str) and text.strip()) else ('[附件]' if media else text)
+            item = ingress.receive(str(message_id), sender_id, chat_id, chat_type, effective_text)
             if not item.created:
                 return item
             store.connection.execute('INSERT INTO gateway_routes VALUES (?,?,?,?)',
@@ -81,7 +82,10 @@ class GatewayBinding:
             generation = store.new_generation(item.conversation_id)
             return f'已开启当前聊天的新上下文（第 {generation} 代）。旧任务保留原回复路由。'
         if command in ('/stop', '/停止'):
-            rows = store.connection.execute("SELECT id FROM tasks WHERE conversation_id=? AND state IN ('claimed','running','reconciling')", (item.conversation_id,)).fetchall()
+            rows = store.connection.execute(
+                "SELECT id FROM tasks WHERE conversation_id=? AND id!=? AND state IN ('queued','claimed','running','reconciling')",
+                (item.conversation_id, item.task_id),
+            ).fetchall()
             for row in rows:
                 store.request_cancel(row['id'], item.conversation_id)
             return f'已登记当前聊天 {len(rows)} 个活动任务的取消请求，等待执行方确认。'
@@ -97,13 +101,11 @@ class GatewayBinding:
         loop = asyncio.get_running_loop()
         owner = f'gateway-{self.channel}-{uuid.uuid4().hex}'
 
-        async def send(claim):
+        async def send(claim, route=None):
             """Send to the immutable database route without using a legacy outbox."""
             if claim.channel != self.channel or claim.account_id != self.account_id:
                 raise PermissionError('delivery belongs to another account')
             if self.channel == 'weixin':
-                with Store(self.database) as store:
-                    route = store.connection.execute('SELECT r.context_token FROM gateway_routes r JOIN outbound_messages o ON o.task_id=r.task_id WHERE o.id=?', (claim.outbound_id,)).fetchone()
                 if route is None:
                     return SendOutcome('rejected', evidence='no authenticated inbound reply route')
                 result = await gateway.send_text(client, credentials, claim.chat_id, claim.text,
@@ -123,14 +125,20 @@ class GatewayBinding:
 
         def tick():
             """Use a connection owned by this thread and a bounded channel call."""
-            def transport(claim):
-                future = asyncio.run_coroutine_threadsafe(send(claim), loop)
-                try:
-                    return future.result(timeout=30)
-                except BaseException:
-                    future.cancel()
-                    raise
             with Store(self.database) as store:
+                def transport(claim):
+                    route = None
+                    if self.channel == 'weixin':
+                        route = store.connection.execute(
+                            'SELECT r.context_token FROM gateway_routes r JOIN outbound_messages o ON o.task_id=r.task_id WHERE o.id=?',
+                            (claim.outbound_id,),
+                        ).fetchone()
+                    future = asyncio.run_coroutine_threadsafe(send(claim, route), loop)
+                    try:
+                        return future.result(timeout=30)
+                    except BaseException:
+                        future.cancel()
+                        raise
                 return DeliveryRunner(store, transport, owner, chunk_limit=1000,
                                       channel=self.channel, account_id=self.account_id).tick()
 

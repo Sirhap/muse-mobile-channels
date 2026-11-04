@@ -53,7 +53,10 @@ def atomic_write_text(path: Path, text: str, mode: int = 0o644) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
     try:
-        tmp.write_text(text, encoding="utf-8")
+        with tmp.open("w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
         os.chmod(tmp, mode)
         os.replace(tmp, path)
     finally:

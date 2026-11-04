@@ -63,7 +63,7 @@ ensure_hatch_tree() {
   if ! id hatch >/dev/null 2>&1; then
     return 0
   fi
-  owner="$(stat -c '%U' "$path" 2>/dev/null || true)"
+  owner="$(stat -c '%U' "$path" 2>/dev/null || stat -f '%Su' "$path" 2>/dev/null || true)"
   if [[ -n "$owner" && "$owner" != "hatch" ]]; then
     chown -R hatch:hatch "$path" && echo "channel-restore: chown hatch $path"
   fi

@@ -1478,10 +1478,10 @@ def _approval_pending_submission(num):
     except (OSError, ValueError):
         off = 0
     try:
-        with open(APPROVAL_RELAY_DIR / "decisions.jsonl",
-                  encoding="utf-8") as f:
-            f.seek(off)
-            lines = jsonl_text_lines(f.read())
+        with open(APPROVAL_RELAY_DIR / "decisions.jsonl", "rb") as f:
+            f.seek(max(0, off))
+            raw = f.read().decode("utf-8", "replace")
+            lines = jsonl_text_lines(raw)
     except OSError:
         return None
     for line in lines:

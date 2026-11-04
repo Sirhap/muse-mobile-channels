@@ -23,11 +23,15 @@ def authorized_operator(item: Mapping, channel: str, chat_id: str, operator_id: 
     """
     if not all(isinstance(value, str) and value for value in (channel, chat_id, operator_id)):
         return False
-    scope = item.get('decision_scope') or {}
-    if (isinstance(scope, dict) and scope.get('channel') == channel
-            and scope.get('chat_id') == chat_id and isinstance(scope.get('operator_ids'), list)
-            and operator_id in scope['operator_ids']):
-        return True
+    scope = item.get('decision_scope')
+    if scope is not None:
+        return bool(
+            isinstance(scope, dict)
+            and scope.get('channel') == channel
+            and scope.get('chat_id') == chat_id
+            and isinstance(scope.get('operator_ids'), list)
+            and operator_id in scope['operator_ids']
+        )
     if administrators is None:
         try:
             administrators = json.loads(os.environ.get('APPROVAL_ADMINS_JSON', '{}'))

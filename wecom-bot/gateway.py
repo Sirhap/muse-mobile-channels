@@ -459,6 +459,14 @@ def sniff_ext(data: bytes) -> str:
         return "zip"
     if data[:4] == b"\x00\x00\x00\x18" or data[4:8] == b"ftyp":
         return "mp4"
+    if data[:9] == b"#!SILK_V3" or data[:10] == b"\x02#!SILK_V3":
+        return "silk"
+    if data[:5] == b"#!AMR":
+        return "amr"
+    if data[:4] == b"RIFF" and data[8:12] == b"WAVE":
+        return "wav"
+    if data[:3] == b"ID3" or data[:2] in (b"\xff\xfb", b"\xff\xf3", b"\xff\xf2"):
+        return "mp3"
     return "bin"
 
 
@@ -1688,10 +1696,10 @@ def _approval_pending_submission(num):
     except (OSError, ValueError):
         off = 0
     try:
-        with open(APPROVAL_RELAY_DIR / "decisions.jsonl",
-                  encoding="utf-8") as f:
-            f.seek(off)
-            lines = jsonl_text_lines(f.read())
+        with open(APPROVAL_RELAY_DIR / "decisions.jsonl", "rb") as f:
+            f.seek(max(0, off))
+            raw = f.read().decode("utf-8", "replace")
+            lines = jsonl_text_lines(raw)
     except OSError:
         return None
     for line in lines:
