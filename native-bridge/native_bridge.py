@@ -566,6 +566,25 @@ def token_params():
     return token
 
 
+def _ensure_muse_cli_path():
+    """Make muse_cli importable before any caller needs load_cookies.
+
+    The SDK lives in the reference clone at <repo>/reference/muse-cli/src
+    (override with MUSE_CLI_SRC, same as native-probe/gw2.py). It used to
+    become importable only as a side effect of importing gw2, so any code
+    path that touched cookie_params() before gateway_class() — e.g. the
+    new _connect_source() — died in a fresh process with ModuleNotFoundError
+    and the bridge reported CredentialAuthError although the cookies were
+    fine. Inserting the path (no import) is harmless when the clone is
+    absent, e.g. in a bare worktree.
+    """
+    src = os.environ.get("MUSE_CLI_SRC") or os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "reference", "muse-cli", "src")
+    if src and os.path.isdir(src) and src not in sys.path:
+        sys.path.insert(0, src)
+
+
 def cookie_params():
     """Load Cookie credentials without allowing a partial or empty file set."""
     cp = os.path.join(CONF_DIR, "cookies.txt")
@@ -576,6 +595,7 @@ def cookie_params():
         raise ValueError("incomplete native cookie file set")
     with open(vp, encoding="utf-8") as source:
         vm_id = source.read().strip()
+    _ensure_muse_cli_path()
     from muse_cli.gateway import load_cookies
     cookies = load_cookies(cp)
     if not isinstance(cookies, str) or not cookies.strip() or not vm_id:
