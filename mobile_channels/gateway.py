@@ -10,6 +10,7 @@ import uuid
 from pathlib import Path
 
 from .ingress import CoreIngress
+from .models import IngestResult
 from .modes import lease_from_env
 from .runtime import DeliveryRunner, SendOutcome
 from .storage import Store
@@ -38,29 +39,119 @@ class GatewayBinding:
                 store.connection.execute('''CREATE TABLE IF NOT EXISTS gateway_routes (
                     task_id TEXT PRIMARY KEY REFERENCES tasks(id),
                     external_id TEXT NOT NULL, context_token TEXT NOT NULL DEFAULT '',
-                    media_json TEXT NOT NULL DEFAULT '[]')''')
+                    media_json TEXT NOT NULL DEFAULT '[]',
+                    merged_ids_json TEXT NOT NULL DEFAULT '[]')''')
+                cols = [c[1] for c in store.connection.execute("PRAGMA table_info(gateway_routes)").fetchall()]
+                if 'merged_ids_json' not in cols:
+                    store.connection.execute("ALTER TABLE gateway_routes ADD COLUMN merged_ids_json TEXT NOT NULL DEFAULT '[]'")
+                self._has_merged_ids_col = True
+                store.connection.execute('''CREATE TABLE IF NOT EXISTS gateway_route_externals (
+                    task_id TEXT NOT NULL REFERENCES tasks(id),
+                    external_id TEXT NOT NULL,
+                    PRIMARY KEY (task_id, external_id))''')
+                store.connection.execute('''CREATE INDEX IF NOT EXISTS idx_gateway_route_externals_ext ON gateway_route_externals(external_id)''')
 
     def close(self) -> None:
         """Release the mode lease when the gateway process stops."""
         if self.lease:
             self.lease.close()
 
-    def receive(self, *, message_id: str, sender_id: str, chat_id: str,
-                chat_type: str, text: str, context_token: str = '', media: list | None = None):
+    def create_coalescer(self, idle_gap_secs: float = 2.0, max_wait_secs: float = 6.0):
+        """为当前网关创建一个入站连发防打碎合并器。"""
+        from .coalesce import InboundCoalescer
+        return InboundCoalescer(idle_gap_secs=idle_gap_secs, max_wait_secs=max_wait_secs)
+
+    def find_task_by_external_id(self, external_id: str) -> str | None:
+        """根据外部消息 ID（包括被合并的次级消息 ID）反查权威 task_id。"""
+        if not external_id or not str(external_id).strip():
+            return None
+        with Store(self.database) as store:
+            row = store.connection.execute(
+                'SELECT task_id FROM gateway_route_externals WHERE external_id=? LIMIT 1',
+                (str(external_id).strip(),)
+            ).fetchone()
+            if row:
+                return row['task_id']
+            row = store.connection.execute(
+                'SELECT task_id FROM gateway_routes WHERE external_id=? LIMIT 1',
+                (str(external_id).strip(),)
+            ).fetchone()
+            return row['task_id'] if row else None
+
+    def receive(self, coalesced=None, *, message_id: str | None = None, sender_id: str | None = None,
+                chat_id: str | None = None, chat_type: str | None = None, text: str | None = None,
+                context_token: str = '', media: list | None = None, merged_ids: list[str] | None = None,
+                received_at: float | None = None):
         """Atomically accept content, commands and route metadata, deduplicating replay.
 
         Unsupported capabilities are explicit replies rather than silent fallback
         to another scheduler. Media metadata is preserved for operator recovery.
+        When merged_ids are provided, all associated external IDs are indexed in
+        gateway_route_externals and preserved in gateway_routes.
         """
+        if coalesced is not None:
+            message_id = coalesced.message_id
+            sender_id = coalesced.sender_id
+            chat_id = coalesced.chat_id
+            chat_type = coalesced.chat_type
+            text = coalesced.text
+            context_token = coalesced.context_token or context_token
+            media = coalesced.media if coalesced.media is not None else media
+            merged_ids = coalesced.merged_ids if coalesced.merged_ids is not None else merged_ids
+            received_at = coalesced.received_at if coalesced.received_at is not None else received_at
+
+        raw_ids = (merged_ids or ([message_id] if message_id is not None else []))
+        all_merged_ids: list[str] = []
+        for mid in raw_ids:
+            s = str(mid).strip()
+            if s and s not in all_merged_ids:
+                all_merged_ids.append(s)
+        if message_id is not None and str(message_id).strip() and str(message_id).strip() not in all_merged_ids:
+            all_merged_ids.insert(0, str(message_id).strip())
+
+        # 幂等性防御：检查主消息 ID 以及所有关联合并 ID 是否已被索引（包含作为次级合并消息），若已存在直接返回既有 Task
+        for mid in all_merged_ids:
+            existing_task_id = self.find_task_by_external_id(mid)
+            if existing_task_id is not None:
+                with Store(self.database) as store:
+                    row = store.connection.execute('SELECT conversation_id FROM tasks WHERE id=?', (existing_task_id,)).fetchone()
+                    conv_id = row['conversation_id'] if row else ''
+                return IngestResult(conv_id, existing_task_id, False)
+
         with Store(self.database) as store, store.transaction():
             ingress = CoreIngress(store, self.channel, self.account_id, self.settings['allowed_senders'])
-            effective_text = text if (isinstance(text, str) and text.strip()) else ('[附件]' if media else text)
-            item = ingress.receive(str(message_id), sender_id, chat_id, chat_type, effective_text)
+            effective_text = text if (isinstance(text, str) and text.strip()) else ('[附件]' if media else (text or ''))
+            item = ingress.receive(
+                str(message_id),
+                str(sender_id or ''),
+                str(chat_id or ''),
+                str(chat_type or 'single'),
+                effective_text,
+                received_at=received_at,
+            )
             if not item.created:
                 return item
-            store.connection.execute('INSERT INTO gateway_routes VALUES (?,?,?,?)',
-                                     (item.task_id, str(message_id), context_token, json.dumps(media or [], ensure_ascii=False)))
-            reply = self._command(store, item, text, bool(media))
+
+            # 写入 gateway_routes
+            if getattr(self, '_has_merged_ids_col', True):
+                store.connection.execute(
+                    'INSERT INTO gateway_routes (task_id, external_id, context_token, media_json, merged_ids_json) VALUES (?,?,?,?,?)',
+                    (item.task_id, str(message_id), context_token, json.dumps(media or [], ensure_ascii=False), json.dumps(all_merged_ids, ensure_ascii=False))
+                )
+            else:
+                store.connection.execute(
+                    'INSERT INTO gateway_routes (task_id, external_id, context_token, media_json) VALUES (?,?,?,?)',
+                    (item.task_id, str(message_id), context_token, json.dumps(media or [], ensure_ascii=False))
+                )
+
+            # 记录所有关联外部消息 ID 至 gateway_route_externals 索引表
+            for ext_id in all_merged_ids:
+                store.connection.execute(
+                    'INSERT OR IGNORE INTO gateway_route_externals (task_id, external_id) VALUES (?,?)',
+                    (item.task_id, ext_id)
+                )
+
+            reply = self._command(store, item, text or '', bool(media))
             if reply is not None:
                 store.complete_command(item.task_id, reply)
             return item
@@ -112,6 +203,28 @@ class GatewayBinding:
                                                  context_token=route['context_token'],
                                                  client_id='core-' + hashlib.sha256(claim.part_id.encode()).hexdigest()[:24])
                 success = isinstance(result, dict) and bool(result) and ('ret' in result or 'errcode' in result) and result.get('ret') in (None, 0) and result.get('errcode') in (None, 0)
+            elif self.channel == 'feishu':
+                # 原生请求级 uuid 幂等键：由 part_id 生成确定性 UUID
+                part_uuid = str(uuid.uuid5(uuid.NAMESPACE_URL, f"muse:claim:{claim.part_id}"))
+                if hasattr(gateway, 'send_text'):
+                    result = await gateway.send_text(
+                        claim.chat_id,
+                        claim.text,
+                        chat_type=claim.chat_type,
+                        uuid=part_uuid,
+                    )
+                elif hasattr(gateway, 'send_message'):
+                    receive_id_type = 'chat_id' if claim.chat_type == 'group' or claim.chat_id.startswith('oc_') else 'open_id'
+                    result = await gateway.send_message(
+                        receive_id=claim.chat_id,
+                        receive_id_type=receive_id_type,
+                        msg_type='text',
+                        content=json.dumps({'text': claim.text}, ensure_ascii=False),
+                        uuid=part_uuid,
+                    )
+                else:
+                    result = {'code': -1, 'msg': 'unsupported feishu gateway'}
+                success = isinstance(result, dict) and result.get('code') == 0
             else:
                 result = await gateway.send_frame({'cmd': 'aibot_send_msg',
                     'headers': {'req_id': 'core-' + hashlib.sha256(claim.part_id.encode()).hexdigest()[:24]},

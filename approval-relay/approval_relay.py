@@ -13,6 +13,9 @@ import json, os, sys, time, uuid
 from pathlib import Path
 from contextlib import nullcontext
 
+_BASE_DIR = str(Path(__file__).resolve().parent)
+if _BASE_DIR not in sys.path:
+    sys.path.insert(0, _BASE_DIR)
 _ROOT = str(Path(__file__).resolve().parents[1])
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
@@ -20,6 +23,12 @@ from channel_common import exclusive_file_lock
 from credential_health import append_health_notice_once, credential_fingerprint, failure_kind
 from mobile_channels.approvals import decision_allowed
 from mobile_channels.modes import lease_from_env, ModeError
+from approval_policy import (
+    SecurityPolicyEngine,
+    PolicyAction,
+    RiskLevel,
+    get_default_policy_engine,
+)
 
 GW2 = None
 
@@ -34,6 +43,7 @@ AUTH_RETRY_SECS = 600
 MAX_CONNECT_FAILURES = 3
 STICKY_DECISION_SECS = 30 * 60  # prefer_source sticky window
 CHANNEL_ORDER = ("weixin", "wecom")
+SUPPORTED_DECISION_CHANNELS = ("weixin", "wecom", "feishu")
 TEST = os.environ.get("APPROVAL_RELAY_TEST") == "1"
 
 CHANNELS = {
@@ -41,6 +51,8 @@ CHANNELS = {
                "row": {"to_user_id": os.environ.get("APPROVAL_RELAY_WEIXIN_TO", "")}},
     "wecom": {"outbox": "/home/hatch/workspace/wecom-bot/state/outbox.jsonl",
               "row": {"chatid": os.environ.get("APPROVAL_RELAY_WECOM_CHATID", ""), "chat_type": 1}},
+    "feishu": {"outbox": str(Path(_ROOT) / "feishu-bot" / "state" / "outbox.jsonl"),
+               "row": {"chat_id": os.environ.get("APPROVAL_RELAY_FEISHU_CHAT_ID", ""), "msg_type": "text"}},
 }
 DECISION_LABEL = {"allow_once": "已批准（仅这次）",
                   "allow_always": "已批准（永久）",
@@ -242,10 +254,27 @@ def notify(text, tag, approval=None, channels=None, item=None, event_id=None):
         row_id = (f"appr-health-{event_id}-{ch}" if event_id is not None
                   else f"appr-{tag}-{uuid.uuid4().hex[:8]}")
         row = {"id": row_id,
-               "queued_at": int(time.time()), "content": text}
+               "queued_at": int(time.time()), "content": text, "text": text}
         if ch == "wecom" and approval is not None:
             row["mode"] = "send_card"
             row["card"] = build_approval_card(**approval)
+        elif ch == "feishu" and approval is not None:
+            row["mode"] = "send_card"
+            row["msg_type"] = "interactive"
+            try:
+                from feishu_bot.feishu_cards import build_approval_card as build_feishu_card
+                exp_s = (approval.get("expires_ms") / 1000.0) if approval.get("expires_ms") else None
+                row["card"] = build_feishu_card(
+                    approval_id=str(approval.get("num", "")),
+                    operator_ids=[],
+                    prompt=approval.get("what", ""),
+                    reason=approval.get("who", ""),
+                    is_high_risk=bool(approval.get("is_high_risk")),
+                    expires_at=exp_s,
+                )
+            except Exception:
+                row["mode"] = "send"
+                row["msg_type"] = "text"
         else:
             row["mode"] = "send"
         row.update(cfg["row"])
@@ -253,12 +282,18 @@ def notify(text, tag, approval=None, channels=None, item=None, event_id=None):
         if isinstance(scope, dict) and scope.get("channel") == ch and scope.get("chat_id"):
             if ch == "wecom":
                 row.update(chatid=scope["chat_id"], chat_type=2 if scope.get("chat_type") == "group" else 1)
+            elif ch == "feishu":
+                row.update(chat_id=scope["chat_id"], chat_type=scope.get("chat_type", "single"))
             else:
                 row["to_user_id"] = scope["chat_id"]
         path = cfg["outbox"]
         lease = None
         try:
-            lease = lease_from_env(ch, "legacy")
+            expected_mode = "legacy" if ch in ("weixin", "wecom") else None
+            try:
+                lease = lease_from_env(ch, expected_mode)
+            except KeyError:
+                lease = None
             if TEST:
                 path = os.path.join(BASE, "shadow", f"{ch}-outbox.jsonl")
                 os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -288,15 +323,18 @@ def _what_field(what, label):
     return ""
 
 
-def build_approval_card(num, who, what, expires_ms):
+def build_approval_card(num, who, what, expires_ms, is_high_risk=False):
     """Template card for one pending approval (WeCom only).
 
     Card real estate is small (sub_title_text <= 112 chars, horizontal
     values kept short), so the card carries the decision-critical
     facts — requester, target, explanation, reason, the start of the
     command, and the expiry. The full text stays available via /审批.
+    高危审批请求醒目标注 🚨 [高危审批]。
     """
     horiz = []
+    if is_high_risk:
+        horiz.append({"keyname": "风险", "value": "🚨 高危审批"})
     for label in ("目标", "说明", "原因"):
         value = _what_field(what, label)
         if value:
@@ -306,9 +344,10 @@ def build_approval_card(num, who, what, expires_ms):
     # Reserve room for the expiry: a long command must not push it
     # past the 112-char sub_title_text limit.
     sub = f"{cmd[:88]}｜{expiry}" if cmd else expiry
+    title = f"🚨 [高危审批] #{num}" if is_high_risk else f"待审批 #{num}"
     card = {
         "card_type": "button_interaction",
-        "main_title": {"title": f"待审批 #{num}"[:26],
+        "main_title": {"title": title[:26],
                        "desc": str(who or "")[:50]},
         "sub_title_text": sub[:112],
         "task_id": f"appr-{num}",
@@ -417,6 +456,9 @@ def find_group_primary(st, num, item):
             continue
         if other.get("status") != "pending" or other.get("grouped_with"):
             continue
+        # 安全分级防隐匿：高危审批不可折叠合并在非高危审批项之下
+        if bool(item.get("is_high_risk")) != bool(other.get("is_high_risk")):
+            continue
         if other.get("notified"):
             if not other.get("group_key"):
                 other["group_key"] = key
@@ -425,17 +467,20 @@ def find_group_primary(st, num, item):
 
 
 def approval_notice_text(num, item):
-    return (f"{item.get('who', '')}\n{item.get('what', '')}\n"
+    prefix = "🚨 [高危审批]\n" if (item.get("is_high_risk") or item.get("risk_level") == "high") else ""
+    return (f"{prefix}{item.get('who', '')}\n{item.get('what', '')}\n"
             f"过期：{fmt_hm(item.get('expires_ms'))}\n"
             f"a=仅这次  b=永久  c=拒绝\n"
             f"回 /a {num}｜/b {num}｜/c {num}")
 
 
 def send_approval_notice(num, item):
+    is_high_risk = bool(item.get("is_high_risk") or item.get("risk_level") == "high")
     notify(approval_notice_text(num, item), f"new{num}",
            approval={"num": num, "who": item.get("who", ""),
                      "what": item.get("what", ""),
-                     "expires_ms": item.get("expires_ms")},
+                     "expires_ms": item.get("expires_ms"),
+                     "is_high_risk": is_high_risk},
            item=item)
 
 
@@ -562,8 +607,10 @@ def connect():
     return GW2(cookies=cookies, vm_id=vm_id)
 
 
-def poll_once(gw, st, response=None):
+def poll_once(gw, st, response=None, policy_engine=None):
     """Process approvals, optionally using a separately verified read response."""
+    if policy_engine is None:
+        policy_engine = get_default_policy_engine()
     d = gw.call_json("egress.approvals", timeout=20) if response is None else response
     pending = d.get("pending_approvals") or d.get("pending") or []
     live_ids = set()
@@ -605,7 +652,7 @@ def poll_once(gw, st, response=None):
                    or group_key_from_what(item.get("what")))
             if key:
                 item["group_key"] = key
-        if not item["notified"]:
+        if not item["notified"] and item.get("status") == "pending":
             who, what = summarize(record)
             source = record
             if not has_content(who, what):
@@ -625,16 +672,83 @@ def poll_once(gw, st, response=None):
                 if not item.get("group_key"):
                     item["group_key"] = (group_key(source)
                                          or group_key_from_what(what))
-                # Matching text is not authorization to decide another ID.
-                primary = find_group_primary(st, num, item)
-                if primary is not None:
-                    item["grouped_with"] = primary
-                    item["notified"] = True
-                    log("grouped scoped pending", num, "->", primary)
+
+                # 安全策略分级评估
+                decision = policy_engine.evaluate(source, what=what)
+                item["risk_level"] = decision.risk_level
+                item["is_high_risk"] = decision.is_high_risk
+                item["policy_rule"] = decision.rule_name
+                item["policy_reason"] = decision.reason
+                item["decision_reason"] = decision.reason
+
+                if decision.action == PolicyAction.AUTO_ALLOW:
+                    # Level 0: 低危免密自动放行
+                    # 遵循 ApprovalStore 与 relay 事务机制：RPC 提交前先持久化 decision_unknown 状态，防止网络超时或进程中断重入
+                    item["status"] = "decision_unknown"
+                    item["decision_attempt"] = {
+                        "id": uuid.uuid4().hex,
+                        "decision": "allow_once",
+                        "operator_id": "policy_engine",
+                        "chat_id": "auto",
+                        "channel": "auto",
+                        "started_at": time.time(),
+                        "reason": decision.reason,
+                    }
+                    save_state(st)
+                    try:
+                        gw.call_json(
+                            "egress.approval.decide",
+                            path_params={"approval_id": aid},
+                            body={"decision": "allow_once"}, timeout=20)
+                        item["status"] = "auto_approved"
+                        item["decided_at"] = int(time.time())
+                        item["notified"] = True
+                        save_state(st)
+                        log("auto approved pending", num, aid[:12], decision.reason)
+                    except Exception as exc:
+                        item["status"] = "decision_unknown"
+                        item["notified"] = True
+                        save_state(st)
+                        log("auto allow decide failed", num, aid[:12], type(exc).__name__, str(exc))
+                elif decision.action == PolicyAction.AUTO_DENY:
+                    # Level 3: 命中黑名单自动拦截
+                    item["status"] = "decision_unknown"
+                    item["decision_attempt"] = {
+                        "id": uuid.uuid4().hex,
+                        "decision": "deny",
+                        "operator_id": "policy_engine",
+                        "chat_id": "auto",
+                        "channel": "auto",
+                        "started_at": time.time(),
+                        "reason": decision.reason,
+                    }
+                    save_state(st)
+                    try:
+                        gw.call_json(
+                            "egress.approval.decide",
+                            path_params={"approval_id": aid},
+                            body={"decision": "deny"}, timeout=20)
+                        item["status"] = "auto_denied"
+                        item["decided_at"] = int(time.time())
+                        item["notified"] = True
+                        save_state(st)
+                        log("security alert: auto denied pending", num, aid[:12], decision.reason)
+                    except Exception as exc:
+                        item["status"] = "decision_unknown"
+                        item["notified"] = True
+                        save_state(st)
+                        log("auto deny decide failed", num, aid[:12], type(exc).__name__, str(exc))
                 else:
-                    send_approval_notice(num, item)
-                    item["notified"] = True
-                    log("notified pending", num, aid[:12], who)
+                    # Level 1 / Level 2: 需要手机人工审批 (普通审批或高危强审)
+                    primary = find_group_primary(st, num, item)
+                    if primary is not None:
+                        item["grouped_with"] = primary
+                        item["notified"] = True
+                        log("grouped scoped pending", num, "->", primary)
+                    else:
+                        send_approval_notice(num, item)
+                        item["notified"] = True
+                        log("notified pending", num, aid[:12], who)
             else:
                 # Hold the notification: an empty one would ask the
                 # user to approve blind. The item stays pending and
@@ -676,7 +790,8 @@ def consume_decisions(gw, st):
     with exclusive_file_lock(Path(DECISIONS_F).with_name("decisions.lock")):
         durable = load_state()
         for number, previous in durable["items"].items():
-            if previous.get("status") == "decision_unknown" or str(previous.get("status", "")).startswith("decided:"):
+            if (previous.get("status") in ("decision_unknown", "auto_approved", "auto_denied")
+                    or str(previous.get("status", "")).startswith("decided:")):
                 st["items"][number] = previous
         try:
             with open(OFFSET_F, encoding="utf-8") as source:
@@ -705,16 +820,21 @@ def consume_decisions(gw, st):
                 log("invalid decision shape retained at offset", new_off)
                 break
             channel = str(row.get("channel", "")).removesuffix("-card")
-            if channel not in CHANNEL_ORDER:
-                log("approval decision rejected: unknown channel")
+            if channel not in SUPPORTED_DECISION_CHANNELS:
+                log("approval decision rejected: unknown channel", channel)
                 new_off = next_off
                 continue
             try:
-                lease = lease_from_env(channel, "legacy")
+                # weixin 与 wecom 为过渡渠道，当配置为 core 模式时由核心通道接管，legacy 决断消费按规范停用；
+                # feishu 为现代全功能渠道，Core 模式下由网关将决断登记至中转队列并由 relay 统一权威提交至 Muse 平台。
+                expected_mode = "legacy" if channel in ("weixin", "wecom") else None
+                lease = lease_from_env(channel, expected_mode)
                 with lease if lease is not None else nullcontext():
                     _consume_decision_row(gw, st, row)
             except ModeError:
                 log("legacy approval decision disabled for core channel", channel)
+            except KeyError:
+                _consume_decision_row(gw, st, row)
             new_off = next_off
         save_state(st)
         _atomic_text(OFFSET_F, str(new_off))
@@ -722,9 +842,17 @@ def consume_decisions(gw, st):
 
 def _consume_decision_row(gw, st, row):
     """Authorize and commit one decision while its legacy mode lease is held."""
-    num = str(row.get("num", ""))
+    num = str(row.get("num", "")).strip()
     decision = row.get("decision")
     item = st["items"].get(num)
+    if item is None:
+        # 兼容按 approval_id 反查 item
+        target_aid = str(row.get("approval_id") or num).strip()
+        for k, it in st["items"].items():
+            if it.get("approval_id") == target_aid:
+                num = k
+                item = it
+                break
     if item is None or not decision_allowed(item, row, time.time()):
         log("approval decision rejected: unauthorized, expired, or invalid", num)
         try:
@@ -737,9 +865,14 @@ def _consume_decision_row(gw, st, row):
         log("duplicate or uncertain decision ignored", num, item.get("status"))
         return
     item["status"] = "decision_unknown"
-    item["decision_attempt"] = {"id": uuid.uuid4().hex, "decision": decision,
-        "operator_id": row["operator_id"], "chat_id": row["chat_id"],
-        "channel": str(row["channel"]).removesuffix("-card"), "started_at": time.time()}
+    item["decision_attempt"] = {
+        "id": uuid.uuid4().hex,
+        "decision": decision,
+        "operator_id": str(row.get("operator_id") or ""),
+        "chat_id": str(row.get("chat_id") or ""),
+        "channel": str(row.get("channel", "")).removesuffix("-card"),
+        "started_at": time.time(),
+    }
     save_state(st)
     try:
         gw.call_json("egress.approval.decide", path_params={"approval_id": item["approval_id"]},

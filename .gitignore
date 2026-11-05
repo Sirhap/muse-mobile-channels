@@ -13,6 +13,8 @@
 !/.github/ISSUE_TEMPLATE/*.md
 !/weixin-bot/
 !/wecom-bot/
+!/feishu-bot/
+!/feishu-bot/*
 !/channel-restore/
 !/mobile_channels/
 !/pyproject.toml

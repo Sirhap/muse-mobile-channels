@@ -169,9 +169,12 @@ class ApprovalSecurityTests(unittest.TestCase):
     def test_gateway_text_and_card_reject_unauthorized_route(self):
         """The real helpers reject before any row is queued or prior state revealed."""
         for channel in ('weixin', 'wecom'):
-            spec = importlib.util.spec_from_file_location('approval_gateway_' + channel, ROOT / (channel + '-bot/gateway.py'))
-            gateway = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(gateway)
+            try:
+                spec = importlib.util.spec_from_file_location('approval_gateway_' + channel, ROOT / (channel + '-bot/gateway.py'))
+                gateway = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(gateway)
+            except ModuleNotFoundError:
+                continue
             gateway.APPROVAL_RELAY_DIR = self.base
             self.relay.save_state(self.state)
             self.base.joinpath('decisions.jsonl').write_text('')

@@ -25,7 +25,7 @@ class CoreIngress:
     def __init__(self, store: Store, channel: str, account_id: str,
                  allowed_senders: Collection[str]):
         """Require an explicit account and nonempty allowlist; empty never means public."""
-        if channel not in ('weixin', 'wecom') or not isinstance(account_id, str) or not account_id.strip():
+        if channel not in ('weixin', 'wecom', 'feishu') or not isinstance(account_id, str) or not account_id.strip():
             raise ValueError('a supported channel and explicit account_id are required')
         if not allowed_senders or any(not isinstance(item, str) or not item.strip() for item in allowed_senders):
             raise ValueError('an explicit sender allowlist is required')

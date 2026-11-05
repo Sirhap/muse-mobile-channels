@@ -67,14 +67,16 @@ class RelayTestCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         base = self.tmp.name
-        self._orig = (relay.STATE_F, relay.STATUS_F, relay.BASE)
+        self._orig = (relay.STATE_F, relay.STATUS_F, relay.BASE, relay.DECISIONS_F, relay.OFFSET_F)
         relay.STATE_F = os.path.join(base, "state.json")
         relay.STATUS_F = os.path.join(base, "status.json")
+        relay.DECISIONS_F = os.path.join(base, "decisions.jsonl")
+        relay.OFFSET_F = os.path.join(base, "decisions.offset")
         relay.BASE = base
         self.state = {"next_num": 1, "items": {}}
 
     def tearDown(self):
-        relay.STATE_F, relay.STATUS_F, relay.BASE = self._orig
+        (relay.STATE_F, relay.STATUS_F, relay.BASE, relay.DECISIONS_F, relay.OFFSET_F) = self._orig
         self.tmp.cleanup()
 
     def shadow_rows(self, channel):
