@@ -1331,6 +1331,9 @@ class ChannelWorker(threading.Thread):
         if self._auth_blocked_stamp != cred_stamp():
             self._auth_blocked_until = 0.0
             self._auth_blocked_stamp = None
+            # 凭证已更新：重试立即放行，不等普通连接退避（与
+            # _reconnect_exhausted_now 的凭证变更清退避同款）。
+            self._next_connect_at = 0.0
             return False
         return True
 
@@ -2050,6 +2053,13 @@ class ChannelWorker(threading.Thread):
             if self._credential_notice_pending_or_queued(current):
                 return
             stamp = cred_stamp()
+            if (current.get("idle_auth_alert_stamp") is not None
+                    and current.get("idle_auth_alert_stamp") != stamp):
+                # 凭证已更新：旧凭证的“已提醒”随之失效，重新计数
+                #（告警文本的承诺：凭证更新后重新计数）。
+                self.update_cs(idle_auth_alert_stamp=None,
+                               idle_failure_alerted=False)
+                current = self.cs()
             if (current.get("idle_auth_alert_stamp") == stamp
                     or current.get("idle_failure_alerted") or current.get("fallback_alerted")):
                 return

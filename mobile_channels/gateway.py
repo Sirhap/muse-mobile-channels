@@ -61,20 +61,43 @@ class GatewayBinding:
         from .coalesce import InboundCoalescer
         return InboundCoalescer(idle_gap_secs=idle_gap_secs, max_wait_secs=max_wait_secs)
 
-    def find_task_by_external_id(self, external_id: str) -> str | None:
-        """根据外部消息 ID（包括被合并的次级消息 ID）反查权威 task_id。"""
+    def find_task_by_external_id(self, external_id: str, conversation_id: str | None = None) -> str | None:
+        """根据外部消息 ID（包括被合并的次级消息 ID）反查权威 task_id。
+
+        外部消息 ID 只在同一会话内唯一（与 Store.ingest 的
+        UNIQUE(conversation_id, external_id) 一致），所以去重调用
+        （receive）必须传 conversation_id 限定在同一个 conversation
+        内；不限定会把另一会话/另一渠道的同 ID 消息误判为重放，直接
+        吞掉新任务。无会话作用域的直接反查（例如测试与排查）退回全局
+        查找，只作定位、不作去重依据。
+        """
         if not external_id or not str(external_id).strip():
             return None
+        external_id = str(external_id).strip()
         with Store(self.database) as store:
+            if conversation_id:
+                row = store.connection.execute(
+                    'SELECT r.task_id FROM gateway_route_externals r JOIN tasks t ON t.id=r.task_id '
+                    'WHERE r.external_id=? AND t.conversation_id=? LIMIT 1',
+                    (external_id, conversation_id)
+                ).fetchone()
+                if row:
+                    return row['task_id']
+                row = store.connection.execute(
+                    'SELECT r.task_id FROM gateway_routes r JOIN tasks t ON t.id=r.task_id '
+                    'WHERE r.external_id=? AND t.conversation_id=? LIMIT 1',
+                    (external_id, conversation_id)
+                ).fetchone()
+                return row['task_id'] if row else None
             row = store.connection.execute(
                 'SELECT task_id FROM gateway_route_externals WHERE external_id=? LIMIT 1',
-                (str(external_id).strip(),)
+                (external_id,)
             ).fetchone()
             if row:
                 return row['task_id']
             row = store.connection.execute(
                 'SELECT task_id FROM gateway_routes WHERE external_id=? LIMIT 1',
-                (str(external_id).strip(),)
+                (external_id,)
             ).fetchone()
             return row['task_id'] if row else None
 
@@ -109,14 +132,25 @@ class GatewayBinding:
         if message_id is not None and str(message_id).strip() and str(message_id).strip() not in all_merged_ids:
             all_merged_ids.insert(0, str(message_id).strip())
 
-        # 幂等性防御：检查主消息 ID 以及所有关联合并 ID 是否已被索引（包含作为次级合并消息），若已存在直接返回既有 Task
-        for mid in all_merged_ids:
-            existing_task_id = self.find_task_by_external_id(mid)
-            if existing_task_id is not None:
-                with Store(self.database) as store:
-                    row = store.connection.execute('SELECT conversation_id FROM tasks WHERE id=?', (existing_task_id,)).fetchone()
-                    conv_id = row['conversation_id'] if row else ''
-                return IngestResult(conv_id, existing_task_id, False)
+        # 幂等性防御：检查主消息 ID 以及所有关联合并 ID 是否已被索引（包含作为次级合并消息），若已存在直接返回既有 Task。
+        # 作用域限定在当前会话：外部 ID 只在会话内唯一，跨会话/跨渠道的同 ID 是不同消息，不得互相吞掉。
+        # 会话行尚不存在时（全新会话）不可能已有任务，直接跳过预查、走 CoreIngress 建会话；
+        # 这里绝不能退回全局反查，否则另一会话的同 ID 会把新消息误判为重放。
+        conversation_id = None
+        with Store(self.database) as store:
+            conv = store.connection.execute(
+                'SELECT id FROM conversations WHERE channel=? AND account_id=? AND chat_type=? AND chat_id=?',
+                (self.channel, self.account_id, str(chat_type or 'single'), str(chat_id or '')),
+            ).fetchone()
+            conversation_id = conv['id'] if conv else None
+        if conversation_id is not None:
+            for mid in all_merged_ids:
+                existing_task_id = self.find_task_by_external_id(mid, conversation_id)
+                if existing_task_id is not None:
+                    with Store(self.database) as store:
+                        row = store.connection.execute('SELECT conversation_id FROM tasks WHERE id=?', (existing_task_id,)).fetchone()
+                        conv_id = row['conversation_id'] if row else ''
+                    return IngestResult(conv_id, existing_task_id, False)
 
         with Store(self.database) as store, store.transaction():
             ingress = CoreIngress(store, self.channel, self.account_id, self.settings['allowed_senders'])

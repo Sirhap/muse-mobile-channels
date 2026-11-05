@@ -42,6 +42,11 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+# fmt_event 须从参考 SDK 取：把参考 muse-cli 源码放进 sys.path，
+# 这样按文件头写的裸命令也能跑，不依赖外部 PYTHONPATH。
+_muse_cli_src = ROOT / "reference" / "muse-cli" / "src"
+if _muse_cli_src.is_dir() and str(_muse_cli_src) not in sys.path:
+    sys.path.insert(0, str(_muse_cli_src))
 SBX = Path("/tmp/bridge-merge-sbx")
 WX = SBX / "weixin_state"
 WC = SBX / "wecom_state"
@@ -72,6 +77,10 @@ spec = importlib.util.spec_from_file_location(
     "native_bridge", ROOT / "native-bridge" / "native_bridge.py")
 nb = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(nb)
+# 2026-11-05 CFG脚手架修复：11月1日重构后CFG不再随导入加载，
+# 须显式加载生产配置再深拷贝覆盖沙箱路径；断言一律未动。
+
+nb.load_config()
 
 nb.CFG = copy.deepcopy(nb.CFG)
 nb.CFG["channels"]["weixin"]["bot_state"] = str(WX)
@@ -314,9 +323,15 @@ for CH in ("wecom", "weixin"):
           no_pointer_anywhere(w))
 
     # 4. Terminal receipt: a queued message whose own send is refused
-    #    before it leaves (pre-send failure) takes the inbox
-    #    fallback — an explicit terminal path, not a pointer reply —
-    #    and the next queued message still gets its own turn.
+    #    AFTER the submission was reserved takes the reconciliation
+    #    hold — NOT the inbox fallback. Since d73d311 (reliable
+    #    channel core) only errors BEFORE reservation may use the
+    #    fallback: once _reserve_submission has persisted the turn,
+    #    the send outcome is unknown (the platform may have accepted
+    #    it before raising), so the bridge preserves evidence instead
+    #    of executing twice. The channel parks until a human
+    #    reconciles; the next queued message does not start while
+    #    the hold stands, and the hold notice goes out exactly once.
     w = World(CH, reject_text="TXT-B")
     w.arrive("m-a", "TXT-A")
     w.step()
@@ -325,20 +340,27 @@ for CH in ("wecom", "weixin"):
     w.step()
     w.platform.answer("ANS-A")
     w.step()
-    check(f"{CH} fallback: refused B goes to the inbox with its msgid",
-          [r["msgid"] for r in w.inbox()] == ["m-b"]
-          and w.inbox()[0].get("via") == "native-bridge-fallback")
+    pending = w.cs().get("submission_pending") or {}
+    check(f"{CH} fallback: refused B held for reconciliation, not the inbox",
+          pending.get("phase") == "submission_unknown"
+          and (pending.get("row") or {}).get("msgid") == "m-b"
+          and w.inbox() == [])
     check(f"{CH} fallback: B has no bridge reply and no pointer",
           [r["msgid"] for r in w.replies()] == ["m-a"]
           and no_pointer_anywhere(w))
     w.step()
-    check(f"{CH} fallback: C still starts as its own turn after B",
-          w.active_ids() == ["m-c"] and user_texts(w) == ["TXT-A", "TXT-C"])
-    w.platform.answer("ANS-C")
+    check(f"{CH} fallback: C does not start while B is unreconciled",
+          w.active_ids() == [] and w.queued_ids() == ["m-c"])
+    check(f"{CH} fallback: hold notice sent once",
+          len([r for r in w.outbox() if r.get("mode") == "send"
+               and "提交结果尚未确认" in (r.get("content") or "")]) == 1)
     w.step()
-    check(f"{CH} fallback: A and C answered once each, B fell back once",
-          sorted(r["msgid"] for r in w.replies()) == ["m-a", "m-c"]
-          and len(w.inbox()) == 1)
+    check(f"{CH} fallback: A answered once, B held once, C still queued",
+          sorted(r["msgid"] for r in w.replies()) == ["m-a"]
+          and len(w.inbox()) == 0
+          and len([r for r in w.outbox() if r.get("mode") == "send"
+                   and "提交结果尚未确认" in (r.get("content") or "")]) == 1
+          and w.queued_ids() == ["m-c"])
 
 # 5. Rollback proof: restoring the old MERGE_CHANNELS value revives
 #    the retained merge path (observation-window escape hatch).

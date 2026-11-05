@@ -195,15 +195,18 @@ check("wx: voice flat-text quote", "（引用：语音扁平转写）" in t)
 # handle_inbound needs a full live gateway (client/creds/context),
 # so this asserts at source level: the retention constant targets
 # state/diverted_raw.jsonl and the write sits inside the divert
-# branch, after the spool append.
+# branch, after the spool append. (2026-11-05: the spool path is
+# now the QUOTE_SPOOL constant built from parts, and the branch
+# guards the raw write with `if diverted:`; anchors updated to
+# the current source forms, order asserted is unchanged.)
 _src = (ROOT / "weixin-bot" / "gateway.py").read_text(encoding="utf-8")
 check("wx: DIVERTED_RAW constant points at state file",
       'DIVERTED_RAW = STATE / "diverted_raw.jsonl"' in _src)
-_spool_i = _src.index("spool/weixin.jsonl")
+_spool_i = _src.index("self.append_jsonl(QUOTE_SPOOL,")
+_guard_i = _src.index("if diverted:", _spool_i)
 _raw_i = _src.index("self.append_jsonl(DIVERTED_RAW, entry)")
-_fb_i = _src.index("if not diverted:", _spool_i)
 check("wx: diverted_raw written inside divert branch after spool",
-      _spool_i < _raw_i < _fb_i)
+      _spool_i < _guard_i < _raw_i)
 
 # ---- 2026-10-11 final fix: refs carry only an id; resolve locally ----
 # Live capture (diverted_raw.jsonl): iLink ref_msg for a quote is

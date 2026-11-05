@@ -51,6 +51,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+# fmt_event 须从参考 SDK 取：把参考 muse-cli 源码放进 sys.path，
+# 这样按文件头写的裸命令也能跑，不依赖外部 PYTHONPATH。
+_muse_cli_src = ROOT / "reference" / "muse-cli" / "src"
+if _muse_cli_src.is_dir() and str(_muse_cli_src) not in sys.path:
+    sys.path.insert(0, str(_muse_cli_src))
 SBX = Path("/tmp/bridge-longtask-sbx")
 WX = SBX / "weixin_state"
 WC = SBX / "wecom_state"
@@ -60,6 +65,12 @@ for d in (WX, WC, TS, SBX / "spool", SBX / "shadow"):
     for f in d.iterdir():
         if f.is_file():
             f.unlink()
+# 2026-11-05: state.json/status.json live directly under SBX and were
+# never cleaned, so a previous run's leftover submission_pending (the
+# final scenario reserves a turn and never reconciles it) made every
+# later run die in _reserve_submission. Reset them too.
+for f in (SBX / "state.json", SBX / "status.json"):
+    f.unlink(missing_ok=True)
 for flag in ("enabled-weixin", "longtask-weixin", "longtask-test"):
     (SBX / flag).touch()
 
@@ -67,6 +78,10 @@ spec = importlib.util.spec_from_file_location(
     "native_bridge", ROOT / "native-bridge" / "native_bridge.py")
 nb = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(nb)
+# 2026-11-05 CFG脚手架修复：11月1日重构后CFG不再随导入加载，
+# 须显式加载生产配置再深拷贝覆盖沙箱路径；断言一律未动。
+
+nb.load_config()
 
 nb.CFG = copy.deepcopy(nb.CFG)
 nb.CFG["channels"]["weixin"]["bot_state"] = str(WX)
@@ -422,22 +437,30 @@ try:
     w = nb.ChannelWorker("test")
     for _ in range(3):
         w.last_idle_scan = 0
+        # 与 last_idle_scan=0 同款时间压缩：一次失败后 _note_reconnect_failure
+        # 会把下次连接推迟 5s 起，测试内连续扫描须先清退避，否则第 2、3 次
+        # 扫描根本不尝试连接、streak 永远到不了 3；断言只测 streak 计数本身。
+        w._next_connect_at = 0
         w.idle_push_scan(w.cs())
     cs = w.cs()
     alerts = [r for r in read_jsonl(shadow_test_out)
-              if r.get("mode") == "send" and "空闲扫描" in
+              if r.get("mode") == "send" and "已暂停自动连接" in
               (r.get("text") or "")]
     check("E ordinary failures streak to 3", cs.get(
         "idle_scan_fail_streak") == 3)
+    # 第 3 次失败触发的是重连暂停提醒（d73d311 后的新文案），不是旧的
+    # 空闲扫描提醒；行为不变：第 3 次恰好提醒一次。
     check("E exactly one alert at the 3rd failure", len(alerts) == 1)
     w.last_idle_scan = 0
     w.idle_push_scan(w.cs())
     alerts = [r for r in read_jsonl(shadow_test_out)
-              if r.get("mode") == "send" and "空闲扫描" in
+              if r.get("mode") == "send" and "已暂停自动连接" in
               (r.get("text") or "")]
+    # 第 3 次失败后通道已 parked（_reconnect_exhausted），第 4 次扫描
+    # 不再尝试连接：无第二次提醒，streak 停在 3。
     check("E 4th failure within the hour sends no second alert",
           len(alerts) == 1
-          and w.cs().get("idle_scan_fail_streak") == 4)
+          and w.cs().get("idle_scan_fail_streak") == 3)
     good2 = StubGW()
     w.gw = good2
     w.last_idle_scan = 0

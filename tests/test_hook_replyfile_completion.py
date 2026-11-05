@@ -27,16 +27,25 @@ S12 active batch + reply_file queued but result cancelled, old
     order still protects LIVE batches — no duration cap — only
     loss of the worker's own pushes is judged (the detached
     heartbeat file no longer counts as a life sign).
+    Since 6066d03 ("require verified worker termination before
+    recovery") the first-loss auto-resume additionally requires a
+    fresh platform-terminal verdict bound to the batch's
+    registered run: silence alone now only enters review (held,
+    no cancel, no resume notice, no fail notice). S12/S15/S1c
+    below assert both sides -- silence-only holds in review, and
+    a bound terminal verdict still auto-resumes once as before.
 S13 active batch + formal reply parked in the retry lane
     -> batch stays alive past cap: no fail-stop, not completed
 S14 detached batch + DELIVERED bound send row -> dropped silently
 S15 detached batch + reply queued but cancelled, old
     -> deathwatch fires before silent retirement: first loss
     auto-resumes once (re-wake + notice, detached dropped),
-    NOT retired to the graveyard
+    NOT retired to the graveyard (same 6066d03 split as S12:
+    silence-only enters review instead).
 S1c control: silent batch, no outbox rows -> deathwatch
     first-loss auto-resume at 1800s without a worker push
     (2026-10-09 orders; fail-stop only on the second loss)
+    (same 6066d03 split as S12: silence-only enters review).
 
 Fixture ages were rescaled on 2026-10-07 when the user raised
 BATCH_CAP_SECS 600 -> 3600: "aged past cap" fixtures now use
@@ -59,9 +68,10 @@ from pathlib import Path
 
 NOW = time.time()
 RESULTS = []
+ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS = Path(os.environ.get(
     "MUSE_HOOK_SCRIPTS_DIR",
-    str(Path(__file__).resolve().parent.parent / "hooks" / "scripts")))
+    str(ROOT / "hooks" / "scripts")))
 
 
 def run_channel(chan, botdir, hookst, script_name, cli_relpath, entry_fn):
@@ -118,10 +128,32 @@ def run_channel(chan, botdir, hookst, script_name, cli_relpath, entry_fn):
     def run_hook():
         env = dict(os.environ, HOME=f"{SBX}/home",
                    HATCH_HOOK_RUNTIME=f"{SBX}/runtime.sh",
-                   HATCH_HOOK_DRY_RUN="0")
+                   HATCH_HOOK_DRY_RUN="0",
+                   DEATH_WATCH_ACTIVITY_PY=str(ROOT / "death_watch_activity.py"),
+                   DEATH_WATCH_BRIDGE_STATE=f"{SBX}/bridge-state.json")
         r = subprocess.run(["bash", f"{SBX}/hook.sh"], env=env,
                            capture_output=True, text=True, timeout=60)
         return r.stdout + r.stderr
+
+    def register(mid, run_id, ts=None):
+        """Plant a worker-activity registration for one msgid."""
+        w(f"{botdir}/state/worker_activity.json",
+          {mid: {"ts": NOW - 5000 if ts is None else ts,
+                 "source": "worker-register", "run_id": run_id}})
+
+    def verdict(mid, run_id, status="shutdown"):
+        """Plant a fresh platform-terminal verdict bound to the run."""
+        w(f"{botdir}/state/worker_platform_status.json",
+          {mid: {"run_id": run_id, "status": status,
+                 "checked_at": NOW, "agent_updated_at": NOW - 5000}})
+
+    def review_status(mid):
+        p = os.path.join(HOOKST, "worker_review.json")
+        try:
+            with open(p, encoding="utf-8") as f:
+                return (json.load(f).get("tasks") or {}).get(mid, {}).get("status")
+        except (OSError, ValueError):
+            return None
 
     def calls():
         return open(f"{SBX}/cli.log").read()
@@ -181,10 +213,32 @@ def run_channel(chan, botdir, hookst, script_name, cli_relpath, entry_fn):
     results([{"id": "RF5", "mode": "reply_file", "ok": False,
               "errmsg": "cancelled", "ts": NOW - 4940}])
     out = run_hook()
-    # Deathwatch (2026-10-09; status-push fix same evening): the
-    # last worker push is the queued reply row 4950s ago -> first
-    # loss of worker pushes: auto-resume once (re-wake + resume
-    # notice), NOT cancelled, NOT completed either.
+    # 6066d03: the last worker push is the queued reply row 4950s
+    # ago, but silence alone is not proof of death -> first loss
+    # only enters review (held, not resumed, not cancelled, not
+    # completed). No resume notice is sent without a verdict.
+    check("S12 first silence enters review (no cancel, no resume, no fail notice)",
+          "CALL: cancel" not in calls() and "任务已停止" not in calls()
+          and "任务执行失败" not in calls()
+          and "已自动续跑" not in calls()
+          and "DECISION wake" not in out)
+    check("S12 batch held in review, not completed",
+          not batch().get("msgids") and review_status("F5") == "pending")
+
+    # S12 verified: the same loss with a bound terminal verdict
+    # auto-resumes once (re-wake + resume notice), NOT cancelled,
+    # NOT completed either (2026-10-09 status-push fix, kept).
+    reset()
+    inbox([entry_fn("F5", NOW - 5000)])
+    hookst_w("seen_msgids.txt", "F5\n")
+    hookst_w("carried_msgids.txt", "F5\n")
+    hookst_w("active_batch.json", {"msgids": ["F5"], "since": NOW - 5000, "detached": []})
+    outbox([{"id": "RF5", "mode": "reply_file", "msgid": "F5", "queued_at": NOW - 4950}])
+    results([{"id": "RF5", "mode": "reply_file", "ok": False,
+              "errmsg": "cancelled", "ts": NOW - 4940}])
+    register("F5", "run-F5")
+    verdict("F5", "run-F5")
+    out = run_hook()
     check("S12 first silence auto-resumes (no cancel, no fail notice)",
           "CALL: cancel" not in calls() and "任务已停止" not in calls()
           and "任务执行失败" not in calls()
@@ -234,11 +288,35 @@ def run_channel(chan, botdir, hookst, script_name, cli_relpath, entry_fn):
     results([{"id": "RF8", "mode": "reply", "ok": False,
               "errmsg": "cancelled", "ts": NOW - 4940}])
     out = run_hook()
-    # Deathwatch (2026-10-09; status-push fix same evening)
-    # supersedes silent retirement: a detached batch with no
-    # worker push for 1800s is auto-resumed once (re-wake +
-    # factual notice) BEFORE the 3600s retire window, so the user
-    # is told instead of the batch vanishing quietly.
+    # 6066d03: silence alone enters review instead of auto-resume:
+    # the detached batch leaves the detached slot, is NOT retired
+    # to the graveyard, and waits in review for a verdict.
+    check("S15 detached first silence enters review (no cancel, no resume)",
+          "CALL: cancel" not in calls()
+          and "已自动续跑" not in calls()
+          and "任务执行失败" not in calls()
+          and "DECISION wake" not in out)
+    check("S15 detached held in review, NOT silently retired",
+          not batch().get("detached") and "F8" not in retired()
+          and not batch().get("msgids")
+          and review_status("F8") == "pending")
+
+    # S15 verified: the same loss with a bound terminal verdict
+    # auto-resumes once (re-wake + notice, detached dropped),
+    # NOT retired to the graveyard.
+    reset()
+    inbox([entry_fn("F8", NOW - 5000)])
+    hookst_w("seen_msgids.txt", "F8\n")
+    hookst_w("carried_msgids.txt", "F8\n")
+    hookst_w("active_batch.json",
+             {"msgids": [], "since": NOW - 5000,
+              "detached": [{"msgids": ["F8"], "since": NOW - 5000}]})
+    outbox([{"id": "RF8", "mode": "reply", "msgid": "F8", "queued_at": NOW - 4950}])
+    results([{"id": "RF8", "mode": "reply", "ok": False,
+              "errmsg": "cancelled", "ts": NOW - 4940}])
+    register("F8", "run-F8")
+    verdict("F8", "run-F8")
+    out = run_hook()
     check("S15 detached first silence auto-resumes (no cancel)",
           "CALL: cancel" not in calls()
           and "已自动续跑" in calls()
@@ -264,11 +342,28 @@ def run_channel(chan, botdir, hookst, script_name, cli_relpath, entry_fn):
     hookst_w("carried_msgids.txt", "D1\n")
     hookst_w("active_batch.json", {"msgids": ["D1"], "since": NOW - 3700, "detached": []})
     out = run_hook()
-    # Deathwatch (2026-10-09; status-push fix same evening):
-    # 3700s with no worker push at all = first loss -> auto-resume
-    # once (re-wake + factual resume notice, no cancel). A second
-    # loss would fail-stop. Live batches remain uncapped; only
-    # loss of the worker's own pushes is judged.
+    # 6066d03: 3700s with no worker push at all = first loss ->
+    # review only (held, no auto-resume, no cancel). A bound
+    # terminal verdict is what authorizes the resume; a second
+    # loss after a consumed resume would fail-stop.
+    check("S1c silent batch enters review (no cancel, no resume)",
+          "CALL: cancel" not in calls()
+          and "已自动续跑" not in calls()
+          and "任务执行失败" not in calls()
+          and "DECISION wake" not in out
+          and not batch().get("msgids")
+          and review_status("D1") == "pending")
+
+    # S1c verified: the same silence with a bound terminal verdict
+    # auto-resumes once (re-wake + factual resume notice, no cancel).
+    reset()
+    inbox([entry_fn("D1", NOW - 3700)])
+    hookst_w("seen_msgids.txt", "D1\n")
+    hookst_w("carried_msgids.txt", "D1\n")
+    hookst_w("active_batch.json", {"msgids": ["D1"], "since": NOW - 3700, "detached": []})
+    register("D1", "run-D1")
+    verdict("D1", "run-D1")
+    out = run_hook()
     check("S1c silent batch auto-resumed once by deathwatch",
           "CALL: cancel" not in calls()
           and "已自动续跑" in calls()
