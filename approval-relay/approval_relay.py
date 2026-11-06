@@ -468,7 +468,10 @@ def find_group_primary(st, num, item):
 
 def approval_notice_text(num, item):
     prefix = "🚨 [高危审批]\n" if (item.get("is_high_risk") or item.get("risk_level") == "high") else ""
+    reason = item.get("policy_reason") or item.get("decision_reason") or ""
+    reason_line = f"原因：{reason}\n" if reason else ""
     return (f"{prefix}{item.get('who', '')}\n{item.get('what', '')}\n"
+            f"{reason_line}"
             f"过期：{fmt_hm(item.get('expires_ms'))}\n"
             f"a=仅这次  b=永久  c=拒绝\n"
             f"回 /a {num}｜/b {num}｜/c {num}")
@@ -706,38 +709,42 @@ def poll_once(gw, st, response=None, policy_engine=None):
                         save_state(st)
                         log("auto approved pending", num, aid[:12], decision.reason)
                     except Exception as exc:
-                        item["status"] = "decision_unknown"
-                        item["notified"] = True
+                        # 自动放行提交失败：退到手动审批，不静默卡住。
+                        # 状态回 pending（consume_decisions 只接受 pending
+                        # 的手动决定；留 decision_unknown 会让用户 /a /b /c
+                        # 被当作重复/不确定忽略），发人工通知（分组感知），
+                        # decision_attempt 保留供审计。
+                        item["status"] = "pending"
+                        item["policy_reason"] = (
+                            "自动放行提交失败，转人工审批"
+                            f"（{type(exc).__name__}）"
+                        )
+                        primary = find_group_primary(st, num, item)
+                        if primary is not None:
+                            item["grouped_with"] = primary
+                            item["notified"] = True
+                            log("grouped auto-allow-failed pending", num, "->", primary)
+                        else:
+                            send_approval_notice(num, item)
+                            item["notified"] = True
+                            log("auto allow decide failed, fell back to manual", num, aid[:12], type(exc).__name__, str(exc))
                         save_state(st)
-                        log("auto allow decide failed", num, aid[:12], type(exc).__name__, str(exc))
                 elif decision.action == PolicyAction.AUTO_DENY:
-                    # Level 3: 命中黑名单自动拦截
-                    item["status"] = "decision_unknown"
-                    item["decision_attempt"] = {
-                        "id": uuid.uuid4().hex,
-                        "decision": "deny",
-                        "operator_id": "policy_engine",
-                        "chat_id": "auto",
-                        "channel": "auto",
-                        "started_at": time.time(),
-                        "reason": decision.reason,
-                    }
+                    # 黑名单命中：不再静默自动拦截，改发手机人工审批通知，
+                    # 由用户 /a（仅这次）/ /b（永久）/ /c（拒绝）决定。
+                    # 能自动审批的（AUTO_ALLOW）仍静默自动放行，不变。
+                    # 状态保持 pending、不提交 deny，用户的手动决定走
+                    # consume_decisions 正常核销。
+                    primary = find_group_primary(st, num, item)
+                    if primary is not None:
+                        item["grouped_with"] = primary
+                        item["notified"] = True
+                        log("grouped blacklist pending", num, "->", primary)
+                    else:
+                        send_approval_notice(num, item)
+                        item["notified"] = True
+                        log("blacklist held for manual decision", num, aid[:12], decision.reason)
                     save_state(st)
-                    try:
-                        gw.call_json(
-                            "egress.approval.decide",
-                            path_params={"approval_id": aid},
-                            body={"decision": "deny"}, timeout=20)
-                        item["status"] = "auto_denied"
-                        item["decided_at"] = int(time.time())
-                        item["notified"] = True
-                        save_state(st)
-                        log("security alert: auto denied pending", num, aid[:12], decision.reason)
-                    except Exception as exc:
-                        item["status"] = "decision_unknown"
-                        item["notified"] = True
-                        save_state(st)
-                        log("auto deny decide failed", num, aid[:12], type(exc).__name__, str(exc))
                 else:
                     # Level 1 / Level 2: 需要手机人工审批 (普通审批或高危强审)
                     primary = find_group_primary(st, num, item)

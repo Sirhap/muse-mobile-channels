@@ -5,7 +5,8 @@
 1. 目标 Host/IP、HTTP 方法及命令提取与匹配逻辑；
 2. 全量自动审批（2026-11-06 用户明示一律自动审批）：除黑名单外一律自动放行，
    旧 Level 0/1/2 的输入现均期望 AUTO_ALLOW；检测函数本身仍单测；
-3. Level 3（自动拦截 Auto Deny）：命中已配置黑名单的请求；
+3. Level 3（黑名单人工复核）：命中已配置黑名单的请求不再静默拦截，
+   改发手机人工审批通知，由用户 /a（仅这次）/ /b（永久）/ /c（拒绝）决定；
 4. 卡片与文本高危标识展示：🚨 [高危审批] 在微信文本与企微卡片上的渲染；
 5. 与 approval_relay 轮询流程的端到端集成模拟测试（含事务一致性与防双重决策保护）。
 """
@@ -34,10 +35,11 @@ import approval_relay as relay
 class MockGateway:
     """模拟 Muse 网关，用于记录 RPC 调用。"""
 
-    def __init__(self, pending_list=None, detail_map=None):
+    def __init__(self, pending_list=None, detail_map=None, fail_decide=False):
         self.pending_list = pending_list or []
         self.detail_map = detail_map or {}
         self.decide_calls = []
+        self.fail_decide = fail_decide
 
     def call_json(self, method, path_params=None, body=None, timeout=None):
         if method == "egress.approvals":
@@ -50,6 +52,8 @@ class MockGateway:
             aid = (path_params or {}).get("approval_id")
             dec = (body or {}).get("decision")
             self.decide_calls.append((aid, dec))
+            if self.fail_decide:
+                raise ConnectionError("simulated decide submit failure")
             return {"ok": True}
         raise AssertionError(f"未预期的 RPC 调用: {method}")
 
@@ -795,8 +799,9 @@ class TestRelayPolicyIntegration(unittest.TestCase):
         self.assertEqual(self.shadow_rows("weixin"), [])
         self.assertEqual(self.shadow_rows("wecom"), [])
 
-    def test_auto_deny_silently_intercepts_blacklisted_target(self):
-        """集成测试：命中黑名单的目标请求被自动拒绝拦截，记录状态且不打扰用户。"""
+    def test_blacklist_hit_notifies_user_for_manual_decision(self):
+        """集成测试：命中黑名单的目标请求不再静默拦截，改发手机人工审批通知，
+        由用户 /a（仅这次）/ /b（永久）/ /c（拒绝）决定；能自动审批的仍自动审批。"""
         custom_engine = policy.SecurityPolicyEngine(
             blacklist_hosts={"malicious-attacker.com"}
         )
@@ -815,17 +820,57 @@ class TestRelayPolicyIntegration(unittest.TestCase):
 
         relay.poll_once(gw, self.state, policy_engine=custom_engine)
 
-        # 1. 验证调用网关 decide 自动拒绝
-        self.assertEqual(len(gw.decide_calls), 1)
-        self.assertEqual(gw.decide_calls[0], ("aid-evil", "deny"))
+        # 1. 不自动提交 deny，交给用户手动决定
+        self.assertEqual(gw.decide_calls, [])
 
-        # 2. 状态记录为 auto_denied
+        # 2. 状态保持 pending，等待用户 /a /b /c
         item = self.state["items"]["1"]
-        self.assertEqual(item["status"], "auto_denied")
+        self.assertEqual(item["status"], "pending")
+        self.assertTrue(item["notified"])
 
-        # 3. 无手机打扰
-        self.assertEqual(self.shadow_rows("weixin"), [])
-        self.assertEqual(self.shadow_rows("wecom"), [])
+        # 3. 已发手机通知（含黑名单原因与 /a /b /c），用户可覆盖
+        rows = self.shadow_rows("weixin") + self.shadow_rows("wecom")
+        self.assertTrue(rows, "blacklist hit must notify the user")
+        text = "\n".join(str(r) for r in rows)
+        self.assertIn("malicious-attacker.com", text)
+        self.assertIn("/a 1", text)
+        self.assertIn("/b 1", text)
+
+    def test_auto_allow_decide_failure_falls_back_to_manual(self):
+        """集成测试：自动放行提交失败时退到手动审批，不静默卡住。
+        状态回 pending、发人工通知（含失败原因与 /a /b），用户 /a /b /c
+        可接过去；不再把决定标成 decision_unknown 丢在一边。"""
+        pending_record = {
+            "approval_id": "aid-fail",
+            "display_name": "Shell command",
+            "registered_command": "pip install requests",
+            "scheme": "https",
+            "method": "GET",
+            "host": "pypi.org",
+            "path": "https://pypi.org/simple",
+            "reason": "install package",
+            "request_expires_at_ms": 9999999999999,
+        }
+        gw = MockGateway(pending_list=[pending_record], fail_decide=True)
+
+        relay.poll_once(gw, self.state)
+
+        # 1. 尝试过提交 allow_once，但提交失败
+        self.assertEqual(gw.decide_calls, [("aid-fail", "allow_once")])
+
+        # 2. 状态回 pending（不是 decision_unknown），用户手动决定可被消费
+        item = self.state["items"]["1"]
+        self.assertEqual(item["status"], "pending")
+        self.assertTrue(item["notified"])
+        self.assertIn("自动放行提交失败", item.get("policy_reason", ""))
+
+        # 3. 已发手机人工通知（含失败原因与 /a /b），用户可接过去
+        rows = self.shadow_rows("weixin") + self.shadow_rows("wecom")
+        self.assertTrue(rows, "auto-allow failure must notify the user")
+        text = "\n".join(str(r) for r in rows)
+        self.assertIn("自动放行提交失败", text)
+        self.assertIn("/a 1", text)
+        self.assertIn("/b 1", text)
 
     def test_idempotence_and_no_duplicate_decision(self):
         """集成测试：多轮轮询与决策流保持严格幂等性，不产生双重核销或状态残留。"""
@@ -854,10 +899,15 @@ class TestRelayPolicyIntegration(unittest.TestCase):
         self.assertEqual(self.state["items"]["1"]["status"], "auto_approved")
 
     def test_auto_allow_persists_decision_unknown_and_handles_exception(self):
-        """集成测试：平台 RPC 异常时状态持久化为 decision_unknown 且标记 notified，防止重试重入。"""
+        """集成测试：平台 RPC 异常时自动放行失败退到手动审批。
+        状态回 pending、发人工通知，用户 /a /b /c 可接过去；不再把决定
+        标成 decision_unknown 静默卡住。第二轮轮询不重复提交。"""
         class FailingGateway(MockGateway):
             def call_json(self, method, path_params=None, body=None, timeout=None):
                 if method == "egress.approval.decide":
+                    aid = (path_params or {}).get("approval_id")
+                    dec = (body or {}).get("decision")
+                    self.decide_calls.append((aid, dec))
                     raise TimeoutError("网络连接超时")
                 return super().call_json(method, path_params, body, timeout)
 
@@ -877,16 +927,23 @@ class TestRelayPolicyIntegration(unittest.TestCase):
         # 执行第一轮轮询，模拟网络调用抛出超时异常
         relay.poll_once(gw, self.state)
 
-        # 状态应变为 decision_unknown，记录尝试信息并标记 notified=True 防止死循环
+        # 状态应回 pending、标记 notified，记录尝试信息供审计，并已发手动通知
         item = self.state["items"]["1"]
-        self.assertEqual(item["status"], "decision_unknown")
+        self.assertEqual(item["status"], "pending")
         self.assertTrue(item["notified"])
         self.assertIsNotNone(item.get("decision_attempt"))
         self.assertEqual(item["decision_attempt"]["decision"], "allow_once")
+        self.assertIn("自动放行提交失败", item.get("policy_reason", ""))
+        rows = self.shadow_rows("weixin") + self.shadow_rows("wecom")
+        self.assertTrue(rows, "auto-allow failure must notify the user")
+        text = "\n".join(str(r) for r in rows)
+        self.assertIn("/a 1", text)
+        self.assertIn("/b 1", text)
 
-        # 第二轮轮询：不应再重复尝试自动提交
+        # 第二轮轮询：不应再重复尝试自动提交（notified 已置 True）
         relay.poll_once(gw, self.state)
-        self.assertEqual(self.state["items"]["1"]["status"], "decision_unknown")
+        self.assertEqual(self.state["items"]["1"]["status"], "pending")
+        self.assertEqual(len(gw.decide_calls), 1)
 
     def test_consume_decisions_syncs_auto_approved_and_rejects_replay(self):
         """集成测试：已被策略引擎 auto_approved 的记录，后续 decisions.jsonl 人工指令不会触发重复提交。"""
