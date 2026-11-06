@@ -1,22 +1,30 @@
-"""官方 Gadget 双轨执行器与客户端完备自动化测试套件。
+"""Gadget worker-transport executor tests: pairing directory, worker lifecycle, dual track.
 
-覆盖：
-- 用例 1：GadgetCredentials 凭证加载与环境变量覆盖；
-- 用例 2：GadgetClient 侧会话创建与隔离验证（多会话不同 side_session_id）；
-- 用例 3：GadgetExecutor 完整的 submit/query/cancel 生命周期；
-- 用例 4：CircuitBreaker 熔断器状态流转（成功重置、连续失败熔断、冷却后半开恢复）；
-- 用例 5：DualTrackExecutor 默认走 Gadget 轨；
-- 用例 6：DualTrackExecutor 凭证缺失时透明降级至 Native 轨；
-- 用例 7：DualTrackExecutor 发生上游异常时触发熔断降级；
-- 用例 8：已在 Gadget 轨提交的任务，即使后续备轨被激活，query 依然严格绑定 Gadget 轨（防止跨轨串话）；
-- 用例 9：与 CoreRunner 的端到端集成测试（验证通过 runner.tick() 驱动从 claimed -> running -> succeeded 的全流程）；
-- 补充用例：数据库模式向前兼容性升级验证（无 track 列迁移）。
+The Gadget track speaks the real Noise protocol through a short-lived worker
+process (mobile_channels/gadget_worker/turn.ts), not the HTTP API the old
+client pretended existed. These tests cover, with the worker seam faked or
+stubbed (no network, no real pairing):
+
+- GadgetCredentials: pairing-directory completeness (three files, 0600 by handover);
+- GadgetClient: spawning the worker, reading its result file, killing it, and
+  the guarantee that credential values never appear in the worker argv;
+- GadgetExecutor: submit/query/cancel lifecycle, persisted gadget_sessions,
+  placeholder-row cleanup only when nothing was sent, unknown on ambiguity;
+- CircuitBreaker state transitions (unchanged);
+- DualTrackExecutor: default gadget route, credential-missing fallback,
+  upstream-error circuit trip, strict per-track query/cancel binding;
+- CoreRunner end-to-end: tick() drives claimed -> running -> succeeded;
+- Schema: legacy executor_runs gains track/baseline_seq; gadget_sessions is created.
 """
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import Mock
@@ -30,127 +38,255 @@ from mobile_channels.executors import (
 )
 from mobile_channels.gadget_client import (
     GadgetAuthError,
+    GadgetClient,
     GadgetCredentials,
     GadgetError,
-    GadgetClient,
     GadgetNetworkError,
 )
 from mobile_channels.ingress import CoreIngress
-from mobile_channels.models import Claim
+from mobile_channels.models import Claim  # noqa: F401  (kept for parity with the old suite)
 from mobile_channels.runtime import CoreRunner, ExecutionContext, ExecutionOutcome
 from mobile_channels.storage import Store
 
 
+STUB_WORKER = '''#!/usr/bin/env python3
+"""Stub Gadget worker for tests: records argv, writes a canned result."""
+import json
+import os
+import sys
+import time
+
+
+def main():
+    args = sys.argv[1:]
+    vals = {}
+    i = 0
+    while i < len(args):
+        if args[i].startswith("--"):
+            vals[args[i][2:]] = args[i + 1]
+            i += 2
+        else:
+            i += 1
+    out = vals["out"]
+    with open(out + ".argv.json", "w", encoding="utf-8") as handle:
+        json.dump(sys.argv, handle)
+    if os.environ.get("GADGET_STUB_MODE", "succeed") == "sleep":
+        time.sleep(120)
+        return 0
+    result = {"state": "succeeded", "text": "stub reply",
+              "message_id": "stub-msg-1", "session_id": vals.get("session")}
+    with open(out, "w", encoding="utf-8") as handle:
+        json.dump(result, handle)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+'''
+
+
+class FakeProc:
+    """Stand-in for subprocess.Popen: only the pid matters to the executor."""
+
+    def __init__(self, pid: int):
+        self.pid = pid
+
+
+class FakeWorkerClient:
+    """In-memory stand-in for GadgetClient: no processes, results driven by the test."""
+
+    def __init__(self, configured: bool = True):
+        self.configured = configured
+        self.started: list[tuple[str, str, str]] = []
+        self.results: dict[str, dict] = {}
+        self.stopped: list[int] = []
+        self.alive: set[int] = set()
+        self.start_error: Exception | None = None
+        self._next_pid = 1000
+
+    def is_configured(self) -> bool:
+        return self.configured
+
+    def start_turn(self, attempt_id: str, session_id: str, text: str, timeout_seconds=None):
+        if self.start_error is not None:
+            raise self.start_error
+        self._next_pid += 1
+        pid = self._next_pid
+        self.started.append((attempt_id, session_id, text))
+        self.alive.add(pid)
+        return FakeProc(pid)
+
+    def read_result(self, attempt_id: str):
+        return self.results.get(attempt_id)
+
+    def result_path(self, attempt_id: str) -> Path:
+        return Path(f"/nonexistent/gadget-{attempt_id}.json")
+
+    def worker_alive(self, pid: int) -> bool:
+        return pid in self.alive
+
+    def stop_turn(self, proc, *, wait_seconds: float = 5.0) -> bool:
+        pid = proc.pid if hasattr(proc, "pid") else int(proc)
+        self.stopped.append(pid)
+        self.alive.discard(pid)
+        return True
+
+    def close(self) -> None:
+        pass
+
+
+def write_pairing(directory: Path, token: str = "tok_test_secret_123") -> None:
+    """Create the three pairing files the reference client reads."""
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "identity.json").write_text('{"device": "test"}', encoding="utf-8")
+    (directory / "pairing.json").write_text('{"devices": []}', encoding="utf-8")
+    (directory / "sdk_token").write_text(token, encoding="utf-8")
+
+
 class TestGadgetCredentials(unittest.TestCase):
-    """用例 1：GadgetCredentials 凭证加载与环境变量覆盖。"""
+    """Pairing-directory completeness: three files, nothing else is trusted."""
 
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
-        self.config_path = Path(self.temp_dir.name) / "gadget.json"
+        self.base = Path(self.temp_dir.name)
 
-    def test_default_unconfigured(self):
-        """当文件不存在且环境变量为空时，凭证未就绪。"""
-        creds = GadgetCredentials.from_env_or_file(self.config_path, env={})
+    def test_default_directory_unconfigured_when_missing(self):
+        """A directory that does not exist is not configured."""
+        creds = GadgetCredentials(directory=self.base / "no-such-dir")
         self.assertFalse(creds.is_configured())
-        self.assertIsNone(creds.device_id)
-        self.assertIsNone(creds.token)
 
-    def test_load_from_json_file(self):
-        """能够正确从本地 JSON 配置文件加载凭证。"""
-        data = {
-            "device_id": "device_1001",
-            "token": "tok_secret_abc",
-            "endpoint": "https://custom.gadget.internal",
-        }
-        self.config_path.write_text(json.dumps(data), encoding="utf-8")
-        creds = GadgetCredentials.from_env_or_file(self.config_path, env={})
-        self.assertTrue(creds.is_configured())
-        self.assertEqual(creds.device_id, "device_1001")
-        self.assertEqual(creds.token, "tok_secret_abc")
-        self.assertEqual(creds.endpoint, "https://custom.gadget.internal")
+    def test_complete_directory_is_configured(self):
+        """All three pairing files present means configured."""
+        pairing = self.base / "pair"
+        write_pairing(pairing)
+        self.assertTrue(GadgetCredentials(directory=pairing).is_configured())
 
-    def test_env_overrides_file(self):
-        """环境变量能够优先覆盖配置文件中的内容。"""
-        data = {
-            "device_id": "device_file",
-            "token": "tok_file",
-            "endpoint": "https://file.gadget.internal",
-        }
-        self.config_path.write_text(json.dumps(data), encoding="utf-8")
-        env = {
-            "MUSE_GADGET_DEVICE_ID": "device_env",
-            "MUSE_GADGET_TOKEN": "tok_env",
-            "MUSE_GADGET_ENDPOINT": "https://env.gadget.internal",
-        }
-        creds = GadgetCredentials.from_env_or_file(self.config_path, env=env)
-        self.assertTrue(creds.is_configured())
-        self.assertEqual(creds.device_id, "device_env")
-        self.assertEqual(creds.token, "tok_env")
-        self.assertEqual(creds.endpoint, "https://env.gadget.internal")
+    def test_missing_one_file_is_not_configured(self):
+        """Two of three files is not enough: the client cannot authenticate."""
+        pairing = self.base / "pair"
+        write_pairing(pairing)
+        (pairing / "sdk_token").unlink()
+        self.assertFalse(GadgetCredentials(directory=pairing).is_configured())
 
-    def test_is_configured_boundary_conditions(self):
-        """测试不同缺失字段组合下 is_configured 的边界条件。"""
-        self.assertFalse(GadgetCredentials(device_id=None, token="tok").is_configured())
-        self.assertFalse(GadgetCredentials(device_id="dev", token=None).is_configured())
-        self.assertFalse(GadgetCredentials(device_id="   ", token="tok").is_configured())
-        self.assertFalse(GadgetCredentials(device_id="dev", token="  ").is_configured())
-        self.assertTrue(GadgetCredentials(device_id="dev", token="tok").is_configured())
+    def test_directory_pointing_at_a_file_is_not_configured(self):
+        """A path that is a file, not a directory, is not configured and never raises."""
+        target = self.base / "not-a-dir"
+        target.write_text("x", encoding="utf-8")
+        self.assertFalse(GadgetCredentials(directory=target).is_configured())
+
+    def test_default_directory_is_the_installed_pairing(self):
+        """The default points at the installed pairing directory, not a JSON config."""
+        creds = GadgetCredentials.default()
+        self.assertEqual(creds.directory, Path.home() / ".config" / "MuseGadgetPair")
 
 
 class TestGadgetClient(unittest.TestCase):
-    """用例 2：GadgetClient 侧会话创建与隔离验证（多会话不同 side_session_id）。"""
+    """Real GadgetClient against a stub worker script: spawn, read, kill, argv hygiene."""
 
     def setUp(self):
-        self.creds = GadgetCredentials(device_id="dev_test", token="tok_test")
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.base = Path(self.temp_dir.name)
+        self.pairing = self.base / "pair"
+        write_pairing(self.pairing)
+        self.run_dir = self.base / "runs"
+        self.stub = self.base / "stub_worker.py"
+        self.stub.write_text(STUB_WORKER, encoding="utf-8")
+        self.client = GadgetClient(
+            credentials=GadgetCredentials(directory=self.pairing),
+            run_dir=self.run_dir,
+            worker_script=self.stub,
+            runner=sys.executable,
+        )
+        self.addCleanup(self.client.close)
+        old_mode = os.environ.pop("GADGET_STUB_MODE", None)
 
-    def test_side_session_creation_and_isolation(self):
-        """验证侧会话的专属格式与多会话、多年级之间的上下文隔离。"""
-        client = GadgetClient(credentials=self.creds)
-        # 同一会话多次获取，返回一致
-        s1_a = client.create_or_get_side_session("conv_1", 0)
-        s1_b = client.create_or_get_side_session("conv_1", 0)
-        self.assertEqual(s1_a, s1_b)
-        self.assertEqual(s1_a, "gadget:side:conv_1:0")
+        def _restore_stub_mode():
+            if old_mode is None:
+                os.environ.pop("GADGET_STUB_MODE", None)
+            else:
+                os.environ["GADGET_STUB_MODE"] = old_mode
 
-        # 不同会话，返回不同 ID
-        s2 = client.create_or_get_side_session("conv_2", 0)
-        self.assertEqual(s2, "gadget:side:conv_2:0")
-        self.assertNotEqual(s1_a, s2)
+        self.addCleanup(_restore_stub_mode)
 
-        # 相同会话，不同 generation，返回不同 ID
-        s1_gen1 = client.create_or_get_side_session("conv_1", 1)
-        self.assertEqual(s1_gen1, "gadget:side:conv_1:1")
-        self.assertNotEqual(s1_a, s1_gen1)
+    def test_start_turn_writes_result_and_message_file(self):
+        """The stub worker runs, writes its result, and the client reads it back."""
+        proc = self.client.start_turn("att_1", "sess_1", "hello gadget")
+        self.assertIsInstance(proc, subprocess.Popen)
+        deadline = time.time() + 10
+        result = None
+        while time.time() < deadline:
+            result = self.client.read_result("att_1")
+            if result is not None:
+                break
+            time.sleep(0.1)
+        proc.wait(timeout=10)
+        self.assertEqual(result, {"state": "succeeded", "text": "stub reply",
+                                  "message_id": "stub-msg-1", "session_id": "sess_1"})
+        message_path = self.run_dir / "gadget-att_1.msg"
+        self.assertEqual(message_path.read_text(encoding="utf-8"), "hello gadget")
 
-    def test_client_transport_mocking(self):
-        """验证注入 transport_func 时的发送、轮询与取消方法。"""
-        mock_transport = Mock()
-        mock_transport.side_effect = lambda action, payload: {
-            "send_message": {"run_id": "run_999"},
-            "get_run_status": {"status": "completed", "display_text": "hello from gadget"},
-            "cancel_run": {"success": True},
-        }.get(action, {})
+    def test_worker_argv_never_carries_credential_values(self):
+        """The spawn argv holds the pairing directory path, never the token value."""
+        proc = self.client.start_turn("att_2", "sess_2", "secret check")
+        proc.wait(timeout=10)
+        argv = json.loads((self.run_dir / "gadget-att_2.json.argv.json").read_text(encoding="utf-8"))
+        joined = " ".join(argv)
+        self.assertIn(str(self.pairing), joined)
+        self.assertNotIn("tok_test_secret_123", joined)
+        # The message travels by file, not inline in argv.
+        self.assertNotIn("secret check", joined)
+        self.assertIn("--message-file", argv)
 
-        client = GadgetClient(credentials=self.creds, transport_func=mock_transport)
-        sid = client.create_or_get_side_session("c1", 0)
-        run_id = client.send_message(sid, "hello")
-        self.assertEqual(run_id, "run_999")
+    def test_start_turn_without_credentials_raises_auth(self):
+        """A missing pairing directory fails fast as an auth error, before spawning."""
+        empty = GadgetClient(
+            credentials=GadgetCredentials(directory=self.base / "empty"),
+            run_dir=self.run_dir,
+            worker_script=self.stub,
+            runner=sys.executable,
+        )
+        with self.assertRaises(GadgetAuthError):
+            empty.start_turn("att_3", "sess_3", "hi")
 
-        status = client.get_run_status(sid, run_id)
-        self.assertEqual(status["status"], "completed")
-        self.assertEqual(status["display_text"], "hello from gadget")
+    def test_start_turn_with_missing_runner_raises_network(self):
+        """A worker that cannot start is a network/transport error, not a crash."""
+        broken = GadgetClient(
+            credentials=GadgetCredentials(directory=self.pairing),
+            run_dir=self.run_dir,
+            worker_script=self.stub,
+            runner="/nonexistent/bun",
+        )
+        with self.assertRaises(GadgetNetworkError):
+            broken.start_turn("att_4", "sess_4", "hi")
 
-        cancelled = client.cancel_run(sid, run_id)
-        self.assertTrue(cancelled)
+    def test_stop_turn_kills_sleeping_worker(self):
+        """A live worker is SIGTERMed as a group and reported gone."""
+        os.environ["GADGET_STUB_MODE"] = "sleep"
+        proc = self.client.start_turn("att_5", "sess_5", "hi")
+        self.assertTrue(self.client.worker_alive(proc.pid))
+        self.assertTrue(self.client.stop_turn(proc))
+        self.assertFalse(self.client.worker_alive(proc.pid))
+        proc.wait(timeout=10)
 
-        client.close()
+    def test_read_result_missing_and_corrupt_return_none(self):
+        """No file yet, or an unreadable file, both read as None (still running)."""
+        self.assertIsNone(self.client.read_result("att_missing"))
+        bad = self.run_dir / "gadget-att_bad.json"
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        bad.write_text("{not json", encoding="utf-8")
+        self.assertIsNone(self.client.read_result("att_bad"))
+
+    def test_close_marks_closed(self):
+        """After close(), start_turn refuses to spawn."""
+        self.client.close()
         with self.assertRaises(GadgetError):
-            client.send_message(sid, "after close")
+            self.client.start_turn("att_6", "sess_6", "hi")
 
 
 class TestGadgetExecutor(unittest.TestCase):
-    """用例 3：GadgetExecutor 完整的 submit/query/cancel 生命周期。"""
+    """GadgetExecutor lifecycle against the fake worker client."""
 
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -159,14 +295,9 @@ class TestGadgetExecutor(unittest.TestCase):
         self.store = Store(self.db_path)
         self.addCleanup(self.store.close)
         self.ingress = CoreIngress(self.store, "wecom", "bot", {"user_1"})
-        self.ingest = self.ingress.receive("msg_1", "user_1", "chat_1", "single", "ping")
-
-        self.mock_transport = Mock()
-        self.client = GadgetClient(
-            credentials=GadgetCredentials("dev1", "tok1"),
-            transport_func=self.mock_transport,
-        )
-        self.executor = GadgetExecutor(self.store, client=self.client)
+        self.ingress.receive("msg_1", "user_1", "chat_1", "single", "ping")
+        self.fake_client = FakeWorkerClient(configured=True)
+        self.executor = GadgetExecutor(self.store, client=self.fake_client)
 
     def _get_context(self) -> ExecutionContext:
         claim = self.store.claim("worker_1", concurrency=1, lease_seconds=60)
@@ -190,9 +321,8 @@ class TestGadgetExecutor(unittest.TestCase):
         )
 
     def test_unconfigured_credentials_returns_not_submitted(self):
-        """当未配置有效凭证时，submit 立即返回 not_submitted 且不写入 executor_runs。"""
-        unconfigured_client = GadgetClient(credentials=GadgetCredentials())
-        executor = GadgetExecutor(self.store, client=unconfigured_client)
+        """When the pairing is missing, submit returns not_submitted and writes nothing."""
+        executor = GadgetExecutor(self.store, client=FakeWorkerClient(configured=False))
         context = self._get_context()
         outcome = executor.submit(context)
         self.assertEqual(outcome.state, "not_submitted")
@@ -201,52 +331,111 @@ class TestGadgetExecutor(unittest.TestCase):
         self.assertEqual(len(runs), 0)
 
     def test_full_lifecycle_submit_query_cancel(self):
-        """验证 submit -> query(running) -> query(succeeded) 与 cancel 全生命周期。"""
-        self.mock_transport.side_effect = lambda action, payload: {
-            "send_message": {"run_id": "run_gadget_1"},
-            "get_run_status": {"status": "running", "display_text": None},
-            "cancel_run": {"success": True},
-        }.get(action, {})
-
+        """submit -> query(running) -> query(succeeded) -> cancel, with a persisted session."""
         context = self._get_context()
-        # 1. 提交任务
         outcome = self.executor.submit(context)
         self.assertEqual(outcome.state, "accepted")
-        self.assertEqual(outcome.run_id, "run_gadget_1")
+        self.assertEqual(outcome.run_id, "worker:1001")
+        self.assertEqual(len(self.fake_client.started), 1)
+        attempt_id, session_id, text = self.fake_client.started[0]
+        self.assertEqual(attempt_id, context.claim.attempt_id)
+        self.assertEqual(text, "ping")
 
-        # 检查数据库记录
         row = self.store.connection.execute(
             "SELECT * FROM executor_runs WHERE attempt_id=?", (context.claim.attempt_id,)
         ).fetchone()
         self.assertIsNotNone(row)
         self.assertEqual(row["track"], "gadget")
-        self.assertEqual(row["platform_run_id"], "run_gadget_1")
+        self.assertEqual(row["platform_run_id"], "worker:1001")
         self.assertEqual(row["status"], "accepted")
+        self.assertEqual(row["session_id"], session_id)
+        saved = self.store.connection.execute(
+            "SELECT session_id FROM gadget_sessions WHERE conversation_id=? AND generation=?",
+            (context.claim.conversation_id, context.claim.generation),
+        ).fetchone()
+        self.assertEqual(saved["session_id"], session_id)
 
-        # 2. 轮询 running 状态
-        q1 = self.executor.query(context, "run_gadget_1")
+        q1 = self.executor.query(context, "worker:1001")
         self.assertEqual(q1.state, "running")
 
-        # 3. 轮询 succeeded 状态
-        self.mock_transport.side_effect = lambda action, payload: {
-            "get_run_status": {"status": "completed", "display_text": "pong from gadget"},
-        }.get(action, {})
-        q2 = self.executor.query(context, "run_gadget_1")
+        self.fake_client.results[context.claim.attempt_id] = {
+            "state": "succeeded", "text": "pong from gadget", "message_id": "m1",
+        }
+        q2 = self.executor.query(context, "worker:1001")
         self.assertEqual(q2.state, "succeeded")
         self.assertEqual(q2.text, "pong from gadget")
 
-        # 4. 取消
-        self.mock_transport.side_effect = lambda action, payload: {
-            "cancel_run": {"success": True},
-            "get_run_status": {"status": "cancelled"},
-        }.get(action, {})
-        c = self.executor.cancel(context, "run_gadget_1")
+        c = self.executor.cancel(context, "worker:1001")
         self.assertEqual(c.state, "cancelled")
-        self.assertEqual(c.evidence, "platform_run_cancelled")
+        self.assertEqual(c.evidence, "worker_terminated")
+        self.assertEqual(self.fake_client.stopped, [1001])
+
+    def test_session_reused_within_generation_and_split_by_new_generation(self):
+        """One session per (conversation, generation); /new gets a new session."""
+        from dataclasses import replace
+
+        context = self._get_context()
+        first = self.executor._session(context)
+        self.assertEqual(self.executor._session(context), first)
+
+        gen1 = ExecutionContext(
+            claim=replace(context.claim, generation=1),
+            text=context.text,
+            external_message_id=context.external_message_id,
+            sender_id=context.sender_id,
+            channel=context.channel,
+            account_id=context.account_id,
+            chat_type=context.chat_type,
+            chat_id=context.chat_id,
+        )
+        second = self.executor._session(gen1)
+        self.assertNotEqual(second, first)
+        self.assertEqual(self.executor._session(gen1), second)
+
+    def test_spawn_failure_drops_placeholder_and_returns_unknown(self):
+        """A worker that never started sent nothing: unknown, and no placeholder row."""
+        self.fake_client.start_error = GadgetNetworkError("cannot start Gadget worker: no bun")
+        context = self._get_context()
+        outcome = self.executor.submit(context)
+        self.assertEqual(outcome.state, "unknown")
+        self.assertIn("cannot start Gadget worker", outcome.evidence)
+        rows = self.store.connection.execute(
+            "SELECT * FROM executor_runs WHERE attempt_id=?", (context.claim.attempt_id,)
+        ).fetchall()
+        self.assertEqual(len(rows), 0)
+
+    def test_query_worker_died_without_result_is_unknown(self):
+        """A dead worker with no result file is unknown, never a guessed failure."""
+        context = self._get_context()
+        self.executor.submit(context)
+        self.fake_client.alive.discard(1001)
+        q = self.executor.query(context, "worker:1001")
+        self.assertEqual(q.state, "unknown")
+        self.assertEqual(q.evidence, "worker_exited_without_result")
+
+    def test_query_unrecognized_result_state_is_unknown(self):
+        """A result file with an unrecognized state is unknown, not running."""
+        context = self._get_context()
+        self.executor.submit(context)
+        self.fake_client.results[context.claim.attempt_id] = {"state": "alien_unrecognized_status"}
+        q = self.executor.query(context, "worker:1001")
+        self.assertEqual(q.state, "unknown")
+        self.assertEqual(q.evidence, "unrecognized_result_state_alien_unrecognized_status")
+
+    def test_query_failed_result_maps_evidence(self):
+        """A worker-reported failure surfaces its evidence, not a generic error."""
+        context = self._get_context()
+        self.executor.submit(context)
+        self.fake_client.results[context.claim.attempt_id] = {
+            "state": "failed", "evidence": "Muse /chat/stream returned HTTP 500",
+        }
+        q = self.executor.query(context, "worker:1001")
+        self.assertEqual(q.state, "failed")
+        self.assertEqual(q.evidence, "Muse /chat/stream returned HTTP 500")
 
 
 class TestCircuitBreaker(unittest.TestCase):
-    """用例 4：CircuitBreaker 熔断器状态流转（成功重置、连续失败熔断、冷却后半开恢复）。"""
+    """Use case 4: CircuitBreaker state transitions (success reset, trip, half-open)."""
 
     def setUp(self):
         self.now = 1000.0
@@ -254,48 +443,39 @@ class TestCircuitBreaker(unittest.TestCase):
     def test_circuit_state_transitions(self):
         cb = CircuitBreaker(failure_threshold=3, cooldown_seconds=30.0, clock=lambda: self.now)
 
-        # 初始状态
         self.assertEqual(cb.status, "CLOSED")
         self.assertTrue(cb.can_execute())
 
-        # 1 次失败
         cb.record_failure()
         self.assertEqual(cb.status, "CLOSED")
         self.assertTrue(cb.can_execute())
 
-        # 2 次失败
         cb.record_failure()
         self.assertEqual(cb.status, "CLOSED")
         self.assertTrue(cb.can_execute())
 
-        # 成功重置
         cb.record_success()
         self.assertEqual(cb.status, "CLOSED")
         self.assertEqual(cb.failure_count, 0)
 
-        # 连续 3 次失败触发熔断
         cb.record_failure()
         cb.record_failure()
         cb.record_failure()
         self.assertEqual(cb.status, "OPEN")
         self.assertFalse(cb.can_execute())
 
-        # 冷却未过（+20s）
         self.now += 20.0
         self.assertEqual(cb.status, "OPEN")
         self.assertFalse(cb.can_execute())
 
-        # 冷却到达（+31s），进入 HALF_OPEN
         self.now += 11.0
         self.assertEqual(cb.status, "HALF_OPEN")
         self.assertTrue(cb.can_execute())
 
-        # 半开状态试探成功 -> 恢复 CLOSED
         cb.record_success()
         self.assertEqual(cb.status, "CLOSED")
         self.assertTrue(cb.can_execute())
 
-        # 再次熔断后，半开状态试探失败 -> 立即重回 OPEN
         cb.record_failure()
         cb.record_failure()
         cb.record_failure()
@@ -308,7 +488,7 @@ class TestCircuitBreaker(unittest.TestCase):
 
 
 class TestDualTrackExecutor(unittest.TestCase):
-    """用例 5 ~ 8：DualTrackExecutor 默认路由、降级、熔断与防串话绑定。"""
+    """Use cases 5-8: DualTrackExecutor default route, fallback, circuit trip, binding."""
 
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -319,14 +499,11 @@ class TestDualTrackExecutor(unittest.TestCase):
         self.addCleanup(self.store.close)
         self.ingress = CoreIngress(self.store, "wecom", "bot", {"user_1"})
 
-        # Mock primary (Gadget)
         self.primary = Mock(spec=GadgetExecutor)
         self.primary.is_configured.return_value = True
 
-        # Mock fallback (Native)
         self.fallback = Mock(spec=MuseExecutor)
 
-        # Circuit
         self.circuit = CircuitBreaker(failure_threshold=3, cooldown_seconds=30.0, clock=lambda: self.now)
 
         self.dual_executor = DualTrackExecutor(
@@ -360,11 +537,10 @@ class TestDualTrackExecutor(unittest.TestCase):
         )
 
     def test_use_case_5_default_gadget_track(self):
-        """用例 5：DualTrackExecutor 默认走 Gadget 轨。"""
+        """Use case 5: DualTrackExecutor defaults to the Gadget track."""
         context = self._create_context("m_primary")
         self.primary.submit.return_value = ExecutionOutcome("accepted", run_id="gadget_run_1")
 
-        # 模拟 GadgetExecutor 成功写入 executor_runs
         with self.store.transaction():
             self.store.connection.execute(
                 "INSERT INTO executor_runs (attempt_id, session_id, platform_run_id, status, created_at, track) VALUES (?,?,?,?,?,?)",
@@ -379,12 +555,11 @@ class TestDualTrackExecutor(unittest.TestCase):
         self.assertEqual(self.dual_executor.current_track(context.claim.attempt_id), "gadget")
 
     def test_use_case_6_credentials_missing_fallback_to_native(self):
-        """用例 6：DualTrackExecutor 凭证缺失时透明降级至 Native 轨。"""
+        """Use case 6: missing pairing falls back to the Native track transparently."""
         self.primary.is_configured.return_value = False
         context = self._create_context("m_unconf")
         self.fallback.submit.return_value = ExecutionOutcome("accepted", run_id="native_run_1")
 
-        # 模拟 fallback 写入 native 记录
         def fallback_submit_side_effect(ctx):
             with self.store.transaction():
                 self.store.connection.execute(
@@ -403,8 +578,7 @@ class TestDualTrackExecutor(unittest.TestCase):
         self.assertEqual(self.dual_executor.current_track(context.claim.attempt_id), "native")
 
     def test_use_case_7_upstream_error_trips_circuit_and_falls_back(self):
-        """用例 7：DualTrackExecutor 发生上游异常时触发熔断降级。"""
-        # 1. 第一次任务发生上游网络异常
+        """Use case 7: upstream errors trip the circuit and fall back to Native."""
         context1 = self._create_context("m_err1")
         self.primary.submit.side_effect = GadgetNetworkError("Connection refused")
 
@@ -423,7 +597,6 @@ class TestDualTrackExecutor(unittest.TestCase):
         self.assertEqual(self.circuit.failure_count, 1)
         self.fallback.submit.assert_called_once()
 
-        # 2. 第二次与第三次失败触发熔断
         context2 = self._create_context("m_err2")
         self.dual_executor.submit(context2)
         self.assertEqual(self.circuit.failure_count, 2)
@@ -433,7 +606,6 @@ class TestDualTrackExecutor(unittest.TestCase):
         self.assertEqual(self.circuit.failure_count, 3)
         self.assertEqual(self.dual_executor.circuit_status(), "OPEN")
 
-        # 3. 第四次任务在 OPEN 状态下直接走 Native，根本不调用 primary
         self.primary.submit.reset_mock()
         context4 = self._create_context("m_err4")
         outcome4 = self.dual_executor.submit(context4)
@@ -441,8 +613,7 @@ class TestDualTrackExecutor(unittest.TestCase):
         self.primary.submit.assert_not_called()
 
     def test_use_case_8_query_strictly_bound_to_track(self):
-        """用例 8：已在 Gadget 轨提交的任务，即使后续备轨被激活，query 依然严格绑定 Gadget 轨（防止跨轨串话）。"""
-        # 任务 1：在 Gadget 轨提交成功
+        """Use case 8: query/cancel stay on the bound track even after the circuit opens."""
         context1 = self._create_context("m_task1")
         with self.store.transaction():
             self.store.connection.execute(
@@ -451,7 +622,6 @@ class TestDualTrackExecutor(unittest.TestCase):
             )
         self.assertEqual(self.dual_executor.current_track(context1.claim.attempt_id), "gadget")
 
-        # 任务 2：在 Native 轨提交成功
         context2 = self._create_context("m_task2")
         with self.store.transaction():
             self.store.connection.execute(
@@ -460,13 +630,11 @@ class TestDualTrackExecutor(unittest.TestCase):
             )
         self.assertEqual(self.dual_executor.current_track(context2.claim.attempt_id), "native")
 
-        # 人为触发熔断开启
         self.circuit.record_failure()
         self.circuit.record_failure()
         self.circuit.record_failure()
         self.assertEqual(self.dual_executor.circuit_status(), "OPEN")
 
-        # 对任务 1 进行 query，必须路由至 primary (Gadget)
         self.primary.query.return_value = ExecutionOutcome("succeeded", text="gadget answer")
         q1 = self.dual_executor.query(context1, "gadget_run_1")
         self.assertEqual(q1.state, "succeeded")
@@ -474,21 +642,19 @@ class TestDualTrackExecutor(unittest.TestCase):
         self.primary.query.assert_called_once_with(context1, "gadget_run_1")
         self.fallback.query.assert_not_called()
 
-        # 对任务 2 进行 query，必须路由至 fallback (Native)
         self.fallback.query.return_value = ExecutionOutcome("succeeded", text="native answer")
         q2 = self.dual_executor.query(context2, "native_run_2")
         self.assertEqual(q2.state, "succeeded")
         self.assertEqual(q2.text, "native answer")
         self.fallback.query.assert_called_once_with(context2, "native_run_2")
 
-        # 对任务 1 发起 cancel，同样必须严格路由至 primary
         self.primary.cancel.return_value = ExecutionOutcome("cancelled", evidence="cancelled")
         c1 = self.dual_executor.cancel(context1, "gadget_run_1")
         self.assertEqual(c1.state, "cancelled")
         self.primary.cancel.assert_called_once_with(context1, "gadget_run_1")
 
     def test_cancel_requested_before_submission_does_not_fallback(self):
-        """若任务在提交前已被请求取消，返回 not_submitted 且不应降级重试备轨。"""
+        """A cancel requested before submission returns not_submitted without falling back."""
         context = self._create_context("m_cancel_first")
         self.primary.submit.return_value = ExecutionOutcome("not_submitted", evidence="cancelled_before_submission")
         outcome = self.dual_executor.submit(context)
@@ -497,7 +663,7 @@ class TestDualTrackExecutor(unittest.TestCase):
         self.fallback.submit.assert_not_called()
 
     def test_query_and_cancel_without_track_binding(self):
-        """对未绑定的 attempt_id 查询或取消，返回 unknown 且 evidence 为 no_track_binding。"""
+        """Query/cancel on an unbound attempt returns unknown with no_track_binding."""
         context = self._create_context("m_no_track")
         q = self.dual_executor.query(context, "run_dummy")
         self.assertEqual(q.state, "unknown")
@@ -509,7 +675,7 @@ class TestDualTrackExecutor(unittest.TestCase):
 
 
 class TestEdgeCasesAndHttpErrors(unittest.TestCase):
-    """测试边界场景、异常转换以及 client_factory 机制。"""
+    """Boundary cases: client_factory, run-id binding, worker start failures."""
 
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -519,7 +685,7 @@ class TestEdgeCasesAndHttpErrors(unittest.TestCase):
         self.addCleanup(self.store.close)
 
     def test_executor_with_client_factory(self):
-        """测试 GadgetExecutor 支持通过 client_factory 惰性提供客户端。"""
+        """GadgetExecutor lazily obtains its client from client_factory."""
         mock_client = Mock(spec=GadgetClient)
         mock_client.is_configured.return_value = True
         executor = GadgetExecutor(self.store, client_factory=lambda: mock_client)
@@ -527,14 +693,13 @@ class TestEdgeCasesAndHttpErrors(unittest.TestCase):
         self.assertIs(executor.client, mock_client)
 
     def test_query_mismatched_run_id_raises_value_error(self):
-        """查询时若传入与 attempt 绑定不一致的 run_id，必须抛出 ValueError。"""
+        """A query with a run_id that does not match the binding raises ValueError."""
         ingress = CoreIngress(self.store, "wecom", "bot", {"user_1"})
         ingress.receive("msg_mis", "user_1", "chat_mis", "single", "text")
         claim = self.store.claim("w1", concurrency=1, lease_seconds=60)
         self.store.begin_submission(claim)
 
-        client = GadgetClient(credentials=GadgetCredentials("d", "t"), transport_func=lambda a, p: {})
-        executor = GadgetExecutor(self.store, client=client)
+        executor = GadgetExecutor(self.store, client=FakeWorkerClient(configured=True))
 
         with self.store.transaction():
             self.store.connection.execute(
@@ -562,27 +727,35 @@ class TestEdgeCasesAndHttpErrors(unittest.TestCase):
         with self.assertRaises(ValueError):
             executor.query(ctx, "run_different")
 
-    def test_client_http_error_mappings(self):
-        """验证 GadgetClient 能够将标准库 HTTP 401 映射为 AuthError，网络错误映射为 NetworkError。"""
-        import io
-        import urllib.error
-        from unittest.mock import patch
+    def test_client_start_failure_mappings(self):
+        """Missing pairing maps to AuthError; an unstartable worker maps to NetworkError."""
+        base = Path(self.temp_dir.name)
+        stub = base / "stub.py"
+        stub.write_text(STUB_WORKER, encoding="utf-8")
 
-        client = GadgetClient(credentials=GadgetCredentials("dev", "tok", "http://fake.endpoint"))
+        unconfigured = GadgetClient(
+            credentials=GadgetCredentials(directory=base / "empty"),
+            run_dir=base / "runs",
+            worker_script=stub,
+            runner=sys.executable,
+        )
+        with self.assertRaises(GadgetAuthError):
+            unconfigured.start_turn("a1", "s1", "hi")
 
-        with patch("urllib.request.urlopen") as mock_urlopen:
-            mock_urlopen.side_effect = urllib.error.HTTPError("http://fake", 401, "Unauthorized", {}, io.BytesIO(b""))
-            with self.assertRaises(GadgetAuthError):
-                client.send_message("sid", "hi")
-
-        with patch("urllib.request.urlopen") as mock_urlopen:
-            mock_urlopen.side_effect = urllib.error.URLError("Connection reset")
-            with self.assertRaises(GadgetNetworkError):
-                client.get_run_status("sid", "r1")
+        pairing = base / "pair"
+        write_pairing(pairing)
+        broken = GadgetClient(
+            credentials=GadgetCredentials(directory=pairing),
+            run_dir=base / "runs",
+            worker_script=stub,
+            runner="/nonexistent/bun",
+        )
+        with self.assertRaises(GadgetNetworkError):
+            broken.start_turn("a2", "s2", "hi")
 
 
 class TestCoreRunnerIntegration(unittest.TestCase):
-    """用例 9：与 CoreRunner 的端到端集成测试（通过 runner.tick() 全流程驱动）。"""
+    """Use case 9: CoreRunner end-to-end, tick() driving claimed -> running -> succeeded."""
 
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -593,13 +766,8 @@ class TestCoreRunnerIntegration(unittest.TestCase):
         self.addCleanup(self.store.close)
         self.ingress = CoreIngress(self.store, "wecom", "bot", {"alice"})
 
-        # 使用真实 GadgetClient（注入 mock transport）
-        self.mock_transport = Mock()
-        self.gadget_client = GadgetClient(
-            credentials=GadgetCredentials("dev_real", "tok_real"),
-            transport_func=self.mock_transport,
-        )
-        self.primary = GadgetExecutor(self.store, client=self.gadget_client)
+        self.fake_client = FakeWorkerClient(configured=True)
+        self.primary = GadgetExecutor(self.store, client=self.fake_client)
         self.fallback = Mock(spec=MuseExecutor)
         self.dual_executor = DualTrackExecutor(
             store=self.store,
@@ -608,47 +776,34 @@ class TestCoreRunnerIntegration(unittest.TestCase):
         )
 
     def test_full_pipeline_claimed_running_succeeded(self):
-        """验证 runner.tick() 驱动任务从 claimed 到 running 再到 succeeded 的端到端流程。"""
-        # 1. 模拟上游消息摄入
+        """runner.tick() drives the task from claimed to running to succeeded."""
         ingest = self.ingress.receive("msg_100", "alice", "chat_alice", "single", "What is dual-track?")
         self.assertTrue(ingest.created)
 
-        # 2. 设置 transport 响应：提交阶段返回 run_id
-        self.mock_transport.side_effect = lambda action, payload: {
-            "send_message": {"run_id": "gadget_run_e2e_100"},
-            "get_run_status": {"status": "running"},
-        }.get(action, {})
-
         runner = CoreRunner(self.store, self.dual_executor, "worker_e2e")
 
-        # 3. 第一次 tick()：认领并提交，状态变为 accepted
         state1 = runner.tick()
         self.assertEqual(state1, "accepted")
         task = self.store.task(ingest.task_id)
         self.assertEqual(task["state"], "running")
 
-        # 检查 executor_runs 记录
         run_row = self.store.connection.execute(
             "SELECT * FROM executor_runs WHERE attempt_id=?", (task["attempt_id"],)
         ).fetchone()
         self.assertIsNotNone(run_row)
         self.assertEqual(run_row["track"], "gadget")
-        self.assertEqual(run_row["platform_run_id"], "gadget_run_e2e_100")
+        self.assertEqual(run_row["platform_run_id"], "worker:1001")
 
-        # 4. 第二次 tick()：轮询仍为 running
         state2 = runner.tick()
         self.assertEqual(state2, "running")
         self.assertEqual(self.store.task(ingest.task_id)["state"], "running")
 
-        # 5. 修改 transport 响应为 completed
-        self.mock_transport.side_effect = lambda action, payload: {
-            "get_run_status": {
-                "status": "completed",
-                "display_text": "Dual-track is high-availability architecture.",
-            },
-        }.get(action, {})
+        self.fake_client.results[task["attempt_id"]] = {
+            "state": "succeeded",
+            "text": "Dual-track is high-availability architecture.",
+            "message_id": "m100",
+        }
 
-        # 6. 第三次 tick()：轮询成功，任务流转至 succeeded 并写入出站消息
         state3 = runner.tick()
         self.assertEqual(state3, "succeeded")
         task_final = self.store.task(ingest.task_id)
@@ -661,13 +816,12 @@ class TestCoreRunnerIntegration(unittest.TestCase):
         self.assertIsNotNone(outbound)
         self.assertEqual(outbound["text"], "Dual-track is high-availability architecture.")
 
-        # 7. 第四次 tick()：队列清空，进入 idle
         state4 = runner.tick()
         self.assertEqual(state4, "idle")
 
 
 class TestSchemaBackwardCompatibility(unittest.TestCase):
-    """验证从没有 track 字段的旧表结构升级时的向前兼容性。"""
+    """Legacy executor_runs gains track/baseline_seq; gadget_sessions is created."""
 
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -675,8 +829,7 @@ class TestSchemaBackwardCompatibility(unittest.TestCase):
         self.db_path = Path(self.temp_dir.name) / "legacy.sqlite3"
 
     def test_legacy_table_auto_migrated_with_track_column(self):
-        """模拟旧版数据库只有 (attempt_id, session_id, platform_run_id, status, created_at)。"""
-        # 手动创建旧版表
+        """A legacy table without track/baseline_seq is migrated in place."""
         conn = sqlite3.connect(str(self.db_path))
         conn.execute("""
             CREATE TABLE executor_runs (
@@ -690,16 +843,14 @@ class TestSchemaBackwardCompatibility(unittest.TestCase):
         conn.commit()
         conn.close()
 
-        # 打开 Store 并运行 ensure_executor_schema
         store = Store(self.db_path)
         self.addCleanup(store.close)
         ensure_executor_schema(store)
 
-        # 验证 track 字段已被平滑追加，且默认值为 'native'
         columns = [row["name"] for row in store.connection.execute("PRAGMA table_info(executor_runs)").fetchall()]
         self.assertIn("track", columns)
+        self.assertIn("baseline_seq", columns)
 
-        # 验证旧记录插入和默认值生效
         store.connection.execute(
             "INSERT INTO executor_runs (attempt_id, session_id, platform_run_id, status, created_at) "
             "VALUES ('att_old', 's_old', 'r_old', 'accepted', 100.0)"
@@ -707,9 +858,13 @@ class TestSchemaBackwardCompatibility(unittest.TestCase):
         row = store.connection.execute("SELECT track FROM executor_runs WHERE attempt_id='att_old'").fetchone()
         self.assertEqual(row["track"], "native")
 
+        tables = [r["name"] for r in store.connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+        self.assertIn("gadget_sessions", tables)
+
 
 class TestSkepticalHardeningAndEdgeCases(unittest.TestCase):
-    """深层健壮性验证：覆盖非字符串凭证类型、URL 编码、异常保留、HALF_OPEN 重置与真实双轨降级。"""
+    """Hardening: credential hygiene, spawn failures, half-open reset, real fallback."""
 
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -742,148 +897,105 @@ class TestSkepticalHardeningAndEdgeCases(unittest.TestCase):
             chat_id=row["chat_id"],
         )
 
-    def test_credentials_with_non_string_types(self):
-        """非字符串凭证字段（如 JSON 中的数字 ID）能安全转换并不发生 AttributeError。"""
-        # 1. 纯数字对象直接传入 dataclass 时，is_configured 安全返回 False，不抛出 AttributeError
-        numeric_creds = GadgetCredentials(device_id=12345, token=67890)  # type: ignore
-        self.assertFalse(numeric_creds.is_configured())
+    def test_worker_argv_never_carries_credential_values(self):
+        """The spawned worker gets the pairing directory path, never a credential value."""
+        base = Path(self.temp_dir.name)
+        pairing = base / "pair"
+        write_pairing(pairing, token="tok_live_value_never_in_argv")
+        run_dir = base / "runs"
+        stub = base / "stub.py"
+        stub.write_text(STUB_WORKER, encoding="utf-8")
+        client = GadgetClient(
+            credentials=GadgetCredentials(directory=pairing),
+            run_dir=run_dir,
+            worker_script=stub,
+            runner=sys.executable,
+        )
+        proc = client.start_turn("att_h", "sess_h", "hello")
+        proc.wait(timeout=10)
+        argv = json.loads((run_dir / "gadget-att_h.json.argv.json").read_text(encoding="utf-8"))
+        joined = " ".join(argv)
+        self.assertIn(str(pairing), joined)
+        self.assertNotIn("tok_live_value_never_in_argv", joined)
 
-        # 2. 从 JSON 文件读取数字类型时，from_env_or_file 自动将其转换为合法字符串
-        json_file = Path(self.temp_dir.name) / "numeric.json"
-        json_file.write_text(json.dumps({"device_id": 88888, "token": 99999}), encoding="utf-8")
-        loaded_creds = GadgetCredentials.from_env_or_file(json_file, env={})
-        self.assertTrue(loaded_creds.is_configured())
-        self.assertEqual(loaded_creds.device_id, "88888")
-        self.assertEqual(loaded_creds.token, "99999")
-
-    def test_url_quoting_for_spaces_and_unicode_in_session_id(self):
-        """当 session_id 或 run_id 包含空格或中文时，URL 经安全编码，不触发 urllib InvalidURL。"""
-        from unittest.mock import MagicMock, patch
-
-        client = GadgetClient(credentials=GadgetCredentials("dev", "tok", "https://gadget.muse.local"))
-        with patch("urllib.request.urlopen") as mock_urlopen:
-            mock_resp = MagicMock()
-            mock_resp.read.return_value = json.dumps({"run_id": "run_ok_1"}).encode("utf-8")
-            mock_resp.__enter__.return_value = mock_resp
-            mock_urlopen.return_value = mock_resp
-
-            # session_id 包含中文与空格
-            run_id = client.send_message("gadget:side:测试 1:0", "hello")
-            self.assertEqual(run_id, "run_ok_1")
-
-            # 验证请求 URL 已被有效编码，不含未转义的空格或非法字符
-            req = mock_urlopen.call_args[0][0]
-            self.assertNotIn(" ", req.full_url)
-            self.assertIn("https://gadget.muse.local/api/sessions/", req.full_url)
-
-    def test_transport_func_internal_type_error_preserved(self):
-        """当用户注入的 transport_func 内部抛出 TypeError 时，原始异常与调用栈不被吞没。"""
-        def bad_transport(action, payload):
-            return None + 1  # 内部抛出 TypeError
-
-        client = GadgetClient(credentials=GadgetCredentials("dev", "tok"), transport_func=bad_transport)
-        with self.assertRaises(TypeError) as ctx:
-            client.send_message("sid", "hi")
-        self.assertIn("unsupported operand type", str(ctx.exception))
+    def test_worker_spawn_oserror_is_network_error(self):
+        """A worker that cannot spawn raises GadgetNetworkError naming the runner."""
+        base = Path(self.temp_dir.name)
+        pairing = base / "pair"
+        write_pairing(pairing)
+        client = GadgetClient(
+            credentials=GadgetCredentials(directory=pairing),
+            run_dir=base / "runs",
+            worker_script=base / "stub.py",
+            runner="/nonexistent/bun",
+        )
+        with self.assertRaises(GadgetNetworkError) as ctx:
+            client.start_turn("att_x", "sess_x", "hi")
+        self.assertIn("/nonexistent/bun", str(ctx.exception))
 
     def test_circuit_breaker_half_open_failure_resets_cooldown(self):
-        """半开状态试探失败后，熔断器立即重回 OPEN 并重启冷却计时。"""
+        """A half-open probe failure re-opens the circuit and restarts the cooldown."""
         now = 1000.0
         cb = CircuitBreaker(failure_threshold=5, cooldown_seconds=30.0, clock=lambda: now)
 
-        # 触发熔断
         for _ in range(5):
             cb.record_failure()
         self.assertEqual(cb.status, "OPEN")
 
-        # 冷却结束，进入 HALF_OPEN
         now += 35.0
         self.assertEqual(cb.status, "HALF_OPEN")
 
-        # 半开试探失败
         cb.record_failure()
         self.assertEqual(cb.status, "OPEN")
 
-        # 冷却重新开始：经过 15s 后仍应是 OPEN，而不能过早回到 HALF_OPEN
         now += 15.0
         self.assertEqual(cb.status, "OPEN")
         self.assertFalse(cb.can_execute())
 
-        # 再次经过 16s（累计 31s），再次进入 HALF_OPEN
         now += 16.0
         self.assertEqual(cb.status, "HALF_OPEN")
         self.assertTrue(cb.can_execute())
 
     def test_gadget_executor_pre_submission_cancellation_cleans_db(self):
-        """在提交前被请求取消时，GadgetExecutor 清理临时行，不留 platform_run_id IS NULL 的僵尸记录。"""
+        """A cancel requested before submission leaves no placeholder row."""
         context = self._create_context("m_cancel_clean")
-        # 标记任务取消
         self.store.request_cancel(context.claim.task_id, context.claim.conversation_id)
 
-        client = GadgetClient(credentials=GadgetCredentials("dev", "tok"), transport_func=lambda a, p: {})
-        executor = GadgetExecutor(self.store, client=client)
+        executor = GadgetExecutor(self.store, client=FakeWorkerClient(configured=True))
 
         outcome = executor.submit(context)
         self.assertEqual(outcome.state, "not_submitted")
         self.assertEqual(outcome.evidence, "cancelled_before_submission")
 
-        # 确认 executor_runs 中不存在任何残留行
         rows = self.store.connection.execute(
             "SELECT * FROM executor_runs WHERE attempt_id=?", (context.claim.attempt_id,)
         ).fetchall()
         self.assertEqual(len(rows), 0)
 
     def test_gadget_executor_standalone_network_failure_returns_unknown(self):
-        """真实 GadgetExecutor 在独立运行时若发生网络异常，返回 unknown 并不抛出未捕获异常。"""
+        """A real GadgetExecutor whose worker cannot start returns unknown, never raises."""
         context = self._create_context("m_net_fail")
-
-        def failing_transport(action, payload):
-            raise GadgetNetworkError("Gateway Timeout 504")
-
-        client = GadgetClient(credentials=GadgetCredentials("dev", "tok"), transport_func=failing_transport)
-        executor = GadgetExecutor(self.store, client=client)
+        fake = FakeWorkerClient(configured=True)
+        fake.start_error = GadgetNetworkError("Gateway Timeout 504")
+        executor = GadgetExecutor(self.store, client=fake)
 
         outcome = executor.submit(context)
         self.assertEqual(outcome.state, "unknown")
         self.assertIn("Gateway Timeout 504", outcome.evidence)
 
-        # 临时记录已被安全清理
         rows = self.store.connection.execute(
             "SELECT * FROM executor_runs WHERE attempt_id=?", (context.claim.attempt_id,)
         ).fetchall()
         self.assertEqual(len(rows), 0)
 
-    def test_gadget_executor_query_unrecognized_status_returns_unknown(self):
-        """当平台返回非预期或未识别的状态字符串时，query 返回 unknown 而非假定仍在 running。"""
-        context = self._create_context("m_corrupt_status")
-        mock_transport = Mock()
-        mock_transport.side_effect = lambda action, payload: {
-            "send_message": {"run_id": "run_corrupt_1"},
-            "get_run_status": {"status": "alien_unrecognized_status"},
-        }.get(action, {})
-
-        client = GadgetClient(credentials=GadgetCredentials("dev", "tok"), transport_func=mock_transport)
-        executor = GadgetExecutor(self.store, client=client)
-
-        outcome = executor.submit(context)
-        self.assertEqual(outcome.state, "accepted")
-
-        q_outcome = executor.query(context, "run_corrupt_1")
-        self.assertEqual(q_outcome.state, "unknown")
-        self.assertEqual(q_outcome.evidence, "unrecognized_status_alien_unrecognized_status")
-
     def test_dual_track_real_gadget_executor_upstream_failure_falls_back_to_native(self):
-        """端到端真实降级：当主轨真实 GadgetExecutor 遭遇网络异常时，平滑降级至 Native 备轨成功提交。"""
+        """End-to-end fallback: a real GadgetExecutor that cannot spawn falls back to Native."""
         context = self._create_context("m_dual_real_fallback")
 
-        # 真实 Gadget 客户端抛出网络异常
-        def broken_transport(action, payload):
-            raise GadgetNetworkError("Connection refused by upstream")
+        fake = FakeWorkerClient(configured=True)
+        fake.start_error = GadgetNetworkError("Connection refused by upstream")
+        primary = GadgetExecutor(self.store, client=fake)
 
-        primary_client = GadgetClient(credentials=GadgetCredentials("dev", "tok"), transport_func=broken_transport)
-        primary = GadgetExecutor(self.store, client=primary_client)
-
-        # 模拟 Native 备轨成功执行
         fallback = Mock(spec=MuseExecutor)
         fallback.submit.return_value = ExecutionOutcome("accepted", run_id="native_real_run_1")
 

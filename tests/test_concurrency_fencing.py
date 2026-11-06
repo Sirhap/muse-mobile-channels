@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import itertools
 import json
 import os
 import tempfile
@@ -155,11 +156,15 @@ class TestDualTrackFencingConcurrency(unittest.TestCase):
             self.store.begin_submission(claim)
             claims.append(claim)
 
-        # Mock GadgetClient
+        # Mock GadgetClient: start_turn hands back a live worker per attempt.
         mock_gadget_client = MagicMock(spec=GadgetClient)
         mock_gadget_client.is_configured.return_value = True
-        mock_gadget_client.create_or_get_side_session.side_effect = lambda cid, gen: f"gadget:side:{cid}:{gen}"
-        mock_gadget_client.send_message.side_effect = lambda sid, text: f"run_{sid}"
+        pid_counter = itertools.count(2000)
+
+        def _fake_start(attempt_id, session_id, text, timeout_seconds=None):
+            return MagicMock(pid=next(pid_counter))
+
+        mock_gadget_client.start_turn.side_effect = _fake_start
 
         primary = GadgetExecutor(self.store, client=mock_gadget_client)
         fallback = MagicMock(spec=MuseExecutor)
@@ -191,7 +196,7 @@ class TestDualTrackFencingConcurrency(unittest.TestCase):
         # 验证全部成功以 gadget 轨提交
         for outcome in results:
             self.assertEqual(outcome.state, "accepted")
-            self.assertTrue(outcome.run_id.startswith("run_gadget:side:"))
+            self.assertTrue(outcome.run_id.startswith("worker:"))
 
         # 检查数据库持久化的 track
         for claim in claims:

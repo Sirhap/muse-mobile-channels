@@ -18,16 +18,21 @@ import importlib.util
 import os
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Callable
 
-from .gadget_client import GadgetClient, GadgetCredentials, GadgetError
+from .gadget_client import GadgetAuthError, GadgetClient, GadgetCredentials, GadgetError, GadgetNetworkError
 from .runtime import ExecutionContext, ExecutionOutcome
 from .storage import Store
 
 SCHEMA = '''
 CREATE TABLE IF NOT EXISTS executor_sessions (
     conversation_id TEXT NOT NULL REFERENCES conversations(id), generation INTEGER NOT NULL,
+    session_id TEXT NOT NULL UNIQUE, PRIMARY KEY(conversation_id,generation)
+);
+CREATE TABLE IF NOT EXISTS gadget_sessions (
+    conversation_id TEXT NOT NULL, generation INTEGER NOT NULL,
     session_id TEXT NOT NULL UNIQUE, PRIMARY KEY(conversation_id,generation)
 );
 CREATE TABLE IF NOT EXISTS executor_runs (
@@ -350,7 +355,21 @@ class CircuitBreaker:
 
 
 class GadgetExecutor:
-    """基于官方 Gadget 侧会话（Side Session）协议的执行器，实现 Executor 协议。"""
+    """Gadget side-session executor: one worker process per turn, real Noise protocol.
+
+    The worker (mobile_channels/gadget_worker/turn.ts) owns the Noise
+    connection: it sends the message -- which creates the side chat -- then
+    subscribes and follows the bound reply to completion, recording its
+    outcome in a per-attempt result file. This executor only spawns the
+    worker, polls the file, and kills the worker on cancel. It never
+    touches the cookie track: the Gadget track stays usable when the bridge
+    credentials are dead, which is the point of the track.
+
+    Sessions are dedicated per conversation generation and persisted in
+    gadget_sessions (separate from the native track's executor_sessions, so
+    a fallback never reuses the other track's session). A session id is only
+    a name until the worker's first send creates it server-side.
+    """
 
     def __init__(
         self,
@@ -373,21 +392,52 @@ class GadgetExecutor:
         return self._client
 
     def is_configured(self) -> bool:
-        """检查凭证是否完备配置。"""
+        """Check the pairing credentials are installed and complete."""
         try:
             return self.client.is_configured()
         except Exception:
             return False
 
+    def _session(self, context: ExecutionContext) -> str:
+        """Dedicated side-session id for this conversation generation, persisted.
+
+        No network call happens here: the id is only a name until the
+        worker's first send creates the session server-side.
+        """
+        key = (context.claim.conversation_id, context.claim.generation)
+        row = self.store.connection.execute(
+            'SELECT session_id FROM gadget_sessions WHERE conversation_id=? AND generation=?', key
+        ).fetchone()
+        if row:
+            return row['session_id']
+        session_id = str(uuid.uuid4())
+        with self.store.transaction():
+            self.store.connection.execute(
+                'INSERT OR IGNORE INTO gadget_sessions VALUES (?,?,?)', (*key, session_id))
+            row = self.store.connection.execute(
+                'SELECT session_id FROM gadget_sessions WHERE conversation_id=? AND generation=?', key
+            ).fetchone()
+        return row['session_id']
+
+    @staticmethod
+    def _worker_pid(platform_run_id: str | None) -> int | None:
+        """Parse the 'worker:<pid>' handle stored as the run id."""
+        if not isinstance(platform_run_id, str) or not platform_run_id.startswith('worker:'):
+            return None
+        try:
+            return int(platform_run_id.split(':', 1)[1])
+        except ValueError:
+            return None
+
     def _validate_owner(self, context: ExecutionContext, *, submitting: bool = False) -> None:
-        """在执行外部操作前即时校验租约所有权与取消状态。"""
+        """Recheck fenced ownership immediately before an external operation."""
         with self.store.transaction():
             task = self.store._owned(context.claim)
             if submitting and task['cancel_requested']:
                 raise PermissionError('task cancellation was requested before submission')
 
     def _binding(self, context: ExecutionContext, run_id: str | None):
-        """校验并获取 attempt 在数据库中的执行绑定记录。"""
+        """Validate and fetch the attempt's persisted execution binding."""
         row = self.store.connection.execute(
             'SELECT * FROM executor_runs WHERE attempt_id=?', (context.claim.attempt_id,)
         ).fetchone()
@@ -397,8 +447,16 @@ class GadgetExecutor:
             raise ValueError('platform run identity does not match this attempt')
         return row
 
+    def _drop_placeholder(self, attempt_id: str) -> None:
+        """Remove the pre-send placeholder row; only valid when nothing was sent."""
+        with self.store.transaction():
+            self.store.connection.execute(
+                'DELETE FROM executor_runs WHERE attempt_id=? AND platform_run_id IS NULL',
+                (attempt_id,)
+            )
+
     def submit(self, context: ExecutionContext) -> ExecutionOutcome:
-        """提交任务至 Gadget 侧会话，并在 executor_runs 记录 track='gadget'。"""
+        """Spawn the Gadget worker for this attempt and record track='gadget'."""
         if not self.is_configured():
             return ExecutionOutcome('not_submitted', evidence='gadget_credentials_missing')
 
@@ -410,9 +468,7 @@ class GadgetExecutor:
                 return ExecutionOutcome('unknown', evidence='attempt_already_has_external_binding')
 
             self._validate_owner(context, submitting=True)
-            sid = self.client.create_or_get_side_session(
-                context.claim.conversation_id, context.claim.generation
-            )
+            session_id = self._session(context)
 
             with self.store.transaction():
                 task = self.store._owned(context.claim)
@@ -421,19 +477,12 @@ class GadgetExecutor:
                 self.store.connection.execute(
                     "INSERT INTO executor_runs (attempt_id, session_id, platform_run_id, status, created_at, track) "
                     "VALUES (?,?,?,?,?,'gadget')",
-                    (context.claim.attempt_id, sid, None, 'submission_unknown', self.store.clock()),
+                    (context.claim.attempt_id, session_id, None, 'submission_unknown', self.store.clock()),
                 )
 
             self._validate_owner(context, submitting=True)
-            run_id = self.client.send_message(sid, context.text)
-
-            if not isinstance(run_id, str) or not run_id:
-                with self.store.transaction():
-                    self.store.connection.execute(
-                        'DELETE FROM executor_runs WHERE attempt_id=? AND platform_run_id IS NULL',
-                        (context.claim.attempt_id,)
-                    )
-                return ExecutionOutcome('unknown', evidence='platform_run_identity_unavailable')
+            proc = self.client.start_turn(context.claim.attempt_id, session_id, context.text)
+            run_id = f"worker:{proc.pid}"
 
             with self.store.transaction():
                 self.store.connection.execute(
@@ -442,64 +491,70 @@ class GadgetExecutor:
                 )
             return ExecutionOutcome('accepted', run_id=run_id)
         except PermissionError:
-            with self.store.transaction():
-                self.store.connection.execute(
-                    'DELETE FROM executor_runs WHERE attempt_id=? AND platform_run_id IS NULL',
-                    (context.claim.attempt_id,)
-                )
+            self._drop_placeholder(context.claim.attempt_id)
             return ExecutionOutcome('not_submitted', evidence='cancelled_before_submission')
+        except (GadgetAuthError, GadgetNetworkError, GadgetError) as exc:
+            # The worker never started, so nothing was sent: the placeholder
+            # row may go. Any failure after the spawn keeps its row.
+            self._drop_placeholder(context.claim.attempt_id)
+            return ExecutionOutcome('unknown', evidence=str(exc))
         except Exception as exc:
-            with self.store.transaction():
-                self.store.connection.execute(
-                    'DELETE FROM executor_runs WHERE attempt_id=? AND platform_run_id IS NULL',
-                    (context.claim.attempt_id,)
-                )
+            # Unknown failure with a placeholder row in place. The worker may
+            # have started: preserve the ambiguous binding, never delete it.
             return ExecutionOutcome('unknown', evidence=str(exc))
 
     def query(self, context: ExecutionContext, run_id: str | None) -> ExecutionOutcome:
-        """查询侧会话运行状态，映射为 succeeded / running / failed / cancelled。"""
+        """Read the worker's result file; a live worker with no file yet is running."""
         self._validate_owner(context)
         binding = self._binding(context, run_id)
         if binding is None:
             return ExecutionOutcome('unknown', evidence='platform_run_identity_unavailable')
 
         try:
-            self._validate_owner(context)
-            status_dict = self.client.get_run_status(binding['session_id'], binding['platform_run_id'])
+            result = self.client.read_result(context.claim.attempt_id)
         except Exception as exc:
             return ExecutionOutcome('unknown', evidence=str(exc))
+        if result is None:
+            pid = self._worker_pid(binding['platform_run_id'])
+            if pid is not None and self.client.worker_alive(pid):
+                return ExecutionOutcome('running')
+            return ExecutionOutcome('unknown', evidence='worker_exited_without_result')
 
-        if not isinstance(status_dict, dict):
-            return ExecutionOutcome('unknown', evidence='invalid_status_payload')
-
-        status = (status_dict.get('status') or '').lower()
-        if status in ('completed', 'complete', 'succeeded'):
-            text = status_dict.get('display_text') or status_dict.get('text') or ''
-            return ExecutionOutcome('succeeded', text=str(text))
-        elif status in ('cancelled', 'canceled'):
-            return ExecutionOutcome('cancelled', evidence='platform_run_cancelled')
-        elif status in ('failed', 'error'):
-            evidence = status_dict.get('error') or status_dict.get('reason') or 'platform_run_failed'
-            return ExecutionOutcome('failed', evidence=str(evidence))
-        elif status in ('queued', 'running'):
+        state = result.get('state')
+        if state == 'running':
             return ExecutionOutcome('running')
-        return ExecutionOutcome('unknown', evidence=f'unrecognized_status_{status}')
+        if state == 'succeeded':
+            text = result.get('text')
+            if not isinstance(text, str) or not text:
+                return ExecutionOutcome('unknown', evidence='worker_succeeded_without_text')
+            return ExecutionOutcome('succeeded', text=text)
+        if state == 'failed':
+            return ExecutionOutcome('failed', evidence=str(result.get('evidence') or 'platform_turn_failed'))
+        if state == 'cancelled':
+            return ExecutionOutcome('cancelled', evidence=str(result.get('evidence') or 'platform_turn_cancelled'))
+        if state == 'unknown':
+            return ExecutionOutcome('unknown', evidence=str(result.get('evidence') or 'worker_unknown'))
+        return ExecutionOutcome('unknown', evidence=f'unrecognized_result_state_{state}')
 
     def cancel(self, context: ExecutionContext, run_id: str | None) -> ExecutionOutcome:
-        """向侧会话发送取消指令并确认终态。"""
+        """Kill the worker and report the turn cancelled."""
         self._validate_owner(context)
         binding = self._binding(context, run_id)
         if binding is None:
             return ExecutionOutcome('unknown', evidence='platform_run_identity_unavailable')
-        try:
-            self._validate_owner(context)
-            self.client.cancel_run(binding['session_id'], binding['platform_run_id'])
-        except Exception as exc:
-            return ExecutionOutcome('unknown', evidence=str(exc))
-        return self.query(context, run_id)
+        pid = self._worker_pid(binding['platform_run_id'])
+        if pid is not None:
+            try:
+                self.client.stop_turn(pid)
+            except Exception as exc:
+                return ExecutionOutcome('unknown', evidence=str(exc))
+        result = self.client.read_result(context.claim.attempt_id)
+        if isinstance(result, dict) and result.get('state') == 'cancelled':
+            return ExecutionOutcome('cancelled', evidence=str(result.get('evidence') or 'platform_turn_cancelled'))
+        return ExecutionOutcome('cancelled', evidence='worker_terminated')
 
     def close(self) -> None:
-        """关闭底层客户端。"""
+        """Close the underlying client; live workers keep running so their results survive."""
         if self._client is not None:
             try:
                 self._client.close()

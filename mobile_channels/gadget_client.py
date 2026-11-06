@@ -1,275 +1,245 @@
-"""官方 Gadget 侧会话（Side Session）协议客户端与凭证管理。
+"""Gadget side-session transport: one worker process per turn, real Noise protocol.
 
-纯 Python 3 标准库实现，支持通过环境变量、本地配置文件加载凭证，
-支持创建/绑定隔离侧会话、发送任务、轮询执行状态及取消。
+The HTTP protocol this module used to speak (gadget.muse.local plus
+/api/sessions) does not exist upstream -- proven 2026-11-06 against the
+official SDK, the wong2 client and the live pairing flow. The real path is
+the Noise session in the reference client (reference/muse-client, a faithful
+port of the official SDK): sendMessage creates the side chat, then a live
+subscription follows the bound reply. A turn is therefore driven by a
+short-lived worker process (mobile_channels/gadget_worker/turn.ts) that owns
+one Noise connection and records its outcome in a result file; this module
+spawns, reads and kills that worker. It never handles credential values --
+only the pairing directory path, which the worker reads itself.
 """
 from __future__ import annotations
 
-import inspect
 import json
 import os
-import urllib.error
-import urllib.parse
-import urllib.request
+import shutil
+import signal
+import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping
+
+# Files the reference client reads from the pairing directory, installed at
+# 0600 by the pairing handover (see ~/.config/MuseGadgetPair).
+PAIRING_FILES = ("identity.json", "pairing.json", "sdk_token")
+
+# States the worker writes into its result file.
+RESULT_STATES = ("running", "succeeded", "failed", "cancelled", "unknown")
 
 
 class GadgetError(Exception):
-    """Gadget 协议客户端通用异常。"""
+    """Gadget transport generic error."""
 
 
 class GadgetAuthError(GadgetError):
-    """Gadget 凭证缺失或认证鉴权失败。"""
+    """Gadget pairing credentials missing or unusable."""
 
 
 class GadgetNetworkError(GadgetError):
-    """Gadget 网络传输或上游服务异常。"""
+    """Gadget worker could not start, or the upstream service failed."""
+
+
+def _resolve_runner() -> str:
+    """Find bun without assuming it is on PATH (systemd units have a thin PATH)."""
+    found = shutil.which("bun")
+    if found:
+        return found
+    for candidate in ("/opt/hatch-image/bin/bun", Path.home() / ".bun" / "bin" / "bun"):
+        if Path(candidate).is_file():
+            return str(candidate)
+    return "bun"
 
 
 @dataclass
 class GadgetCredentials:
-    """Gadget 官方 SDK 鉴权凭证。"""
+    """Pairing credentials: a directory, never the values themselves.
 
-    device_id: str | None = None
-    token: str | None = None
-    endpoint: str | None = None
+    The directory holds the three files the reference client reads. Nothing
+    in this module reads or logs their contents.
+    """
+
+    directory: Path | str | None = None
+
+    def __post_init__(self) -> None:
+        if self.directory is None:
+            self.directory = Path.home() / ".config" / "MuseGadgetPair"
+        self.directory = Path(self.directory).expanduser()
 
     def is_configured(self) -> bool:
-        """检查凭证是否完备可用（需要 device_id 和 token 均为有效非空字符串）。"""
-        return bool(
-            isinstance(self.device_id, str) and self.device_id.strip() and
-            isinstance(self.token, str) and self.token.strip()
-        )
+        """True only when the pairing directory holds all three files."""
+        try:
+            directory = Path(self.directory)
+            return directory.is_dir() and all((directory / name).is_file() for name in PAIRING_FILES)
+        except Exception:
+            return False
 
     @classmethod
-    def from_env_or_file(
-        cls,
-        file_path: str | Path | None = None,
-        env: Mapping[str, str] | None = None,
-    ) -> GadgetCredentials:
-        """从配置文件与环境变量加载凭证，环境变量具有更高优先级。"""
-        device_id: str | None = None
-        token: str | None = None
-        endpoint: str | None = "https://gadget.muse.local"
-
-        # 1. 尝试从本地配置文件加载
-        if file_path is None:
-            path = Path.home() / ".config" / "muse" / "gadget.json"
-        else:
-            path = Path(file_path).expanduser()
-
-        if path.is_file():
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-                if isinstance(data, dict):
-                    raw_dev = data.get("device_id")
-                    raw_tok = data.get("token")
-                    raw_ep = data.get("endpoint")
-                    device_id = str(raw_dev) if raw_dev is not None else None
-                    token = str(raw_tok) if raw_tok is not None else None
-                    endpoint = str(raw_ep) if raw_ep is not None else endpoint
-            except Exception:
-                pass
-
-        # 2. 环境变量覆盖
-        environ = os.environ if env is None else env
-        if "MUSE_GADGET_DEVICE_ID" in environ and environ["MUSE_GADGET_DEVICE_ID"]:
-            device_id = str(environ["MUSE_GADGET_DEVICE_ID"])
-        if "MUSE_GADGET_TOKEN" in environ and environ["MUSE_GADGET_TOKEN"]:
-            token = str(environ["MUSE_GADGET_TOKEN"])
-        if "MUSE_GADGET_ENDPOINT" in environ and environ["MUSE_GADGET_ENDPOINT"]:
-            endpoint = str(environ["MUSE_GADGET_ENDPOINT"])
-
-        return cls(device_id=device_id, token=token, endpoint=endpoint)
+    def default(cls) -> "GadgetCredentials":
+        """The installed pairing directory."""
+        return cls()
 
 
 class GadgetClient:
-    """Gadget 官方侧会话协议客户端（纯 Python 3 标准库）。"""
+    """Spawns one worker process per Gadget turn and reads its result file.
+
+    The worker is the only component that speaks the Noise protocol. This
+    client owns the process lifecycle and the per-attempt files:
+    ``gadget-<attempt_id>.json`` (result), ``.msg`` (message text) and
+    ``.log`` (worker stderr). Result files are written atomically by the
+    worker (temp file plus rename), so a reader never sees a partial file.
+    """
 
     def __init__(
         self,
         credentials: GadgetCredentials | None = None,
-        transport_func: Callable[..., Any] | None = None,
+        *,
+        run_dir: Path | str | None = None,
+        worker_script: Path | str | None = None,
+        runner: str | None = None,
+        turn_timeout_seconds: int = 900,
     ):
-        """初始化客户端，可注入 transport_func 以供测试 Mock。"""
-        self.credentials = credentials if credentials is not None else GadgetCredentials.from_env_or_file()
-        self.transport_func = transport_func
-        self._sessions: dict[tuple[str, int], str] = {}
+        self.credentials = credentials if credentials is not None else GadgetCredentials.default()
+        self.run_dir = Path(run_dir).expanduser() if run_dir is not None else Path.home() / ".config" / "muse-gadget-runs"
+        if worker_script is not None:
+            self.worker_script = Path(worker_script).expanduser()
+        else:
+            self.worker_script = Path(__file__).resolve().parent / "gadget_worker" / "turn.ts"
+        self.runner = runner or _resolve_runner()
+        self.turn_timeout_seconds = turn_timeout_seconds
         self._closed = False
 
     def is_configured(self) -> bool:
-        """检查凭证是否有效。"""
+        """Pairing credentials are installed and complete."""
         return self.credentials.is_configured()
 
-    def _call_transport(self, action: str, payload: dict) -> Any:
-        """调用注入的 transport_func，根据签名精准分发，不吞没回调内部的 TypeError。"""
-        if self.transport_func is None:
-            raise GadgetError("未配置 transport_func")
+    def _paths(self, attempt_id: str) -> tuple[Path, Path, Path]:
+        """(result, message, log) paths for one attempt; the result path is derivable later."""
+        base = self.run_dir / f"gadget-{attempt_id}"
+        return base.with_suffix(".json"), base.with_suffix(".msg"), base.with_suffix(".log")
+
+    def result_path(self, attempt_id: str) -> Path:
+        """Where the worker records this attempt's outcome."""
+        return self._paths(attempt_id)[0]
+
+    def start_turn(
+        self,
+        attempt_id: str,
+        session_id: str,
+        text: str,
+        timeout_seconds: int | None = None,
+    ) -> subprocess.Popen:
+        """Spawn the worker for one turn; returns the child process.
+
+        Raises GadgetAuthError when the pairing is missing and
+        GadgetNetworkError when the worker cannot start. A spawned worker
+        owns the send: if this returns, the turn is live and the caller must
+        poll read_result (or stop_turn) instead of resending.
+        """
+        if self._closed:
+            raise GadgetError("GadgetClient is closed")
+        if not self.is_configured():
+            raise GadgetAuthError("Gadget pairing credentials are not installed")
+        result_path, message_path, log_path = self._paths(attempt_id)
+        self.run_dir.mkdir(parents=True, exist_ok=True)
         try:
-            sig = inspect.signature(self.transport_func)
-            params = list(sig.parameters.values())
-            if len(params) == 1 and params[0].kind in (
-                inspect.Parameter.POSITIONAL_ONLY,
-                inspect.Parameter.POSITIONAL_OR_KEYWORD,
-            ):
-                return self.transport_func(payload)
-        except (ValueError, TypeError):
+            os.chmod(self.run_dir, 0o700)
+        except OSError:
             pass
-        return self.transport_func(action, payload)
+        message_path.write_text(text, encoding="utf-8")
+        os.chmod(message_path, 0o600)
+        log_file = open(log_path, "ab")
+        try:
+            proc = subprocess.Popen(
+                [self.runner, str(self.worker_script),
+                 "--session", session_id,
+                 "--message-file", str(message_path),
+                 "--out", str(result_path),
+                 "--timeout", str(int(timeout_seconds or self.turn_timeout_seconds)),
+                 "--credentials", str(self.credentials.directory)],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=log_file,
+                start_new_session=True,
+                close_fds=True,
+            )
+        except OSError as exc:
+            raise GadgetNetworkError(f"cannot start Gadget worker: {exc}") from exc
+        finally:
+            log_file.close()
+        return proc
 
-    def create_or_get_side_session(self, conversation_id: str, generation: int) -> str:
-        """生成/申请专属侧会话 ID（如 gadget:side:{conversation_id}:{generation}）。"""
-        if self._closed:
-            raise GadgetError("GadgetClient 已关闭")
-        key = (conversation_id, generation)
-        if key in self._sessions:
-            return self._sessions[key]
+    def read_result(self, attempt_id: str) -> dict | None:
+        """The worker's latest recorded outcome, or None when it has written nothing yet."""
+        try:
+            raw = self.result_path(attempt_id).read_text(encoding="utf-8")
+        except (FileNotFoundError, OSError):
+            return None
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            return None
+        return data if isinstance(data, dict) else None
 
-        session_id = f"gadget:side:{conversation_id}:{generation}"
-        if self.transport_func is not None:
-            try:
-                res = self._call_transport("create_session", {
-                    "conversation_id": conversation_id,
-                    "generation": generation,
-                    "session_id": session_id,
-                })
-                if isinstance(res, dict) and res.get("session_id"):
-                    session_id = str(res["session_id"])
-                elif isinstance(res, str) and res:
-                    session_id = res
-            except Exception:
-                pass
+    @staticmethod
+    def worker_alive(pid: int) -> bool:
+        """True when the process exists and is not a zombie.
 
-        self._sessions[key] = session_id
-        return session_id
-
-    def send_message(self, session_id: str, text: str, attachments: list | None = None) -> str:
-        """向侧会话发送消息并返回 run_id。"""
-        if self._closed:
-            raise GadgetError("GadgetClient 已关闭")
-        payload = {
-            "session_id": session_id,
-            "text": text,
-            "attachments": attachments or [],
-        }
-        if self.transport_func is not None:
-            res = self._call_transport("send_message", payload)
-            if isinstance(res, str) and res:
-                return res
-            if isinstance(res, dict) and res.get("run_id"):
-                return str(res["run_id"])
-            raise GadgetError(f"transport 返回了无效的响应: {res}")
-
-        if not self.credentials.is_configured():
-            raise GadgetAuthError("Gadget 凭证未配置")
-
-        safe_session_id = urllib.parse.quote(str(session_id), safe=":")
-        res = self._http_post(f"/api/sessions/{safe_session_id}/messages", payload)
-        run_id = res.get("run_id") if isinstance(res, dict) else None
-        if not isinstance(run_id, str) or not run_id:
-            raise GadgetError("平台未返回有效的 run_id")
-        return run_id
-
-    def get_run_status(self, session_id: str, run_id: str) -> dict:
-        """获取侧会话任务状态及输出文本。"""
-        if self._closed:
-            raise GadgetError("GadgetClient 已关闭")
-        payload = {"session_id": session_id, "run_id": run_id}
-        if self.transport_func is not None:
-            res = self._call_transport("get_run_status", payload)
-            if isinstance(res, dict):
-                return res
-            raise GadgetError(f"transport 返回了无效的状态响应: {res}")
-
-        if not self.credentials.is_configured():
-            raise GadgetAuthError("Gadget 凭证未配置")
-
-        safe_session_id = urllib.parse.quote(str(session_id), safe=":")
-        safe_run_id = urllib.parse.quote(str(run_id), safe="")
-        res = self._http_get(f"/api/sessions/{safe_session_id}/runs/{safe_run_id}")
-        if isinstance(res, dict):
-            return res
-        raise GadgetError("平台返回了非 JSON 格式的状态响应")
-
-    def cancel_run(self, session_id: str, run_id: str) -> bool:
-        """向侧会话发送取消任务请求。"""
-        if self._closed:
-            raise GadgetError("GadgetClient 已关闭")
-        payload = {"session_id": session_id, "run_id": run_id}
-        if self.transport_func is not None:
-            res = self._call_transport("cancel_run", payload)
-            if isinstance(res, bool):
-                return res
-            if isinstance(res, dict):
-                return bool(res.get("cancelled", res.get("success", True)))
+        A zombie still answers os.kill(pid, 0), so the /proc state is
+        checked: 'Z' means the worker already exited and only awaits
+        reaping by its parent.
+        """
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        try:
+            with open(f"/proc/{pid}/stat", "r", encoding="utf-8") as handle:
+                stat = handle.read()
+            state = stat.rsplit(")", 1)[1].split()[0]
+            return state != "Z"
+        except (FileNotFoundError, IndexError, ValueError, OSError):
             return True
 
-        if not self.credentials.is_configured():
-            raise GadgetAuthError("Gadget 凭证未配置")
+    def stop_turn(self, proc: subprocess.Popen | int, *, wait_seconds: float = 5.0) -> bool:
+        """SIGTERM the worker's process group, then SIGKILL. True when it is gone.
 
-        safe_session_id = urllib.parse.quote(str(session_id), safe=":")
-        safe_run_id = urllib.parse.quote(str(run_id), safe="")
-        res = self._http_post(f"/api/sessions/{safe_session_id}/runs/{safe_run_id}/cancel", {})
-        return bool(res.get("cancelled", res.get("success", True)))
+        The worker writes a cancelled result on SIGTERM when it can; a
+        SIGKILL leaves no file, which the executor reads as a cancelled turn
+        through its own binding, not as a failure.
+        """
+        pid = proc.pid if isinstance(proc, subprocess.Popen) else int(proc)
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                return True
+        deadline = time.time() + wait_seconds
+        while time.time() < deadline:
+            if not self.worker_alive(pid):
+                return True
+            time.sleep(0.1)
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        return not self.worker_alive(pid)
 
     def close(self) -> None:
-        """关闭客户端。"""
+        """Mark closed; live workers are left running so their results survive a restart."""
         self._closed = True
-        self._sessions.clear()
 
-    def __enter__(self) -> GadgetClient:
+    def __enter__(self) -> "GadgetClient":
         return self
 
     def __exit__(self, *args: object) -> None:
         self.close()
-
-    def _http_post(self, path: str, payload: dict) -> dict:
-        """基于标准库 urllib 发起 POST 请求。"""
-        endpoint = (self.credentials.endpoint or "https://gadget.muse.local").rstrip("/")
-        url = f"{endpoint}{path}"
-        data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
-            url,
-            data=data,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.credentials.token}",
-                "X-Device-ID": str(self.credentials.device_id or ""),
-            },
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                body = resp.read().decode("utf-8")
-                return json.loads(body) if body else {}
-        except urllib.error.HTTPError as err:
-            if err.code in (401, 403):
-                raise GadgetAuthError(f"Gadget 认证失败 ({err.code}): {err.reason}") from err
-            raise GadgetNetworkError(f"Gadget HTTP 错误 ({err.code}): {err.reason}") from err
-        except Exception as err:
-            raise GadgetNetworkError(f"Gadget 网络异常: {err}") from err
-
-    def _http_get(self, path: str) -> dict:
-        """基于标准库 urllib 发起 GET 请求。"""
-        endpoint = (self.credentials.endpoint or "https://gadget.muse.local").rstrip("/")
-        url = f"{endpoint}{path}"
-        req = urllib.request.Request(
-            url,
-            headers={
-                "Authorization": f"Bearer {self.credentials.token}",
-                "X-Device-ID": str(self.credentials.device_id or ""),
-            },
-            method="GET",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                body = resp.read().decode("utf-8")
-                return json.loads(body) if body else {}
-        except urllib.error.HTTPError as err:
-            if err.code in (401, 403):
-                raise GadgetAuthError(f"Gadget 认证失败 ({err.code}): {err.reason}") from err
-            raise GadgetNetworkError(f"Gadget HTTP 错误 ({err.code}): {err.reason}") from err
-        except Exception as err:
-            raise GadgetNetworkError(f"Gadget 网络异常: {err}") from err
