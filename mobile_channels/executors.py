@@ -661,7 +661,18 @@ class DualTrackExecutor:
                         "UPDATE executor_runs SET status='failed_superseded' WHERE attempt_id=?",
                         (context.claim.attempt_id,),
                     )
-                return self.fallback.submit(context)
+                fallback_outcome = self.fallback.submit(context)
+                if fallback_outcome.state == 'accepted' and fallback_outcome.run_id:
+                    # The fallback bound a new run for this attempt. The
+                    # CoreRunner state machine binds one run per attempt at
+                    # submit time and cannot accept a second 'accepted'
+                    # outcome during the query phase (mark_submitted
+                    # requires the 'reconciling' state), so rebind the
+                    # attempt to the native run and report 'running': the
+                    # runner keeps polling the live run on the next tick.
+                    self.store.rebind_run(context.claim, fallback_outcome.run_id)
+                    return ExecutionOutcome('running')
+                return fallback_outcome
             return outcome
         elif track == 'native':
             try:

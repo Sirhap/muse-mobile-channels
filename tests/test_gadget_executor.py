@@ -680,32 +680,47 @@ class TestDualTrackExecutor(unittest.TestCase):
 
         Proves the live WeCom trial failure (task 1: the worker died at
         15s in the token refresh, result carries no message_id) would now
-        get a Native reply.
+        get a Native reply. Uses the real Native executor (scripted
+        bridge), because a Mock fallback hides the runner contract: the
+        fallback submit's 'accepted' outcome cannot be returned from
+        query -- the CoreRunner state machine binds one run per attempt
+        at submit time -- so query rebinds the attempt to the Native run
+        and reports 'running' (proven live 2026-11-06: returning
+        'accepted' crashed the runner in mark_submitted).
         """
         context = self._create_context("m_fallback_before_send")
         fake = FakeWorkerClient(configured=True)
         primary = GadgetExecutor(self.store, client=fake)
-        fallback = Mock(spec=MuseExecutor)
-        fallback.submit.return_value = ExecutionOutcome("accepted", run_id="native_run_1")
+        fallback = MuseExecutor(
+            self.store, client_factory=lambda: self._scripted_bridge_client())
         dual_executor = DualTrackExecutor(
             store=self.store, primary=primary, fallback=fallback,
         )
         submitted = dual_executor.submit(context)
         self.assertEqual(submitted.state, "accepted")
+        # Mirror what the runner does after a submit: bind the gadget run
+        # and move the task to 'running' (the query-phase state).
+        self.store.mark_submitted(context.claim, submitted.run_id)
         fake.results[context.claim.attempt_id] = {
             "state": "failed",
             "evidence": "The operation timed out.",
             "session_id": "s1",
         }
         outcome = dual_executor.query(context, submitted.run_id)
-        self.assertEqual(outcome.state, "accepted")
-        self.assertEqual(outcome.run_id, "native_run_1")
-        fallback.submit.assert_called_once_with(context)
+        self.assertEqual(outcome.state, "running")
         row = self.store.connection.execute(
-            "SELECT status, track FROM executor_runs WHERE attempt_id=?",
+            "SELECT status, track, platform_run_id FROM executor_runs WHERE attempt_id=?",
             (context.claim.attempt_id,),
         ).fetchone()
-        self.assertEqual(row["status"], "failed_superseded")
+        self.assertEqual((row["status"], row["track"]), ("accepted", "native"))
+        attempt = self.store.connection.execute(
+            "SELECT run_id FROM execution_attempts WHERE id=?",
+            (context.claim.attempt_id,),
+        ).fetchone()
+        self.assertEqual(attempt["run_id"], row["platform_run_id"])
+        # A follow-up query polls the Native run (no reply recorded yet).
+        followup = dual_executor.query(context, attempt["run_id"])
+        self.assertEqual(followup.state, "running")
 
     def test_no_fallback_when_gadget_failed_after_send(self):
         """A Gadget turn that failed AFTER its message reached the session

@@ -368,6 +368,38 @@ class Store:
             )
             self._event(claim.task_id, "submitted")
 
+    def rebind_run(self, claim: Claim, run_id: str) -> None:
+        """Replace the bound run after a query-time track fallback.
+
+        The previous run is proven dead (its message never reached the
+        session) and the fallback executor has already bound this attempt
+        to the new run in executor_runs. This syncs the attempt's run_id
+        to that binding so the runner's next query polls the live run.
+        It is an explicit, audited rebind, not a silent overwrite: the
+        task must be running/reconciling and the new run must match the
+        current executor binding. (Proven live 2026-11-06: returning the
+        fallback submit's 'accepted' outcome from query crashed the
+        runner, because mark_submitted only accepts a run while the task
+        is 'reconciling'.)
+        """
+        if not run_id:
+            raise ValueError("run_id must be nonempty")
+        with self._transaction():
+            row = self._owned(claim)
+            if row["state"] not in ("running", "reconciling"):
+                raise StateError("run can only be rebound for a running task")
+            binding = self.connection.execute(
+                "SELECT platform_run_id FROM executor_runs WHERE attempt_id=?",
+                (claim.attempt_id,),
+            ).fetchone()
+            if binding is None or binding["platform_run_id"] != run_id:
+                raise StateError("rebind run must match the current executor binding")
+            self.connection.execute(
+                "UPDATE execution_attempts SET run_id=? WHERE id=?",
+                (run_id, claim.attempt_id),
+            )
+            self._event(claim.task_id, "run_rebound")
+
     def _complete_result(self, row: sqlite3.Row, text: str, event: str) -> str:
         """Save a result, bound outbox and audit within the caller's transaction."""
         outbound_id = _identifier()
