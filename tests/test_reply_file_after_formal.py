@@ -20,6 +20,11 @@ import types
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+# fmt_event 须从参考 SDK 取：把参考 muse-cli 源码放进 sys.path，
+# 这样按文件头写的裸命令也能跑，不依赖外部 PYTHONPATH。
+_muse_cli_src = ROOT / "reference" / "muse-cli" / "src"
+if _muse_cli_src.is_dir() and str(_muse_cli_src) not in sys.path:
+    sys.path.insert(0, str(_muse_cli_src))
 SBX = Path("/tmp/reply-file-after-formal-sbx")
 MSGID = "7514000000000000007"
 TEXT = "做好了，视频在下面"
@@ -149,6 +154,9 @@ check(
 nb.BASE = str(BRIDGE)
 nb.STATE_F = str(BRIDGE / "state.json")
 nb.STATUS_F = str(BRIDGE / "status.json")
+# 2026-11-05 CFG脚手架修复：11月1日重构后CFG不再随导入加载，
+# 须显式加载生产配置再深拷贝覆盖沙箱路径；断言一律未动。
+nb.load_config()
 nb.CFG = copy.deepcopy(nb.CFG)
 nb.CFG["channels"]["weixin"]["bot_state"] = str(WX_STATE)
 (BRIDGE / "enabled-weixin").touch()

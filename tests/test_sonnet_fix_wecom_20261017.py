@@ -616,7 +616,13 @@ def check_c11_approval_lock() -> None:
     relay = directory / "relay"
     relay.mkdir()
     (relay / "state.json").write_text(json.dumps({
-        "items": {"1": {"status": "pending", "who": "bob", "what": "ship"}},
+        # 2026-11-05：分支新增的审批策略引擎（mobile_channels.approvals）
+        # 要求审批带未过期的 expires_ms 与 decision_scope 绑定，否则
+        # decide 在拿锁前就被 decision_allowed 挡掉，锁竞争测不到。
+        "items": {"1": {"status": "pending", "who": "bob", "what": "ship",
+                        "expires_ms": int(time.time() * 1000) + 3600000,
+                        "decision_scope": {"channel": "wecom", "chat_id": "chat-1",
+                                           "operator_ids": ["op-1"]}}},
     }), encoding="utf-8")
     decisions = relay / "decisions.jsonl"
     previous = wc.APPROVAL_RELAY_DIR
@@ -629,7 +635,9 @@ def check_c11_approval_lock() -> None:
 
     def decide() -> None:
         try:
-            outcome.append(wc.slash_approval_decide_ack("1", "allow_once", "wecom"))
+            outcome.append(wc.slash_approval_decide_ack(
+                "1", "allow_once", "wecom",
+                operator_id="op-1", chat_id="chat-1"))
         except Exception as exc:
             outcome.append(f"error:{exc!r}")
 

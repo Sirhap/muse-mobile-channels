@@ -16,6 +16,7 @@ import asyncio
 import importlib.util
 import json
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -56,6 +57,13 @@ def _bind_weixin(wx, sbx):
     wx.STATE = sbx
     wx.INBOX = sbx / "inbox.jsonl"
     wx.SEEN_FILE = sbx / "seen_ids.jsonl"
+    # 2026-11-05: _load_persisted also seeds the dedupe set from
+    # QUOTE_SPOOL, and the gateway comment says "tests rebind this
+    # constant". Without the rebind the production spool (which holds
+    # m-good-1/m-good-2 from earlier runs) pre-seeds seen_msgids and
+    # the dedupe silently drops both good messages of the poison
+    # batch before they ever reach the inbox.
+    wx.QUOTE_SPOOL = sbx / "quote_spool.jsonl"
     wx.SYNC_FILE = sbx / "sync.json"
     wx.CONTEXT_FILE = sbx / "context.json"
     wx.LOCK_FILE = sbx / "gateway.lock"
@@ -308,7 +316,15 @@ async def _drive_weixin_poison_batch(wx):
 
     async def wrapped_handle_inbound(client, creds, msg):
         if isinstance(msg, dict) and msg.get("message_id") == "m-poison-1":
-            raise ValueError("simulated deterministic malformed payload crash")
+            # Simulate a deterministic malformed-payload crash with the
+            # type the real parser raises for exactly this case
+            # (MalformedInboundMessage, a ValueError subclass). A bare
+            # ValueError is deliberately NOT quarantined: the checkpoint
+            # and ingress suites pin it as retryable (an unexpected
+            # execution/storage failure must retain the checkpoint),
+            # so the simulation must use the named payload type.
+            raise wx.MalformedInboundMessage(
+                "simulated deterministic malformed payload crash")
         return await real_handle_inbound(client, creds, msg)
 
     g.handle_inbound = wrapped_handle_inbound
@@ -646,6 +662,11 @@ def _bind_bridge(nb, sbx):
     nb.STATE_F = str(sbx / "state.json")
     nb.STATUS_F = str(sbx / "status.json")
     nb.CONF_DIR = str(cred)
+    # 2026-11-05: CFG is explicit since the 11-01 refactor (no
+    # import-time I/O); load the production config into the sandbox
+    # base before the test deep-copies and redirects it.
+    shutil.copy(ROOT / "native-bridge" / "config.json", sbx / "config.json")
+    nb.load_config()
     nb.CFG = json.loads(json.dumps(nb.CFG))
     for ch in nb.CFG["channels"]:
         nb.CFG["channels"][ch]["bot_state"] = str(sbx / ch)
@@ -700,11 +721,24 @@ def test_bridge(nb):
         calls["n"] = 0
         lines.clear()
         w.ensure_gw()
+        # Time compression (same pattern as longtask): the reconnect
+        # backoff parks the next attempt 5s out; the test drives
+        # attempts in a tight loop, so clear the throttle before each
+        # driven attempt, exactly like w.last_idle_scan = 0 below.
+        w._next_connect_at = 0
         w.ensure_gw()
         nb.connect = ok
+        w._next_connect_at = 0
         w.ensure_gw()
+        # A bare handshake does NOT reset the failure budget by design
+        # (_acquire_connection docstring): only a real bridge operation
+        # does. Simulate that operation succeeding, as production
+        # callers do via _note_reconnect_success, or the counter would
+        # stay at 2 and the final failure would park the channel.
+        w._note_reconnect_success()
         w.drop_gw()
         nb.connect = boom
+        w._next_connect_at = 0
         w.ensure_gw()
         check("bridge reset: fail, fail, succeed, fail leaves counter at 1",
               calls["n"] == 4
@@ -719,9 +753,12 @@ def test_bridge(nb):
         st = nb.load_state()
         nb.ch_state(st, "test")["session_id"] = "sid-1"
         nb.save_state(st)
+        w._next_connect_at = 0
         w.ensure_gw()
+        w._next_connect_at = 0
         w.ensure_gw()
         w.last_idle_scan = 0
+        w._next_connect_at = 0
         w.idle_push_scan(w.cs())
         before = calls["n"]
         for _ in range(10):
@@ -736,7 +773,7 @@ def test_bridge(nb):
               and w.cs().get("reconnect_exhausted") is True
               and w.cs().get("reconnect_failures") == 3
               and sum("native-bridge reconnect exhausted after 3 "
-                      "consecutive failed connection attempts; "
+                      "consecutive failed connection/operation attempts; "
                       "state=reconnect_exhausted" in line
                       for line in lines) == 1)
 
@@ -766,10 +803,13 @@ def test_bridge(nb):
         still_blocked = calls["n"]
         paused = w3._auth_connect_blocked()
         w3._auth_blocked_until = 0
+        w3._next_connect_at = 0
         w3.ensure_gw()
         w3._auth_blocked_until = 0
+        w3._next_connect_at = 0
         w3.ensure_gw()
         w3._auth_blocked_until = 0
+        w3._next_connect_at = 0
         w3.ensure_gw()
         after_cap = calls["n"]
         (cred / "cookies.txt").write_text(

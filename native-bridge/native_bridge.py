@@ -29,6 +29,16 @@ import fcntl, hashlib, importlib.util, json, os, sys, threading, time, traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
+_ROOT = str(Path(__file__).resolve().parents[1])
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+from credential_health import (CredentialAuthError, append_health_notice_once, credential_fingerprint,
+                               failure_kind, is_auth_failure, observe_connection)
+
+# Connection attempts are per worker thread. Keep connect()'s client-returning
+# interface while passing sanitized source results back to the owning worker.
+_connection_health = threading.local()
+
 BASE = os.environ.get("NATIVE_BRIDGE_HOME", "/home/hatch/workspace/native-bridge")
 # Explicit overrides remain available to existing integrations and sandbox tests.
 CFG = None
@@ -84,7 +94,7 @@ def __getattr__(name):
     raise AttributeError(name)
 
 
-CONF_DIR = os.path.expanduser("~/.config/native-bridge")
+CONF_DIR = os.environ.get("NATIVE_BRIDGE_CREDENTIALS", os.path.expanduser("~/.config/native-bridge"))
 STATE_F = os.path.join(BASE, "state.json")
 STATUS_F = os.path.join(BASE, "status.json")
 POLL_SECS = 2
@@ -152,13 +162,13 @@ AUTH_FAIL_BACKOFF_SECS = 600
 # this same cap. After the cap, only a cred-file change or a
 # process restart tries again.
 RECONNECT_MAX_ATTEMPTS = 3
-# Queue redesign stage 1 (todo 31): merging is OFF for every channel,
-# i.e. strict per-message FIFO — a message arriving mid-turn stays
-# queued and starts as its own turn when the running one closes. The
-# merge code below is kept, unreachable, for rollback during the
-# observation window; removal is a later stage. Rollback value:
-# {"weixin", "test", "wecom"}.
-MERGE_CHANNELS = set()
+# Queue semantics (todo 31 stage 1, 2026-10-17) turned merging OFF for
+# strict per-message FIFO. Re-enabled 2026-11-06 by user order
+# ("改成和官方一样"): channels in MERGE_CHANNELS fold a queued message
+# into the running turn (official-client steering) while that turn's
+# reply has not started. Rollback value (disable again):
+# set().
+MERGE_CHANNELS = {"weixin", "test", "wecom"}
 # Channels in MERGE_CHANNELS fold a queued message into the running
 # turn (official-client steering) while that turn's reply has not
 # started; other channels keep strict FIFO. The combined answer is
@@ -309,6 +319,12 @@ def write_status(extra, active=None):
         except (OSError, ValueError):
             cur = {}
         cur.update(extra)
+        with _state_lock:
+            cur["credential_health"] = {
+                channel: {key: state.get(key) for key in
+                          ("credential_sources", "active_source", "last_verified_at")}
+                for channel, state in load_state().get("channels", {}).items()
+                if "credential_sources" in state}
         if active is not None:
             cur_active = cur.get("active")
             if not isinstance(cur_active, dict):
@@ -350,33 +366,12 @@ def is_session_not_found(exc):
     return "session not found" in str(exc).lower()
 
 
-def is_auth_failure(exc):
-    """True when a connect failure means the stored credential itself
-    is dead (muse.ai session invalidated / token refused), as opposed
-    to a transient network error. Matches the AuthError type from
-    muse_cli.gateway plus the 401/403 markers the probe baseline
-    established for this gateway (empty token 401, bad token 403)."""
-    if type(exc).__name__ == "AuthError":
-        return True
-    s = str(exc)
-    return "hatchAdmissionInvalidated" in s or " 401" in s \
-        or " 403" in s or "upgrade: 403" in s
-
-
 def cred_stamp():
     """Fingerprint of the credential files connect() can use, so a
     re-exported credential is noticed (and retried / re-alerted)
-    without polling the files' contents. Names + mtime + size only;
+    without polling the files' contents. File metadata only;
     credential values are never read here."""
-    parts = []
-    for name in ("cookies.txt", "vm_id.txt", "token.json"):
-        p = os.path.join(CONF_DIR, name)
-        try:
-            st = os.stat(p)
-            parts.append(f"{name}:{st.st_mtime_ns}:{st.st_size}")
-        except OSError:
-            parts.append(f"{name}:missing")
-    return "|".join(parts)
+    return credential_fingerprint(CONF_DIR, ("cookies.txt", "vm_id.txt", "token.json"))
 
 
 def outbox_path(ch):
@@ -540,47 +535,126 @@ def read_signal_ts(path):
 
 
 def token_params():
+    """Load the effective token source and reject incomplete credential files."""
     raw = os.environ.get("NATIVE_TOKEN_JSON")
     if raw:
-        return json.loads(raw)
-    p = os.path.join(CONF_DIR, "token.json")
-    if os.path.exists(p):
-        return json.load(open(p))
-    return None
+        token = json.loads(raw)
+    else:
+        try:
+            with open(os.path.join(CONF_DIR, "token.json"), encoding="utf-8") as source:
+                token = json.load(source)
+        except FileNotFoundError:
+            return None
+    if not isinstance(token, dict) or any(
+            not isinstance(token.get(key), str) or not token[key].strip()
+            for key in ("vm_id", "access_token", "hatch_token")):
+        raise ValueError("incomplete native token")
+    return token
+
+
+def _ensure_muse_cli_path():
+    """Make muse_cli importable before any caller needs load_cookies.
+
+    The SDK lives in the reference clone at <repo>/reference/muse-cli/src
+    (override with MUSE_CLI_SRC, same as native-probe/gw2.py). It used to
+    become importable only as a side effect of importing gw2, so any code
+    path that touched cookie_params() before gateway_class() — e.g. the
+    new _connect_source() — died in a fresh process with ModuleNotFoundError
+    and the bridge reported CredentialAuthError although the cookies were
+    fine. Inserting the path (no import) is harmless when the clone is
+    absent, e.g. in a bare worktree.
+    """
+    src = os.environ.get("MUSE_CLI_SRC") or os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "reference", "muse-cli", "src")
+    if src and os.path.isdir(src) and src not in sys.path:
+        sys.path.insert(0, src)
 
 
 def cookie_params():
+    """Load Cookie credentials without allowing a partial or empty file set."""
     cp = os.path.join(CONF_DIR, "cookies.txt")
     vp = os.path.join(CONF_DIR, "vm_id.txt")
-    if not (os.path.exists(cp) and os.path.exists(vp)):
+    if not os.path.exists(cp) and not os.path.exists(vp):
         return None
+    if not (os.path.isfile(cp) and os.path.isfile(vp)):
+        raise ValueError("incomplete native cookie file set")
+    with open(vp, encoding="utf-8") as source:
+        vm_id = source.read().strip()
+    _ensure_muse_cli_path()
     from muse_cli.gateway import load_cookies
     cookies = load_cookies(cp)
-    if not cookies.strip():
-        return None
-    return cookies, open(vp).read().strip()
+    if not isinstance(cookies, str) or not cookies.strip() or not vm_id:
+        raise ValueError("incomplete native cookies")
+    return cookies, vm_id
+
+
+def _connect_source(source):
+    """Validate one source and always close a client whose probe failed."""
+    client = None
+    try:
+        if source == "cookies":
+            params = cookie_params()
+            if params is None:
+                return None
+            client = gateway_class()(cookies=params[0], vm_id=params[1])
+        else:
+            params = token_params()
+            if params is None:
+                return None
+            client = gateway_class()(cookies="", vm_id=params["vm_id"],
+                                     access_token=params["access_token"],
+                                     hatch_token=params["hatch_token"])
+        response = client.call_json("sessions.list", timeout=15)
+        if not isinstance(response, (dict, list)):
+            raise ConnectionError("native credential probe returned invalid JSON data")
+        if isinstance(response, dict) and (response.get("error") or response.get("ok") is False):
+            raise ConnectionError("native credential probe returned an error")
+        return client
+    except Exception:
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass  # Preserve the original probe error, never its contents.
+        raise
 
 
 def connect():
-    """Build a GW2 and prove it with a cheap call. Raises on failure."""
-    client_class = gateway_class()
-    if not os.environ.get("NATIVE_TOKEN_JSON"):
-        ck = cookie_params()
-        if ck:
-            try:
-                gw = client_class(cookies=ck[0], vm_id=ck[1])
-                gw.call_json("sessions.list", timeout=15)
-                return gw
-            except Exception as e:
-                print(f"[bridge] cookie auth failed, trying token file: "
-                      f"{type(e).__name__} {str(e)[:120]}", flush=True)
-    tp = token_params()
-    if tp:
-        gw = client_class(cookies="", vm_id=tp["vm_id"],
-                 access_token=tp["access_token"], hatch_token=tp["hatch_token"])
-        gw.call_json("sessions.list", timeout=15)
-        return gw
-    raise RuntimeError("no native credential (cookies.txt or token.json)")
+    """Prove the preferred source, preserving Cookie failures during fallback."""
+    _connection_health.results = []
+    _connection_health.active_source = None
+    sources = ("token",) if os.environ.get("NATIVE_TOKEN_JSON") else ("cookies", "token")
+    last_error = None
+    for source in sources:
+        origin = "environment" if source == "token" and os.environ.get("NATIVE_TOKEN_JSON") else "file"
+        names = ("cookies.txt", "vm_id.txt") if source == "cookies" else ("token.json",)
+        report = {"source": source, "origin": origin, "checked_at": int(time.time()),
+                  "fingerprint": "environment" if origin == "environment" else credential_fingerprint(CONF_DIR, names)}
+        try:
+            client = _connect_source(source)
+        except Exception as error:
+            report.update(status="failed", failure_kind=failure_kind(error))
+            last_error = error
+        else:
+            report.update(status="healthy" if client is not None else "missing", failure_kind=None)
+            if client is not None:
+                _connection_health.active_source = source
+        _connection_health.results.append(report)
+        if report["status"] == "healthy":
+            return client
+    if last_error is not None:
+        # Keep authentication/configuration classification without leaking the
+        # upstream response through existing callers' exception logging.
+        kind = failure_kind(last_error)
+        if kind == "auth":
+            raise CredentialAuthError("native credential authentication failed") from None
+        if kind == "configuration":
+            raise ValueError("native credential configuration invalid") from None
+        if kind == "dependency":
+            raise ImportError("native credential client dependency unavailable") from None
+        raise ConnectionError("native credential connection failed") from None
+    raise ValueError("no native credential (cookies.txt or token.json)")
 
 
 def _load_channel_common():
@@ -935,6 +1009,14 @@ class ChannelWorker(threading.Thread):
         """
         if self._reconnect_exhausted:
             return
+        if is_auth_failure(exc):
+            current = self.cs()
+            source = current.get("active_source")
+            if source:
+                report = dict(current.get("credential_sources", {}).get(source, {}),
+                              source=source, status="failed", failure_kind="auth",
+                              checked_at=int(time.time()))
+                self._record_credential_results([report], None)
         self._note_connect_failure(exc)
         self._reconnect_failures += 1
         self._next_connect_at = time.time() + min(5 * 2 ** (self._reconnect_failures - 1), 60)
@@ -957,6 +1039,8 @@ class ChannelWorker(threading.Thread):
     def _notify_reconnect_pause(self):
         """Report a parked bridge once, using only its existing bound route."""
         cs = self.cs()
+        if self._credential_notice_pending_or_queued(cs):
+            return
         if cs.get("fallback_alerted") or cs.get("idle_failure_alerted"):
             return
         turns = cs.get("turns") or []
@@ -1009,6 +1093,7 @@ class ChannelWorker(threading.Thread):
         A handshake does not reset the failure budget. The caller records
         success only after its actual bridge operation succeeds.
         """
+        self._flush_credential_notices()
         if self._reconnect_exhausted_now():
             self._notify_reconnect_pause()
             return None, None
@@ -1017,12 +1102,64 @@ class ChannelWorker(threading.Thread):
         if time.time() < self._next_connect_at:
             return None, None
         self.last_connect_try = time.time()
+        _connection_health.results = []
+        _connection_health.active_source = None
         try:
             gw = connect()
         except Exception as e:
+            self._record_credential_results()
             self._note_reconnect_failure(e)
             return None, e
+        self._record_credential_results()
         return gw, None
+
+    def _record_credential_results(self, reports=None, selected=None):
+        """Commit sanitized source results before publishing outage events."""
+        if reports is None:
+            reports = getattr(_connection_health, "results", [])
+            selected = getattr(_connection_health, "active_source", None)
+        if not reports:
+            return
+        try:
+            with _state_lock:
+                state = load_state()
+                channel = ch_state(state, self.ch)
+                health = observe_connection(channel.get("credential_health", {}), reports,
+                                            selected, int(time.time()))
+                channel.update(credential_health=health, credential_sources=health["sources"],
+                               active_source=health.get("active_source"),
+                               last_verified_at=health.get("last_verified_at"))
+                save_state(state)
+            self._flush_credential_notices()
+        except Exception as error:
+            self.log("credential health persistence failed:", type(error).__name__)
+
+    def _credential_notice_pending_or_queued(self, state):
+        """Keep generic outage notices from duplicating a credential incident."""
+        health = state.get("credential_health", {})
+        incident = health.get("incident", {})
+        return bool(incident.get("active") and (incident.get("fault_queued")
+                    or any(event["kind"] == "fault" for event in health.get("pending_notices", []))))
+
+    def _flush_credential_notices(self):
+        """Retry durable health events without claiming platform delivery."""
+        health = self.cs().get("credential_health", {})
+        for event in health.get("pending_notices", []):
+            if not self._send_alert_text(event["text"], event_id=event["id"]):
+                break
+            try:
+                with _state_lock:
+                    state = load_state()
+                    current = ch_state(state, self.ch).get("credential_health", {})
+                    current["pending_notices"] = [item for item in current.get("pending_notices", [])
+                                                  if item["id"] != event["id"]]
+                    incident = current.get("incident", {})
+                    if incident.get("id") == event["incident_id"] and event["kind"] == "fault":
+                        incident["fault_queued"] = True
+                    save_state(state)
+            except Exception as error:
+                self.log("credential notice acknowledgement failed:", type(error).__name__)
+                break
 
     def cs(self):
         with _state_lock:
@@ -1088,6 +1225,9 @@ class ChannelWorker(threading.Thread):
         if self._auth_blocked_stamp != cred_stamp():
             self._auth_blocked_until = 0.0
             self._auth_blocked_stamp = None
+            # 凭证已更新：重试立即放行，不等普通连接退避（与
+            # _reconnect_exhausted_now 的凭证变更清退避同款）。
+            self._next_connect_at = 0.0
             return False
         return True
 
@@ -1783,7 +1923,16 @@ class ChannelWorker(threading.Thread):
         streak = (current.get("idle_scan_fail_streak") or 0) + 1
         self.update_cs(idle_scan_fail_streak=streak)
         if is_auth_failure(exc):
+            if self._credential_notice_pending_or_queued(current):
+                return
             stamp = cred_stamp()
+            if (current.get("idle_auth_alert_stamp") is not None
+                    and current.get("idle_auth_alert_stamp") != stamp):
+                # 凭证已更新：旧凭证的“已提醒”随之失效，重新计数
+                #（告警文本的承诺：凭证更新后重新计数）。
+                self.update_cs(idle_auth_alert_stamp=None,
+                               idle_failure_alerted=False)
+                current = self.cs()
             if (current.get("idle_auth_alert_stamp") == stamp
                     or current.get("idle_failure_alerted") or current.get("fallback_alerted")):
                 return
@@ -1961,6 +2110,7 @@ class ChannelWorker(threading.Thread):
         """Hold the channel routing lock across state checks and external calls."""
         common = _load_channel_common()
         with common.bridge_route_lock(Path(BASE), self.ch) if self.ch in ("weixin", "wecom") else common.exclusive_file_lock(Path(BASE) / (".route-" + self.ch + ".lock")):
+            self._flush_credential_notices()
             if self.ch in ("weixin", "wecom") and os.path.exists(os.path.join(BASE, ".fallback-" + self.ch)):
                 return
             self._step_locked(spool, boundary_f)
@@ -2020,6 +2170,14 @@ class ChannelWorker(threading.Thread):
                              f"{str(e)[:100]}; will retry")
                     self._note_reconnect_failure(e)
                     self.drop_gw()
+                    # Fail safe: a poll failure leaves reply_started
+                    # unknown, and the merge block below must not fold
+                    # into a turn whose reply may already have started.
+                    # Mark it started and persist it via _turns_dirty
+                    # (the post-loop update_cs(turns=alive) only fires
+                    # when a turn field changed).
+                    turn["reply_started"] = True
+                    self._turns_dirty = True
                     alive.append(turn)
                     alive.extend(turns[turns.index(turn) + 1:])
                     break
@@ -2155,7 +2313,20 @@ class ChannelWorker(threading.Thread):
             cs = self.cs()
         if self.queue and not cs["turns"]:
             self._start_next()
-        cs = self.cs()
+            cs = self.cs()
+            # A freshly started turn has not replied yet: fold any
+            # messages still queued into it, so they ride this turn
+            # instead of each waiting for a turn of their own. Skip
+            # when the queue head is the row that just started (a
+            # recovery row carries nbytes=0, so _reserve_submission
+            # does not pop it, and re-merging it would re-consume
+            # an already-spent recovery identity).
+            if self.queue and cs["turns"] and self.ch in MERGE_CHANNELS:
+                started_ids = cs["turns"][-1].get("ids") or [
+                    cs["turns"][-1].get("msgid")]
+                if self.queue[0][0].get("msgid") not in started_ids:
+                    self._merge_into_active()
+                    cs = self.cs()
         if not cs["turns"] and not self.queue:
             self.idle_push_scan(cs)
         cs = self.cs()
@@ -2185,12 +2356,13 @@ class ChannelWorker(threading.Thread):
               **spool_progress(cs, nbytes),
               "fallback_streak": streak, **self._consume_recovery(cs, row)}
         alert = streak >= 3 and not (cs.get("fallback_alerted", False)
-                                    or cs.get("idle_failure_alerted", False))
+                                    or cs.get("idle_failure_alerted", False)
+                                    or self._credential_notice_pending_or_queued(cs))
         self.update_cs(**kw)
         if alert and self._send_fb_alert(row, streak):
             self.update_cs(last_fb_alert=int(time.time()), fallback_alerted=True)
 
-    def _send_alert_text(self, text, row=None):
+    def _send_alert_text(self, text, row=None, *, event_id=None):
         """Write one visible alert row into this channel's outbox
         (live addressing when live, the shadow outbox otherwise).
         Generalized from _send_fb_alert's write pattern so LT2's
@@ -2198,8 +2370,9 @@ class ChannelWorker(threading.Thread):
         including the gateway's parked-retry handling downstream —
         instead of inventing a second one. row, when given, supplies
         the live route; otherwise the channel config does."""
-        rid = f"bridgealert-{uuid.uuid4().hex}"
+        rid = f"bridgealert-{self.ch}-{event_id}" if event_id else f"bridgealert-{uuid.uuid4().hex}"
         try:
+            writer = append_health_notice_once if event_id else append_jsonl
             if live_mode(self.ch):
                 # Gateways read the body from "content" ONLY (every
                 # other bridge outbox writer uses it). This writer
@@ -2223,11 +2396,11 @@ class ChannelWorker(threading.Thread):
                     if not to:
                         return False
                     out["to_user_id"] = to
-                append_jsonl(os.path.join(
+                writer(os.path.join(
                     runtime_config()["channels"][self.ch]["bot_state"], "outbox.jsonl"),
                     out)
             else:
-                append_jsonl(os.path.join(BASE, "shadow",
+                writer(os.path.join(BASE, "shadow",
                                           f"{self.ch}-outbox.jsonl"),
                              {"id": rid, "mode": "send",
                               "content": text, "text": text,
@@ -2290,6 +2463,16 @@ class ChannelWorker(threading.Thread):
                 current = self.cs()
                 self.update_cs(turns=[merged_turn] + list(current["turns"][1:]),
                                submission_pending=None)
+                # The merge is committed (message sent, recovery identity
+                # consumed). _reserve_submission only pops the queue head
+                # when nbytes is truthy, so a recovery row (nbytes=0)
+                # would otherwise stay at the head and be re-merged,
+                # re-consuming an already-spent recovery identity and
+                # wedging the channel. Drop it from the in-memory queue;
+                # the spool offset must NOT advance for it (nbytes=0),
+                # so this is a plain pop, not a spool commit.
+                if self.queue and self.queue[0][0].get("msgid") == row.get("msgid"):
+                    self.queue.pop(0)
             except Exception as error:
                 self.log("merge submission requires reconciliation:", type(error).__name__)
                 self.drop_gw()

@@ -13,11 +13,31 @@ import json
 import os
 import sys
 import tempfile
+import types
 import unittest
 
 os.environ["APPROVAL_RELAY_TEST"] = "1"
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import approval_relay as relay  # noqa: E402
+
+def require_approval_engine():
+    """Stub policy engine returning REQUIRE_APPROVAL for every item.
+
+    The default engine auto-approves everything since the 2026-11-06
+    all-allow policy, so notification/grouping tests inject this stub to
+    exercise the notify path (the old behaviour for these records).
+    """
+    class _RequireApproval:
+        def evaluate(self, record, what=""):
+            return types.SimpleNamespace(
+                action=relay.PolicyAction.REQUIRE_APPROVAL,
+                risk_level=relay.RiskLevel.NORMAL,
+                is_high_risk=False,
+                rule_name="normal_approval",
+                reason="test stub: manual approval required",
+            )
+    return _RequireApproval()
+
 
 FULL_RECORD = {
     "approval_id": "aid-full",
@@ -67,14 +87,16 @@ class RelayTestCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         base = self.tmp.name
-        self._orig = (relay.STATE_F, relay.STATUS_F, relay.BASE)
+        self._orig = (relay.STATE_F, relay.STATUS_F, relay.BASE, relay.DECISIONS_F, relay.OFFSET_F)
         relay.STATE_F = os.path.join(base, "state.json")
         relay.STATUS_F = os.path.join(base, "status.json")
+        relay.DECISIONS_F = os.path.join(base, "decisions.jsonl")
+        relay.OFFSET_F = os.path.join(base, "decisions.offset")
         relay.BASE = base
         self.state = {"next_num": 1, "items": {}}
 
     def tearDown(self):
-        relay.STATE_F, relay.STATUS_F, relay.BASE = self._orig
+        (relay.STATE_F, relay.STATUS_F, relay.BASE, relay.DECISIONS_F, relay.OFFSET_F) = self._orig
         self.tmp.cleanup()
 
     def shadow_rows(self, channel):
@@ -114,7 +136,7 @@ class PollTests(RelayTestCase):
         gateway = StubGateway([SPARSE_RECORD],
                               detail={**FULL_RECORD,
                                       "approval_id": "aid-sparse"})
-        relay.poll_once(gateway, self.state)
+        relay.poll_once(gateway, self.state, policy_engine=require_approval_engine())
         rows = self.shadow_rows("weixin")
         self.assertEqual(len(rows), 1)
         self.assertIn("Shell command", rows[0]["content"])
@@ -126,21 +148,21 @@ class PollTests(RelayTestCase):
     def test_empty_after_detail_holds_notification_then_retries(self):
         failing = StubGateway([SPARSE_RECORD],
                               detail_error=RuntimeError("boom"))
-        relay.poll_once(failing, self.state)
+        relay.poll_once(failing, self.state, policy_engine=require_approval_engine())
         self.assertEqual(self.shadow_rows("weixin"), [])
         self.assertFalse(self.state["items"]["1"]["notified"])
 
         succeeding = StubGateway(
             [SPARSE_RECORD],
             detail={**FULL_RECORD, "approval_id": "aid-sparse"})
-        relay.poll_once(succeeding, self.state)
+        relay.poll_once(succeeding, self.state, policy_engine=require_approval_engine())
         rows = self.shadow_rows("weixin")
         self.assertEqual(len(rows), 1)
         self.assertIn("open-entry.sh", rows[0]["content"])
 
     def test_full_pending_notifies_without_detail_fetch(self):
         gateway = StubGateway([FULL_RECORD], detail=None)
-        relay.poll_once(gateway, self.state)
+        relay.poll_once(gateway, self.state, policy_engine=require_approval_engine())
         rows = self.shadow_rows("weixin")
         self.assertEqual(len(rows), 1)
         self.assertIn("Shell command", rows[0]["content"])
@@ -150,8 +172,8 @@ class PollTests(RelayTestCase):
     def test_notified_item_is_not_renotified(self):
         gateway = StubGateway([FULL_RECORD],
                               detail=FULL_RECORD)
-        relay.poll_once(gateway, self.state)
-        relay.poll_once(gateway, self.state)
+        relay.poll_once(gateway, self.state, policy_engine=require_approval_engine())
+        relay.poll_once(gateway, self.state, policy_engine=require_approval_engine())
         self.assertEqual(len(self.shadow_rows("weixin")), 1)
 
 

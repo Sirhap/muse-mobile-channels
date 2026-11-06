@@ -116,7 +116,15 @@ def rewrite_hook(src: str, spec: dict[str, str], bot_state: Path, cli: Path) -> 
         "/home/hatch/workspace/native-bridge/state.json",
         str(bridge_state),
     )
-    if "/home/hatch" in rewritten:
+    # 门禁只拦生产状态/CLI 路径：沙箱 hook 有意执行仓库自身的两个
+    # 代码模块（channel_common、death_watch_activity），当仓库本身就
+    # 检在 /home/hatch/workspace 时它们字面上也是 hatch 路径，若不
+    # 豁免，门禁在生产检出路径上恒误报；其它 hatch 路径仍照常拦截。
+    gated = rewritten
+    for allowed in (str(REPO_ROOT / "channel_common.py"),
+                    str(REPO_ROOT / "death_watch_activity.py")):
+        gated = gated.replace(allowed, "")
+    if "/home/hatch" in gated:
         raise RuntimeError("rewrite left a /home/hatch path in the hook copy")
     if "DEATH_WATCH_SECS = 1800" not in rewritten:
         raise RuntimeError(

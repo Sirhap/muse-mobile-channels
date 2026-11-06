@@ -73,8 +73,9 @@ if [[ ! -f "$INBOX" ]]; then
   exit 0
 fi
 
-PAYLOAD="$(python3 - "$SEEN" "$INBOX" "$OUTBOX" "$PENDING" "$BATCH" "$JUMP" "$BOUNDARY" "$CLAIMS" "$QA" "$STARVE" "$SUBJOBS" "$SUBREQ" "$SUBCMD" "$CLI" "$CONTEXT" "$CARRIED" "$CLEARED" <<'PYEOF'
+PAYLOAD=$(python3 - "$SEEN" "$INBOX" "$OUTBOX" "$PENDING" "$BATCH" "$JUMP" "$BOUNDARY" "$CLAIMS" "$QA" "$STARVE" "$SUBJOBS" "$SUBREQ" "$SUBCMD" "$CLI" "$CONTEXT" "$CARRIED" "$CLEARED" <<'PYEOF'
 import importlib.util
+from pathlib import Path
 import json, os, subprocess, sys, time
 
 seen_path, inbox_path, outbox_path, pending_path, batch_path, jump_path, boundary_path, claims_path, qa_path, starve_path, subjobs_path, subreq_path, subcmd_path, cli_path, context_path, carried_path, cleared_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7], sys.argv[8], sys.argv[9], sys.argv[10], sys.argv[11], sys.argv[12], sys.argv[13], sys.argv[14], sys.argv[15], sys.argv[16], sys.argv[17]
@@ -119,12 +120,11 @@ DEATH_WATCH_SECS = 1800
 # still visible on the bridge or in worker_activity.json ->
 # hold (no resume, no cancel, resume_attempts untouched, the
 # batch stays under watch; the outbox silence clock is NOT
-# restarted); first loss with no such signal -> auto-resume
-# ONCE via the orphan re-wake path plus one factual notice;
-# second loss -> fail-stop (cancel + ONE factual stop
-# notice stating the last real push, never an inferred
-# "execution failed" verdict). A missing or unreadable probe
-# is not life: the hook then uses the resume/cancel path.
+# restarted); missing same-run terminal evidence -> durable review
+# and one factual inspection notice; fresh same-run terminal evidence
+# -> resume ONCE, then fail-stop only after a second confirmed loss.
+# A missing or unreadable probe is neither life nor proof of death:
+# it permits inspection, never automatic replay or cancellation.
 # See death_watch_activity.py.
 # --- Early signals (2026-10-14, todo tasks 4+5; deployed
 # only, NOT deployed) ---
@@ -148,8 +148,8 @@ STALL_FIRST_NOTICE_SECS = 300
 # worker's own outbox silence is already at least
 # EARLY_RESUME_MIN_SILENCE_SECS. This only RE-TIMES the existing
 # death routing (_route_death: covered -> silent drop, probe
-# alive -> hold, first loss -> resume once, second loss ->
-# fail-stop); it adds no new resume/cancel machinery. A missing
+# alive -> hold, unknown -> review, confirmed terminal -> resume once
+# then fail-stop); it adds no new resume/cancel machinery. A missing
 # pid file is unknown, never death; one live pid vetoes the batch.
 EARLY_RESUME_MIN_SILENCE_SECS = 300
 EARLY_RESUME_HB_STALE_SECS = 180
@@ -176,8 +176,8 @@ EARLY_RESUME_HB_STALE_SECS = 180
 # the hook leaves a throttled check request in
 # platform_check_requests.json for the checker cron: at most one
 # request per PLATFORM_CHECK_EVERY_SECS per msgid, at most
-# PLATFORM_CHECK_MAX_PER_BATCH per batch. No verdict -> the
-# original 1800s path is completely unchanged.
+# PLATFORM_CHECK_MAX_PER_BATCH per ten-minute window. No verdict ->
+# the 1800s inspection path retains the execution in pending review.
 EARLY_PLATFORM_MIN_SILENCE_SECS = 300
 PLATFORM_CHECK_EVERY_SECS = 300
 PLATFORM_CHECK_MAX_PER_BATCH = 2
@@ -627,6 +627,8 @@ _resume_attempts_path = os.path.join(os.path.dirname(pending_path),
                                      "resume_attempts.json")
 _resume_queue_path = os.path.join(os.path.dirname(pending_path),
                                   "resume_queue.json")
+_recovery_attempts_path = os.path.join(os.path.dirname(pending_path),
+                                      "recovery_attempts.json")
 
 
 def _load_json_obj(path):
@@ -648,9 +650,42 @@ def _save_json_obj(path, obj):
         pass
 
 
-_resume_attempts = {str(k): float(v)
-                    for k, v in _load_json_obj(_resume_attempts_path).items()
-                    if isinstance(v, (int, float)) and now - float(v) < 7200}
+def _load_authorization(path):
+    """Missing state is empty; corrupt/unreadable recovery authority is not."""
+    try:
+        with open(path, encoding="utf-8") as source:
+            value = json.load(source)
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError):
+        raise RuntimeError("recovery authorization state unavailable") from None
+    if not isinstance(value, dict):
+        raise ValueError("invalid recovery authorization state")
+    return value
+
+
+def _valid_attempt_time(value):
+    """Accept finite positive timestamps, excluding bool and NaN values."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and 0 < value < float("inf")
+
+
+_legacy_attempts = _load_authorization(_resume_attempts_path)
+if any(not _valid_attempt_time(value) for value in _legacy_attempts.values()):
+    raise ValueError("invalid legacy recovery budget")
+_recovery_attempts = _load_authorization(_recovery_attempts_path)
+for _record in _recovery_attempts.values():
+    if (not isinstance(_record, dict) or not _valid_attempt_time(_record.get("attempted_at"))
+            or not (_record.get("source_run_id") is None
+                    or isinstance(_record.get("source_run_id"), str) and _record["source_run_id"])):
+        raise ValueError("invalid recovery attempt identity")
+# Legacy float budgets are real consumed budgets but do not identify which run
+# was resumed. They can only request review, never authorize a second stop.
+for _mid, _when in _legacy_attempts.items():
+    _recovery_attempts.setdefault(str(_mid), {"source_run_id": None,
+                                            "attempted_at": float(_when)})
+_resume_attempts = {str(mid): float(record["attempted_at"])
+                    for mid, record in _recovery_attempts.items()}
+# Keep budget ownership until delivery; a delayed verdict never resets it.
 _resume_queue = _load_json_obj(_resume_queue_path)
 _resume_queue = {str(k): float(v) for k, v in _resume_queue.items()
                  if isinstance(v, (int, float)) and now - float(v) < 7200}
@@ -660,8 +695,8 @@ _resume_notice_entries = []
 def _load_activity_probe():
     """Load death_watch_activity.py, or None when it cannot be loaded.
 
-    A missing probe degrades to the outbox-only decision. It must
-    not freeze the watch and must not raise into the hook poll.
+    A missing probe leaves execution unverified. Silence can request review,
+    but cannot authorize replay or cancellation without platform evidence.
     """
     path = (os.environ.get("DEATH_WATCH_ACTIVITY_PY")
             or "/home/hatch/workspace/death_watch_activity.py")
@@ -749,8 +784,8 @@ def _activity_blocks(msgids, window=DEATH_WATCH_SECS):
 
     One alive msgid holds the whole batch: siblings are not resumed
     and not cancelled on this poll. A degraded source is not life.
-    When nothing is alive and a source failed, the failure is
-    recorded and the caller proceeds with resume/cancel.
+    When nothing is alive and a source failed, the failure is recorded.
+    The caller must still obtain bound terminal proof before resume/cancel.
     """
     holds = []
     degraded = []
@@ -788,9 +823,9 @@ def _maybe_request_platform_check(msgids, last_activity):
     fresh signal of any kind (a live hold or a running verdict
     vetoes), no terminal verdict yet, and at least one msgid was
     self-registered (no run_id -> nothing the checker can resolve).
-    The checker is a low-frequency agent cron following the
-    runbook; it only writes the verdict snapshot. Best-effort and
-    never in dry runs: a failed write just delays the check.
+    The checker follows the platform runbook and writes only verdicts.
+    Requests are bounded per run in renewable ten-minute windows. A failed
+    request write never grants permission to replay/cancel unknown work.
     """
     if dry:
         return
@@ -818,13 +853,19 @@ def _maybe_request_platform_check(msgids, last_activity):
     changed = False
     for mid, run_id in registered.items():
         rec = reqs.get(mid) or {}
-        count = int(rec.get("count") or 0)
         last = float(rec.get("last_request_ts") or 0)
+        same_run = rec.get("run_id") == run_id
+        count = int(rec.get("count") or 0) if same_run else 0
+        # Two requests per ten-minute window, not two for the entire task.
+        window_started = float(rec.get("window_started_at") or rec.get("requested_at") or 0)
+        if not same_run or now - window_started >= 600:
+            count, last, window_started = 0, 0, now
         if count >= PLATFORM_CHECK_MAX_PER_BATCH:
             continue
         if now - last < PLATFORM_CHECK_EVERY_SECS:
             continue
         reqs[mid] = {"run_id": run_id, "count": count + 1,
+                     "window_started_at": window_started,
                      "last_request_ts": now, "requested_at": now,
                      "silence_secs": int(now - last_activity)}
         changed = True
@@ -834,46 +875,150 @@ def _maybe_request_platform_check(msgids, last_activity):
         _save_json_obj(_platform_check_path, cur)
 
 
-def _route_death(e, window=DEATH_WATCH_SECS):
-    """First loss of worker pushes -> resume once (queue the msgid
-    for an orphan re-wake + one factual user notice). Second loss ->
-    fail-stop via failed_entries.
+# Unknown execution is a durable scheduling block, never proof of liveness.
+# Resolve relative to the shared module already located by deployment/sandbox
+# configuration, so this does not depend on the hook process working directory.
+_review_common = _load_pending_answers()
+if _review_common is None:
+    raise RuntimeError("worker review dependency unavailable; refusing unsafe scheduling")
+_review_path = os.path.join(os.path.dirname(_review_common.__file__), "worker_supervision.py")
+_review_spec = importlib.util.spec_from_file_location("worker_supervision", _review_path)
+if _review_spec is None or _review_spec.loader is None:
+    raise RuntimeError("worker review dependency unavailable; refusing unsafe scheduling")
+_review_module = importlib.util.module_from_spec(_review_spec)
+_review_spec.loader.exec_module(_review_module)
+_review = _review_module.WorkerReview(
+    os.path.join(os.path.dirname(pending_path), "worker_review.json"),
+    outbox_path, _pending_channel(), now, dry=dry)
 
-    Real activity is checked again here, before either write, so a
-    caller cannot resume or cancel a msgid the probe still calls
-    alive. Returns "hold", "resume", or "fail". "hold" does not
-    record a resume attempt. Early-route callers pass the early
-    window so the alive recheck matches the trigger's timescale.
+
+# Read the append-only outbox once per poll, even with many pending reviews.
+_review_last_push = {}
+for _row in load_jsonl(outbox_path):
+    if _row.get("mode") not in ("update", "reply", "reply_file"):
+        continue
+    _mid = str(_row.get("msgid") or "")
+    _ts = _row.get("queued_at", _row.get("ts"))
+    if _mid and isinstance(_ts, (int, float)) and 0 < _ts <= now:
+        _review_last_push[_mid] = max(_review_last_push.get(_mid, 0), float(_ts))
+
+
+def _worker_last_push(e):
+    """Read cached bound work evidence, excluding unbound review notices."""
+    initial = e.get("ts")
+    latest = float(initial) if isinstance(initial, (int, float)) else now
+    return max(latest, _review_last_push.get(str(e["msgid"]), 0))
+
+
+def _save_authorization(path, value):
+    """Commit authorization before any replay/stop decision; errors stop polling."""
+    destination = Path(path)
+    _review_common.atomic_write_text(destination, json.dumps(value, ensure_ascii=False), mode=0o600)
+    descriptor = os.open(destination.parent, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _forget_recovery(mid):
+    """Clear both authoritative ownership and its legacy display mirror."""
+    changed = _recovery_attempts.pop(str(mid), None) is not None
+    mirrored = _resume_attempts.pop(str(mid), None) is not None
+    if changed:
+        _save_authorization(_recovery_attempts_path, _recovery_attempts)
+    if mirrored:
+        _save_authorization(_resume_attempts_path, _resume_attempts)
+
+
+_death_routes = {}
+
+def _route_death(e, window=DEATH_WATCH_SECS):
+    """Route confirmed termination; leave unverified executions in review.
+
+    Silence only triggers inspection. Resume/cancel additionally require fresh
+    platform-terminal evidence bound to this message's current worker run.
     """
-    _mid = str(e["msgid"])
-    if _activity_blocks([_mid], window):
+    mid = str(e["msgid"])
+    if mid in _death_routes:
+        return _death_routes[mid]
+    if mid in _cancelled_ids:
+        _review.resolve(mid, "cancelled")
         return "hold"
-    # Handoff veto (2026-10-29): a worker that transferred the batch
-    # to the main session must not be resumed or fail-stopped, even
-    # when its platform session has ended. _activity_blocks already
-    # returns hold for a fresh handoff via the probe's worker-handoff
-    # signal; this check is defence in depth for a probe that
-    # reports handoff without alive.
-    if _assess_msgid(_mid).get("worker_handoff"):
+    if _activity_blocks([mid], window):
         return "hold"
-    if _assess_msgid(_mid).get("platform_terminal"):
-        # Routed on platform-terminal evidence (todo 21): remember
-        # the basis so the resume / fail-stop notices can state it.
-        _platform_routed_ids.add(_mid)
-    if _resume_attempts.get(_mid):
+    info = _assess_msgid(mid, window)
+    if info.get("worker_handoff"):
+        return "hold"
+    source_run = info.get("worker_run_id")
+    terminal_proven = (info.get("platform_terminal") and isinstance(source_run, str)
+                       and bool(source_run.strip()))
+    if not terminal_proven:
+        if not info.get("worker_run_id"):
+            # Diagnostic identity survives a missing probe without granting proof.
+            registered = _load_json_obj(_WORKER_ACTIVITY).get(mid)
+            if isinstance(registered, dict) and isinstance(registered.get("run_id"), str):
+                info["worker_run_id"] = registered["run_id"]
+        _review.record(mid, info, _worker_last_push(e))
+        _maybe_request_platform_check([mid], _worker_last_push(e))
+        _death_routes[mid] = "review"
+        return "review"
+    attempt = _recovery_attempts.get(mid)
+    if attempt is not None:
+        consumed_run = attempt.get("source_run_id")
+        if not consumed_run or consumed_run == info.get("worker_run_id"):
+            # The same old terminal may remain visible until the replacement
+            # worker registers. It is not proof that a second execution ended.
+            reason = ("recovery_run_identity_unknown" if not consumed_run
+                      else "recovery_already_consumed_for_run")
+            _review.record(mid, dict(info, platform_verdict_reason=reason), _worker_last_push(e))
+            _death_routes[mid] = "review"
+            return "review"
+        _review.resolve(mid, "replacement_run_terminal")
+        _platform_routed_ids.add(mid)
+        _death_routes[mid] = "fail"
         return "fail"
-    _resume_attempts[_mid] = now
-    _save_json_obj(_resume_attempts_path, _resume_attempts)
-    if _mid not in _resume_queue:
-        _resume_queue[_mid] = now
-        _save_json_obj(_resume_queue_path, _resume_queue)
+    # A single authoritative record binds the once-only replay to its source
+    # run. Persist it BEFORE display mirrors, replay queues or review release.
+    _recovery_attempts[mid] = {"source_run_id": info["worker_run_id"], "attempted_at": now}
+    _save_authorization(_recovery_attempts_path, _recovery_attempts)
+    _resume_attempts[mid] = now
+    _save_authorization(_resume_attempts_path, _resume_attempts)
+    _resume_queue[mid] = now
+    _save_authorization(_resume_queue_path, _resume_queue)
+    _review.resolve(mid, "platform_terminal")
+    _platform_routed_ids.add(mid)
     _resume_notice_entries.append(e)
+    _death_routes[mid] = "resume"
     return "resume"
 
 batch_done = False
 orphaned_entries = []
 orphan_info = []
 failed_entries = []
+# Revisit pending inspections without creating a replacement worker. A real
+# late reply or explicit user cancellation closes review; a confirmed terminal
+# record may release exactly the existing bounded recovery path.
+_review_by_id = {str(e["msgid"]): e for e in entries}
+for _mid in list(_review.pending_ids):
+    if _mid in _cancelled_ids:
+        _review.resolve(_mid, "cancelled")
+        continue
+    if {"reply", "reply_file"} & _delivered_modes.get(_mid, set()):
+        _review.resolve(_mid, "reply_delivered")
+        _resume_queue.pop(_mid, None)
+        _forget_recovery(_mid)
+        _save_json_obj(_resume_queue_path, _resume_queue)
+        continue
+    _entry = _review_by_id.get(_mid)
+    if _entry is not None and now - _worker_last_push(_entry) < EARLY_PLATFORM_MIN_SILENCE_SECS:
+        continue
+    if _entry is not None and _route_death(_entry) == "fail":
+        failed_entries.append(_entry)
+    elif _entry is None:
+        # Missing inbox/route information is not permission to discard review.
+        _maybe_request_platform_check([_mid], now - DEATH_WATCH_SECS)
+
 if batch_active:
     # A batch ends when a formal reply to any of its messages lands.
     # Standalone "send" rows carry no msgid (they are proactive
@@ -920,8 +1065,7 @@ if batch_active:
     if batch_replied:
         batch_done = True
         for _m in batch_ids:
-            if _resume_attempts.pop(str(_m), None) is not None:
-                _save_json_obj(_resume_attempts_path, _resume_attempts)
+            _forget_recovery(str(_m))
             if _resume_queue.pop(str(_m), None) is not None:
                 _save_json_obj(_resume_queue_path, _resume_queue)
     elif (now - last_activity >= DEATH_WATCH_SECS
@@ -947,8 +1091,8 @@ if batch_active:
         # (1) covered by a follow-up reply -> drop silently;
         # (2) bridge/worker real activity still fresh -> hold
         #     (no resume, no cancel, batch stays);
-        # (3) first loss -> auto-resume once (orphan re-wake);
-        # (4) second loss -> fail-stop (cancel + factual notice).
+        # (3) unknown platform state -> durable review, no replay/cancel;
+        # (4) confirmed terminal -> resume once, then bounded fail-stop.
         by_id = {e["msgid"]: e for e in entries}
         _cov = _covered_by_followup(batch_ids, batch_since,
                                     last_activity)
@@ -967,14 +1111,15 @@ if batch_active:
             batch_done = True
             for mid in batch.get("msgids") or []:
                 e = by_id.get(mid)
-                if e is not None and _route_death(e, _route_window) == "fail":
+                if (e is not None and e not in failed_entries
+                        and _route_death(e, _route_window) == "fail"):
                     failed_entries.append(e)
     elif now - last_activity >= EARLY_PLATFORM_MIN_SILENCE_SECS:
         # Suspicious zone only (todo 21): silent past the early
         # floor, no death evidence yet (the heartbeat loop may well
         # be alive -- this is exactly the uncovered shape). Leave a
         # throttled platform-check request; routing waits for the
-        # verdict or the unchanged 1800s watch.
+        # verdict or the 1800s inspection path.
         _maybe_request_platform_check(batch.get("msgids") or [],
                                       last_activity)
 
@@ -1011,8 +1156,8 @@ DETACHED_RETIRE_SECS = 3600
 if detached:
     # Batches preempted earlier keep running in parallel; supervise
     # them here: drop one when its reply lands, FAIL its messages
-    # when it goes silent past the same cap as a normal batch
-    # (fail-stop, same rule as the active batch).
+    # inspect silence with the same rule as active batches. Missing execution
+    # evidence enters review; only confirmed termination may resume/cancel.
     drows = load_jsonl(outbox_path)
 
     def dts(r):
@@ -1050,9 +1195,7 @@ if detached:
                 dlast = _parked_mtime
         if dreplied:
             for _m in dids:
-                if _resume_attempts.pop(str(_m), None) is not None:
-                    _save_json_obj(_resume_attempts_path,
-                                   _resume_attempts)
+                _forget_recovery(str(_m))
                 if _resume_queue.pop(str(_m), None) is not None:
                     _save_json_obj(_resume_queue_path, _resume_queue)
             continue
@@ -1065,8 +1208,8 @@ if detached:
             # status-push fix): the worker's own pushes gone for
             # DEATH_WATCH_SECS -- same routing as the active batch:
             # covered -> silent drop; real activity -> keep
-            # watching; first loss -> resume once; second loss ->
-            # fail-stop (cancel + factual notice). The third
+            # watching; unverified execution -> review; confirmed terminal
+            # -> resume once, then fail-stop. The third
             # disjunct (todo 21) is the platform-terminal early
             # route, same routing, verdict as the death evidence.
             # This runs BEFORE the retire branch below, so a lost
@@ -1135,6 +1278,19 @@ if retire_rows and not dry:
     except OSError:
         pass
 
+# Review remains a separate state after the active/detached slot is released.
+# It cannot leak back through queue reconciliation, orphan claims or starvation.
+_review_ids = _review.pending_ids
+pending = {mid: ts for mid, ts in pending.items() if str(mid) not in _review_ids}
+pending_entries = [e for e in pending_entries if str(e["msgid"]) not in _review_ids]
+orphaned_entries = [e for e in orphaned_entries if str(e["msgid"]) not in _review_ids]
+orphan_info = [e for e in orphan_info if str(e.get("msgid")) not in _review_ids]
+for _mid in _review_ids | _cancelled_ids:
+    if _resume_queue.pop(_mid, None) is not None:
+        _save_json_obj(_resume_queue_path, _resume_queue)
+_review.flush_notices(_review_by_id, load_jsonl(os.path.join(
+    os.path.dirname(outbox_path), "outbox_results.jsonl")))
+
 # --- resume queue merge (2026-10-09 status-push fix) ---
 # Msgids routed to a one-time auto-resume wait in resume_queue.json
 # until a wake actually carries them (the claims-recording block at
@@ -1145,6 +1301,8 @@ if _resume_queue:
     _rq_by_id = {e["msgid"]: e for e in entries}
     for _mid in list(_resume_queue):
         _e = _rq_by_id.get(_mid) or _rq_by_id.get(str(_mid))
+        if _mid in _review_ids:
+            continue
         if _e is None or _e in orphaned_entries:
             continue
         orphaned_entries.append(_e)
@@ -1155,8 +1313,8 @@ if _resume_queue:
             {"msgid": _e["msgid"],
              "text": (_e.get("text") or "")[:500],
              "waited_mins": _waited, "resume": True,
-             "resume_note": "上一名 worker 已中断（没再收到它本人的"
-                            "推送）：先检查已有产物和进度，从断点续做，"
+             "resume_note": "平台已确认上一执行结束且尚无正式交付："
+                            "先检查已有产物和进度，从断点续做，"
                             "不要从头重做；这是唯一一次自动续跑，"
                             "完成后照常正式回复本条。"})
 
@@ -1204,7 +1362,7 @@ if orphaned_entries:
 STALL_NOTICE_SECS = 1200
 if not dry:
     _stall_candidates = []
-    if batch_active and not batch_done:
+    if batch_active and not batch_done and not (set(batch_ids) & _review_ids):
         if now - last_activity >= STALL_NOTICE_SECS:
             if not _activity_blocks(batch_ids):
                 _stall_candidates.append(
@@ -1221,6 +1379,8 @@ if not dry:
                 (list(batch_ids), batch_since, last_activity,
                  "first"))
     for _dids, _dsince, _dlast in detached_activity:
+        if set(_dids) & _review_ids:
+            continue
         if now - _dlast >= STALL_NOTICE_SECS:
             if not _activity_blocks(_dids):
                 _stall_candidates.append((_dids, _dsince, _dlast,
@@ -1261,13 +1421,12 @@ if not dry:
             if _kind == "first":
                 _notice = ("⏳ 任务「" + _t[:20] + "」已 " + str(_mins)
                            + " 分钟还没有第一条推送（未报错）；"
-                             "无推送满 30 分钟将自动续跑，进程已"
-                             "消失且心跳过期、或平台确认原会话"
-                             "已结束会提前续跑，/stop 取消")
+                             "长时间无进度会登记待核查；确认原执行"
+                             "已结束后才可能续跑，/stop 可登记取消")
             else:
                 _notice = ("⏳ 任务「" + _t[:20] + "」已 " + str(_mins)
                            + " 分钟无推送（未报错），再推即继续；"
-                             "满 30 分钟无推送将自动续跑，/stop 取消")
+                             "执行状态不明时先待核查，不自动重派或取消；/stop 可登记取消")
             _sent = False
             try:
                 r = subprocess.run([cli_path, "send", "--to",
@@ -1439,7 +1598,7 @@ _lost_cands = []
 for e in entries:
     mid = e["msgid"]
     if (mid in seen and mid not in carried and mid not in cleared
-            and mid not in _cancelled_ids
+            and mid not in _cancelled_ids and mid not in _review_ids
             and mid not in _orphan_ids and mid not in pending
             and mid not in _live_ids and mid not in claims):
         ts = e.get("ts")
@@ -1584,7 +1743,7 @@ if not dry:
         for _mid, _rec in starve.items():
             if (_rec["carried"] >= STARVE_THRESHOLD and _mid not in bound_ids
                     and _mid not in inflight_ids and _mid not in claims
-                    and _mid not in _cancelled_ids
+                    and _mid not in _cancelled_ids and _mid not in _review_ids
                     and _mid in _by_id):
                 _cands.append((_mid, _rec))
         if _cands:
@@ -2228,7 +2387,7 @@ if job_wake is not None:
         payload["job_retry"] = True
 print(json.dumps(payload, ensure_ascii=False))
 PYEOF
-)"
+)
 
 COUNT="$(printf '%s' "$PAYLOAD" | jq -r '.count // 0')"
 if [[ "$COUNT" == "0" ]]; then

@@ -13,12 +13,22 @@ import json, os, sys, time, uuid
 from pathlib import Path
 from contextlib import nullcontext
 
+_BASE_DIR = str(Path(__file__).resolve().parent)
+if _BASE_DIR not in sys.path:
+    sys.path.insert(0, _BASE_DIR)
 _ROOT = str(Path(__file__).resolve().parents[1])
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 from channel_common import exclusive_file_lock
+from credential_health import append_health_notice_once, credential_fingerprint, failure_kind
 from mobile_channels.approvals import decision_allowed
 from mobile_channels.modes import lease_from_env, ModeError
+from approval_policy import (
+    SecurityPolicyEngine,
+    PolicyAction,
+    RiskLevel,
+    get_default_policy_engine,
+)
 
 GW2 = None
 
@@ -29,8 +39,11 @@ STATUS_F = os.path.join(BASE, "status.json")
 DECISIONS_F = os.path.join(BASE, "decisions.jsonl")
 OFFSET_F = os.path.join(BASE, "decisions.offset")
 POLL_SECS = 20
+AUTH_RETRY_SECS = 600
+MAX_CONNECT_FAILURES = 3
 STICKY_DECISION_SECS = 30 * 60  # prefer_source sticky window
 CHANNEL_ORDER = ("weixin", "wecom")
+SUPPORTED_DECISION_CHANNELS = ("weixin", "wecom", "feishu")
 TEST = os.environ.get("APPROVAL_RELAY_TEST") == "1"
 
 CHANNELS = {
@@ -38,6 +51,8 @@ CHANNELS = {
                "row": {"to_user_id": os.environ.get("APPROVAL_RELAY_WEIXIN_TO", "")}},
     "wecom": {"outbox": "/home/hatch/workspace/wecom-bot/state/outbox.jsonl",
               "row": {"chatid": os.environ.get("APPROVAL_RELAY_WECOM_CHATID", ""), "chat_type": 1}},
+    "feishu": {"outbox": str(Path(_ROOT) / "feishu-bot" / "state" / "outbox.jsonl"),
+               "row": {"chat_id": os.environ.get("APPROVAL_RELAY_FEISHU_CHAT_ID", ""), "msg_type": "text"}},
 }
 DECISION_LABEL = {"allow_once": "已批准（仅这次）",
                   "allow_always": "已批准（永久）",
@@ -200,7 +215,7 @@ def resolve_notify_channels(item=None, explicit=None):
     return both
 
 
-def notify(text, tag, approval=None, channels=None, item=None):
+def notify(text, tag, approval=None, channels=None, item=None, event_id=None):
     """Push a notice to selected channels (prefer_source_else_both).
 
     ``channels`` if given is used as-is (after normalizing); otherwise
@@ -209,6 +224,8 @@ def notify(text, tag, approval=None, channels=None, item=None):
     template card instead of plain text. WeChat keeps the text form.
     The text is kept on the card row as fallback/audit content.
     Missing evidence still notifies both channels.
+    ``event_id`` gives health retries a stable id per target; ordinary approval
+    notifications keep their existing randomly generated ids.
 
     各通道写入独立处理，单渠道部署也能收到通知。全部目标写入
     失败时抛出 OSError，调用方保留未通知状态，等待下一轮重试。
@@ -234,11 +251,30 @@ def notify(text, tag, approval=None, channels=None, item=None):
     last_error = None
     for ch in targets:
         cfg = CHANNELS[ch]
-        row = {"id": f"appr-{tag}-{uuid.uuid4().hex[:8]}",
-               "queued_at": int(time.time()), "content": text}
+        row_id = (f"appr-health-{event_id}-{ch}" if event_id is not None
+                  else f"appr-{tag}-{uuid.uuid4().hex[:8]}")
+        row = {"id": row_id,
+               "queued_at": int(time.time()), "content": text, "text": text}
         if ch == "wecom" and approval is not None:
             row["mode"] = "send_card"
             row["card"] = build_approval_card(**approval)
+        elif ch == "feishu" and approval is not None:
+            row["mode"] = "send_card"
+            row["msg_type"] = "interactive"
+            try:
+                from feishu_bot.feishu_cards import build_approval_card as build_feishu_card
+                exp_s = (approval.get("expires_ms") / 1000.0) if approval.get("expires_ms") else None
+                row["card"] = build_feishu_card(
+                    approval_id=str(approval.get("num", "")),
+                    operator_ids=[],
+                    prompt=approval.get("what", ""),
+                    reason=approval.get("who", ""),
+                    is_high_risk=bool(approval.get("is_high_risk")),
+                    expires_at=exp_s,
+                )
+            except Exception:
+                row["mode"] = "send"
+                row["msg_type"] = "text"
         else:
             row["mode"] = "send"
         row.update(cfg["row"])
@@ -246,22 +282,31 @@ def notify(text, tag, approval=None, channels=None, item=None):
         if isinstance(scope, dict) and scope.get("channel") == ch and scope.get("chat_id"):
             if ch == "wecom":
                 row.update(chatid=scope["chat_id"], chat_type=2 if scope.get("chat_type") == "group" else 1)
+            elif ch == "feishu":
+                row.update(chat_id=scope["chat_id"], chat_type=scope.get("chat_type", "single"))
             else:
                 row["to_user_id"] = scope["chat_id"]
         path = cfg["outbox"]
         lease = None
         try:
-            lease = lease_from_env(ch, "legacy")
+            expected_mode = "legacy" if ch in ("weixin", "wecom") else None
+            try:
+                lease = lease_from_env(ch, expected_mode)
+            except KeyError:
+                lease = None
             if TEST:
                 path = os.path.join(BASE, "shadow", f"{ch}-outbox.jsonl")
                 os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "a", encoding="utf-8") as output:
-                fcntl.flock(output, fcntl.LOCK_EX)
-                output.write(json.dumps(row, ensure_ascii=False) + "\n")
-                output.flush()
-                os.fsync(output.fileno())
+            if event_id is not None:
+                append_health_notice_once(path, row)
+            else:
+                with open(path, "a", encoding="utf-8") as output:
+                    fcntl.flock(output, fcntl.LOCK_EX)
+                    output.write(json.dumps(row, ensure_ascii=False) + "\n")
+                    output.flush()
+                    os.fsync(output.fileno())
             queued = True
-        except (OSError, ModeError) as exc:
+        except (OSError, ValueError, ModeError) as exc:
             last_error = exc
             log("notify write disabled or failed", ch, type(exc).__name__)
         finally:
@@ -278,15 +323,18 @@ def _what_field(what, label):
     return ""
 
 
-def build_approval_card(num, who, what, expires_ms):
+def build_approval_card(num, who, what, expires_ms, is_high_risk=False):
     """Template card for one pending approval (WeCom only).
 
     Card real estate is small (sub_title_text <= 112 chars, horizontal
     values kept short), so the card carries the decision-critical
     facts — requester, target, explanation, reason, the start of the
     command, and the expiry. The full text stays available via /审批.
+    高危审批请求醒目标注 🚨 [高危审批]。
     """
     horiz = []
+    if is_high_risk:
+        horiz.append({"keyname": "风险", "value": "🚨 高危审批"})
     for label in ("目标", "说明", "原因"):
         value = _what_field(what, label)
         if value:
@@ -296,9 +344,10 @@ def build_approval_card(num, who, what, expires_ms):
     # Reserve room for the expiry: a long command must not push it
     # past the 112-char sub_title_text limit.
     sub = f"{cmd[:88]}｜{expiry}" if cmd else expiry
+    title = f"🚨 [高危审批] #{num}" if is_high_risk else f"待审批 #{num}"
     card = {
         "card_type": "button_interaction",
-        "main_title": {"title": f"待审批 #{num}"[:26],
+        "main_title": {"title": title[:26],
                        "desc": str(who or "")[:50]},
         "sub_title_text": sub[:112],
         "task_id": f"appr-{num}",
@@ -407,6 +456,9 @@ def find_group_primary(st, num, item):
             continue
         if other.get("status") != "pending" or other.get("grouped_with"):
             continue
+        # 安全分级防隐匿：高危审批不可折叠合并在非高危审批项之下
+        if bool(item.get("is_high_risk")) != bool(other.get("is_high_risk")):
+            continue
         if other.get("notified"):
             if not other.get("group_key"):
                 other["group_key"] = key
@@ -415,17 +467,20 @@ def find_group_primary(st, num, item):
 
 
 def approval_notice_text(num, item):
-    return (f"{item.get('who', '')}\n{item.get('what', '')}\n"
+    prefix = "🚨 [高危审批]\n" if (item.get("is_high_risk") or item.get("risk_level") == "high") else ""
+    return (f"{prefix}{item.get('who', '')}\n{item.get('what', '')}\n"
             f"过期：{fmt_hm(item.get('expires_ms'))}\n"
             f"a=仅这次  b=永久  c=拒绝\n"
             f"回 /a {num}｜/b {num}｜/c {num}")
 
 
 def send_approval_notice(num, item):
+    is_high_risk = bool(item.get("is_high_risk") or item.get("risk_level") == "high")
     notify(approval_notice_text(num, item), f"new{num}",
            approval={"num": num, "who": item.get("who", ""),
                      "what": item.get("what", ""),
-                     "expires_ms": item.get("expires_ms")},
+                     "expires_ms": item.get("expires_ms"),
+                     "is_high_risk": is_high_risk},
            item=item)
 
 
@@ -547,11 +602,16 @@ def connect():
     cookies = load_cookies(os.path.join(CONF, "cookies.txt"))
     with open(os.path.join(CONF, "vm_id.txt"), encoding="utf-8") as source:
         vm_id = source.read().strip()
+    if not isinstance(cookies, str) or not cookies.strip() or not vm_id:
+        raise ValueError("approval credentials are empty")
     return GW2(cookies=cookies, vm_id=vm_id)
 
 
-def poll_once(gw, st):
-    d = gw.call_json("egress.approvals", timeout=20)
+def poll_once(gw, st, response=None, policy_engine=None):
+    """Process approvals, optionally using a separately verified read response."""
+    if policy_engine is None:
+        policy_engine = get_default_policy_engine()
+    d = gw.call_json("egress.approvals", timeout=20) if response is None else response
     pending = d.get("pending_approvals") or d.get("pending") or []
     live_ids = set()
     for a in pending:
@@ -592,7 +652,7 @@ def poll_once(gw, st):
                    or group_key_from_what(item.get("what")))
             if key:
                 item["group_key"] = key
-        if not item["notified"]:
+        if not item["notified"] and item.get("status") == "pending":
             who, what = summarize(record)
             source = record
             if not has_content(who, what):
@@ -612,16 +672,83 @@ def poll_once(gw, st):
                 if not item.get("group_key"):
                     item["group_key"] = (group_key(source)
                                          or group_key_from_what(what))
-                # Matching text is not authorization to decide another ID.
-                primary = find_group_primary(st, num, item)
-                if primary is not None:
-                    item["grouped_with"] = primary
-                    item["notified"] = True
-                    log("grouped scoped pending", num, "->", primary)
+
+                # 安全策略分级评估
+                decision = policy_engine.evaluate(source, what=what)
+                item["risk_level"] = decision.risk_level
+                item["is_high_risk"] = decision.is_high_risk
+                item["policy_rule"] = decision.rule_name
+                item["policy_reason"] = decision.reason
+                item["decision_reason"] = decision.reason
+
+                if decision.action == PolicyAction.AUTO_ALLOW:
+                    # Level 0: 低危免密自动放行
+                    # 遵循 ApprovalStore 与 relay 事务机制：RPC 提交前先持久化 decision_unknown 状态，防止网络超时或进程中断重入
+                    item["status"] = "decision_unknown"
+                    item["decision_attempt"] = {
+                        "id": uuid.uuid4().hex,
+                        "decision": "allow_once",
+                        "operator_id": "policy_engine",
+                        "chat_id": "auto",
+                        "channel": "auto",
+                        "started_at": time.time(),
+                        "reason": decision.reason,
+                    }
+                    save_state(st)
+                    try:
+                        gw.call_json(
+                            "egress.approval.decide",
+                            path_params={"approval_id": aid},
+                            body={"decision": "allow_once"}, timeout=20)
+                        item["status"] = "auto_approved"
+                        item["decided_at"] = int(time.time())
+                        item["notified"] = True
+                        save_state(st)
+                        log("auto approved pending", num, aid[:12], decision.reason)
+                    except Exception as exc:
+                        item["status"] = "decision_unknown"
+                        item["notified"] = True
+                        save_state(st)
+                        log("auto allow decide failed", num, aid[:12], type(exc).__name__, str(exc))
+                elif decision.action == PolicyAction.AUTO_DENY:
+                    # Level 3: 命中黑名单自动拦截
+                    item["status"] = "decision_unknown"
+                    item["decision_attempt"] = {
+                        "id": uuid.uuid4().hex,
+                        "decision": "deny",
+                        "operator_id": "policy_engine",
+                        "chat_id": "auto",
+                        "channel": "auto",
+                        "started_at": time.time(),
+                        "reason": decision.reason,
+                    }
+                    save_state(st)
+                    try:
+                        gw.call_json(
+                            "egress.approval.decide",
+                            path_params={"approval_id": aid},
+                            body={"decision": "deny"}, timeout=20)
+                        item["status"] = "auto_denied"
+                        item["decided_at"] = int(time.time())
+                        item["notified"] = True
+                        save_state(st)
+                        log("security alert: auto denied pending", num, aid[:12], decision.reason)
+                    except Exception as exc:
+                        item["status"] = "decision_unknown"
+                        item["notified"] = True
+                        save_state(st)
+                        log("auto deny decide failed", num, aid[:12], type(exc).__name__, str(exc))
                 else:
-                    send_approval_notice(num, item)
-                    item["notified"] = True
-                    log("notified pending", num, aid[:12], who)
+                    # Level 1 / Level 2: 需要手机人工审批 (普通审批或高危强审)
+                    primary = find_group_primary(st, num, item)
+                    if primary is not None:
+                        item["grouped_with"] = primary
+                        item["notified"] = True
+                        log("grouped scoped pending", num, "->", primary)
+                    else:
+                        send_approval_notice(num, item)
+                        item["notified"] = True
+                        log("notified pending", num, aid[:12], who)
             else:
                 # Hold the notification: an empty one would ask the
                 # user to approve blind. The item stays pending and
@@ -663,7 +790,8 @@ def consume_decisions(gw, st):
     with exclusive_file_lock(Path(DECISIONS_F).with_name("decisions.lock")):
         durable = load_state()
         for number, previous in durable["items"].items():
-            if previous.get("status") == "decision_unknown" or str(previous.get("status", "")).startswith("decided:"):
+            if (previous.get("status") in ("decision_unknown", "auto_approved", "auto_denied")
+                    or str(previous.get("status", "")).startswith("decided:")):
                 st["items"][number] = previous
         try:
             with open(OFFSET_F, encoding="utf-8") as source:
@@ -692,16 +820,21 @@ def consume_decisions(gw, st):
                 log("invalid decision shape retained at offset", new_off)
                 break
             channel = str(row.get("channel", "")).removesuffix("-card")
-            if channel not in CHANNEL_ORDER:
-                log("approval decision rejected: unknown channel")
+            if channel not in SUPPORTED_DECISION_CHANNELS:
+                log("approval decision rejected: unknown channel", channel)
                 new_off = next_off
                 continue
             try:
-                lease = lease_from_env(channel, "legacy")
+                # weixin 与 wecom 为过渡渠道，当配置为 core 模式时由核心通道接管，legacy 决断消费按规范停用；
+                # feishu 为现代全功能渠道，Core 模式下由网关将决断登记至中转队列并由 relay 统一权威提交至 Muse 平台。
+                expected_mode = "legacy" if channel in ("weixin", "wecom") else None
+                lease = lease_from_env(channel, expected_mode)
                 with lease if lease is not None else nullcontext():
                     _consume_decision_row(gw, st, row)
             except ModeError:
                 log("legacy approval decision disabled for core channel", channel)
+            except KeyError:
+                _consume_decision_row(gw, st, row)
             new_off = next_off
         save_state(st)
         _atomic_text(OFFSET_F, str(new_off))
@@ -709,9 +842,17 @@ def consume_decisions(gw, st):
 
 def _consume_decision_row(gw, st, row):
     """Authorize and commit one decision while its legacy mode lease is held."""
-    num = str(row.get("num", ""))
+    num = str(row.get("num", "")).strip()
     decision = row.get("decision")
     item = st["items"].get(num)
+    if item is None:
+        # 兼容按 approval_id 反查 item
+        target_aid = str(row.get("approval_id") or num).strip()
+        for k, it in st["items"].items():
+            if it.get("approval_id") == target_aid:
+                num = k
+                item = it
+                break
     if item is None or not decision_allowed(item, row, time.time()):
         log("approval decision rejected: unauthorized, expired, or invalid", num)
         try:
@@ -724,9 +865,14 @@ def _consume_decision_row(gw, st, row):
         log("duplicate or uncertain decision ignored", num, item.get("status"))
         return
     item["status"] = "decision_unknown"
-    item["decision_attempt"] = {"id": uuid.uuid4().hex, "decision": decision,
-        "operator_id": row["operator_id"], "chat_id": row["chat_id"],
-        "channel": str(row["channel"]).removesuffix("-card"), "started_at": time.time()}
+    item["decision_attempt"] = {
+        "id": uuid.uuid4().hex,
+        "decision": decision,
+        "operator_id": str(row.get("operator_id") or ""),
+        "chat_id": str(row.get("chat_id") or ""),
+        "channel": str(row.get("channel", "")).removesuffix("-card"),
+        "started_at": time.time(),
+    }
     save_state(st)
     try:
         gw.call_json("egress.approval.decide", path_params={"approval_id": item["approval_id"]},
@@ -753,22 +899,141 @@ def cycle():
         _cycle_locked()
 
 
+def _credential_health(st):
+    """Load retry ownership, resetting the budget only when used files change."""
+    stamp = credential_fingerprint(CONF, ("cookies.txt", "vm_id.txt"))
+    health = st.setdefault("credential_health", {})
+    if not isinstance(health, dict):
+        raise ValueError("invalid approval credential health state")
+    if health.get("fingerprint") != stamp:
+        old_outage = bool(health.get("outage_active"))
+        last_verified = health.get("last_verified_at")
+        pending = health.get("pending_notices", [])
+        health.clear()
+        health.update(fingerprint=stamp, state="unknown", failures=0,
+                      reconnect_exhausted=False, next_attempt_at=0,
+                      last_verified_at=last_verified, outage_active=old_outage,
+                      pending_notices=pending, incident_id=uuid.uuid4().hex,
+                      failure_notice_created=False, failure_kind=None)
+        save_state(st)
+    return health
+
+
+def _health_notice(health, text, phase):
+    """Retain a stable event until an outbox accepts it, including after restart."""
+    health.setdefault("pending_notices", []).append({
+        "id": f"{health['incident_id']}-{phase}", "text": text,
+    })
+
+
+def _connection_failed(st, health, exc, now):
+    """Persist bounded retries without storing potentially sensitive exceptions."""
+    kind = failure_kind(exc)
+    if not health.get("outage_active"):
+        health["incident_id"] = uuid.uuid4().hex
+        health["failure_notice_created"] = False
+    count = int(health.get("failures", 0)) + 1
+    delay = AUTH_RETRY_SECS if kind in {"auth", "configuration"} else (5 if count == 1 else 10)
+    health.update(state="failed", failure_kind=kind, failures=count,
+                  reconnect_exhausted=count >= MAX_CONNECT_FAILURES,
+                  next_attempt_at=now + delay, outage_active=True)
+    if not health.get("failure_notice_created"):
+        if kind == "auth":
+            text = ("审批监听认证失败，当前无法读取或提交审批。请在已登录 Muse 的浏览器安装凭证扩展，"
+                    "重新导出完整 muse-credentials.zip 文件交给 Muse 安装并验活；只更新 token 无法恢复审批监听。"
+                    "重试有次数上限，之后等待 Cookie 或 VM 凭证文件更新。")
+        elif kind == "configuration":
+            text = ("审批监听凭证文件缺失或格式无效。请把浏览器扩展导出的完整 muse-credentials.zip "
+                    "文件交给 Muse 核对并安装；只更新 token 无法恢复审批监听。重试有次数上限。")
+        else:
+            text = ("审批监听连接异常，尚不能确认是凭证问题。将有限重试，连续失败 3 次后暂停；"
+                    "请让 Muse 检查网络、依赖和连接状态，排除问题后通过受控运维方式恢复。")
+        _health_notice(health, text, "failed")
+        health["failure_notice_created"] = True
+    save_state(st)
+
+
+def _connection_verified(st, health, now):
+    """Record a real approval-list RPC independently of later local processing."""
+    if health.get("outage_active"):
+        _health_notice(health, "审批监听认证和审批列表读取已恢复；聊天收发仍需实际消息验证。", "recovered")
+    health.update(state="healthy", failure_kind=None, failures=0,
+                  reconnect_exhausted=False, next_attempt_at=0,
+                  last_verified_at=now, outage_active=False)
+    save_state(st)
+
+
+def _flush_health_notices(st, health):
+    """Retry outbox writes separately from transport health and keep stable ids."""
+    notices = health.setdefault("pending_notices", [])
+    while notices:
+        event = notices[0]
+        save_state(st)
+        try:
+            notify(event["text"], "credential", event_id=event["id"])
+        except Exception as exc:
+            log("credential health notice not queued", type(exc).__name__)
+            return
+        notices.pop(0)
+        save_state(st)
+
+
+def _health_status(health):
+    """Expose verification evidence, never credential values or exception text."""
+    state = health.get("state")
+    missing = any(not Path(CONF, name).is_file() for name in ("cookies.txt", "vm_id.txt"))
+    status = ("healthy" if state == "healthy" else
+              "missing" if missing else "failed" if state == "failed" else "unknown")
+    return {"status": status, "failure_kind": health.get("failure_kind"),
+            "failures": health.get("failures", 0),
+            "reconnect_exhausted": health.get("reconnect_exhausted", False),
+            "next_attempt_at": health.get("next_attempt_at", 0),
+            "last_verified_at": health.get("last_verified_at")}
+
+
 def _cycle_locked():
     """Run one cycle while holding the relay process lock."""
     st = load_state()
+    health = _credential_health(st)
     gw = None
+    n, err = -1, None
+    now = time.time()
     try:
-        gw = connect()
-        n = poll_once(gw, st)
-        consume_decisions(gw, st)
-        err = None
-    except Exception as e:
-        n, err = -1, f"{type(e).__name__}: {str(e)[:150]}"
-        log("cycle error", err)
+        if not health.get("reconnect_exhausted") and now >= health.get("next_attempt_at", 0):
+            try:
+                gw = connect()
+                response = gw.call_json("egress.approvals", timeout=20)
+                if not isinstance(response, dict):
+                    raise ValueError("invalid approval-list response")
+                if response.get("error") or response.get("ok") is False:
+                    raise RuntimeError("approval-list request was rejected")
+            except Exception as exc:
+                _connection_failed(st, health, exc, now)
+                err = f"approval connection failed ({health['failure_kind']})"
+            else:
+                _connection_verified(st, health, now)
+                try:
+                    n = poll_once(gw, st, response=response)
+                    consume_decisions(gw, st)
+                except Exception as exc:
+                    err = f"approval processing failed ({type(exc).__name__})"
+        elif health.get("state") == "failed":
+            err = f"approval connection paused ({health.get('failure_kind', 'unknown')})"
     finally:
         if gw is not None:
-            gw.close()
-    _atomic_text(STATUS_F, json.dumps({"ts": int(time.time()), "pending": n, "last_error": err}))
+            try:
+                gw.close()
+            except Exception as exc:
+                log("gateway close failed", type(exc).__name__)
+    _flush_health_notices(st, health)
+    if err:
+        log("cycle error", err)
+    _atomic_text(STATUS_F, json.dumps({
+        "ts": int(time.time()), "pending": n, "last_error": err,
+        "credential_sources": {"cookies": _health_status(health)},
+        "active_source": "cookies" if health.get("state") == "healthy" else None,
+        "last_verified_at": health.get("last_verified_at"),
+    }))
 
 
 def main():

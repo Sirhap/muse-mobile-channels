@@ -1,0 +1,123 @@
+// Device credential files: load and save the Gadget pairing files.
+// Source: wong2/muse-client src/credentials.ts (Apache-2.0), kept
+// whole: every function here is token-file handling. File formats
+// match the original gadget SDK / macOS experiment so credentials
+// produced by `muse-client pair` (or an earlier pairing) load here
+// unchanged, and vice versa.
+//
+// Layout of a credentials directory (0600 files, 0700 directory):
+//   pairing.json   access_token, refresh_token, token_type: 'device',
+//                  api_url_v2, noise_host, access_token_saved_at,
+//                  sdk_token_hint (first 12 chars of the SDK token)
+//   identity.json  { mac: "aa:bb:cc:dd:ee:ff" }  (device identity)
+//   sdk_token      the SDK token text (optional; read at pairing time)
+//
+// Never log token values. The helpers below only read/write files.
+
+import { readFile, mkdir, open, rename, unlink, chmod } from 'node:fs/promises';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { object, requiredString } from './account.js';
+import type { DeviceCredentials } from './account.js';
+
+export function defaultCredentialsDirectory(): string {
+  return process.platform === 'darwin'
+    ? join(homedir(), 'Library', 'Application Support', 'MuseGadgetPair')
+    : '/var/lib/musegadget';
+}
+
+/** Remove local pairing credentials, keeping the device identity and SDK token.
+ * Returns false if no pairing exists. Does not revoke the device on Muse.
+ */
+export async function unpair(directory = defaultCredentialsDirectory()): Promise<boolean> {
+  const lockPath = join(directory, 'pair.lock');
+  let lock;
+  try {
+    lock = await open(lockPath, 'wx', 0o600);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT') return false;
+    if (code === 'EEXIST') throw new Error('Pairing is in progress or the directory is locked. Stop pairing before running unpair.');
+    throw error;
+  }
+  try {
+    await lock.writeFile(String(process.pid));
+    try {
+      await unlink(join(directory, 'pairing.json'));
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+      throw error;
+    }
+  } finally {
+    await lock.close();
+    await unlink(lockPath);
+  }
+}
+
+/** Reads the pairing files from the original gadget SDK / macOS experiment. */
+export async function loadCredentials(directory = defaultCredentialsDirectory()): Promise<DeviceCredentials> {
+  const [pairing, identity] = await Promise.all([
+    readFile(join(directory, 'pairing.json'), 'utf8').then((s) => object(JSON.parse(s))),
+    readFile(join(directory, 'identity.json'), 'utf8').then((s) => object(JSON.parse(s))),
+  ]);
+  const mac = requiredString(identity.mac, 'paired identity MAC');
+  if (!/^[0-9a-f]{2}(:[0-9a-f]{2}){5}$/.test(mac)) throw new Error('Invalid paired identity MAC');
+  let sdkToken: string | undefined;
+  try {
+    sdkToken = (await readFile(join(directory, 'sdk_token'), 'utf8')).trim() || undefined;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  return {
+    accessToken: requiredString(pairing.access_token, 'device access token'),
+    refreshToken: requiredString(pairing.refresh_token, 'device refresh token'),
+    deviceId: `homelink-${mac.replaceAll(':', '').slice(-6)}`,
+    sdkToken,
+    sdkTokenHint: typeof pairing.sdk_token_hint === 'string' && pairing.sdk_token_hint.length === 12
+      ? pairing.sdk_token_hint : undefined,
+    apiUrl: typeof pairing.api_url_v2 === 'string' ? pairing.api_url_v2 || undefined : undefined,
+    noiseHost: typeof pairing.noise_host === 'string' ? pairing.noise_host || undefined : undefined,
+    savedAt: typeof pairing.access_token_saved_at === 'number' ? pairing.access_token_saved_at : undefined,
+  };
+}
+
+/** Atomically updates the original pairing file; never logs tokens. */
+export async function saveCredentials(credentials: DeviceCredentials, directory = defaultCredentialsDirectory()): Promise<void> {
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  // mkdir only applies the mode when it creates the directory; tighten
+  // a pre-existing directory explicitly so a loose one is corrected
+  // rather than silently accepted.
+  await chmod(directory, 0o700);
+  const path = join(directory, 'pairing.json');
+  let previous: Record<string, unknown> = {};
+  try {
+    previous = object(JSON.parse(await readFile(path, 'utf8')));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  const data = {
+    ...previous,
+    access_token: credentials.accessToken,
+    refresh_token: credentials.refreshToken,
+    ...(credentials.sdkTokenHint !== undefined ? { sdk_token_hint: credentials.sdkTokenHint } : {}),
+    token_type: 'device',
+    api_url_v2: credentials.apiUrl ?? '',
+    noise_host: credentials.noiseHost ?? '',
+    access_token_saved_at: credentials.savedAt ?? Math.floor(Date.now() / 1000),
+  };
+  const temporary = `${path}.${randomUUID()}.tmp`;
+  try {
+    const file = await open(temporary, 'wx', 0o600);
+    try {
+      await file.writeFile(JSON.stringify(data, null, 2));
+      await file.sync();
+    } finally {
+      await file.close();
+    }
+    await rename(temporary, path);
+  } finally {
+    await unlink(temporary).catch(() => {});
+  }
+}

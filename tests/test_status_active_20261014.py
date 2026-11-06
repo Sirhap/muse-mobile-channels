@@ -42,6 +42,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+# fmt_event 须从参考 SDK 取：把参考 muse-cli 源码放进 sys.path，
+# 这样按文件头写的裸命令也能跑，不依赖外部 PYTHONPATH。
+_muse_cli_src = ROOT / "reference" / "muse-cli" / "src"
+if _muse_cli_src.is_dir() and str(_muse_cli_src) not in sys.path:
+    sys.path.insert(0, str(_muse_cli_src))
 SBX = Path("/tmp/status-active-sbx")
 shutil.rmtree(SBX, ignore_errors=True)
 SBX.mkdir(parents=True)
@@ -74,6 +79,9 @@ def iso(ts):
 # Bridge half
 # ------------------------------------------------------------------
 nb = load_module("native_bridge_active", "native-bridge/native_bridge.py")
+# 2026-11-05 CFG脚手架修复：11月1日重构后CFG不再随导入加载，
+# 须显式加载生产配置再深拷贝覆盖沙箱路径；断言一律未动。
+nb.load_config()
 nb.CFG = copy.deepcopy(nb.CFG)
 for _ch in ("weixin", "wecom", "test"):
     if _ch in nb.CFG["channels"]:

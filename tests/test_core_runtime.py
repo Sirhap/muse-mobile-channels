@@ -199,40 +199,122 @@ class RuntimeTests(unittest.TestCase):
         client._open.assert_called_once()
         self.assertEqual(self.store.snapshot()['outbound'], {})
 
-    def test_muse_correlated_run_completes_only_its_own_result(self):
-        """A dedicated session does not excuse accepting unrelated assistant output."""
-        self.receive()
+    def _scripted_client(self, session_ids=('dedicated-session',), seed=(), record=True):
+        """Fake gateway with real correlation semantics (no run ids anywhere).
+
+        ``session.start`` hands out ids in order, ``_open`` returns an int
+        stream id like the real gateway and -- when ``record`` is true --
+        records the sent message in the session's history, and ``chat.history``
+        returns the shared event list. Tests append assistant events to the
+        returned state to simulate Muse replying. History is shared across
+        sessions here; the server's per-session scoping is not under test.
+        """
+        state = {'events': [dict(e) for e in seed],
+                 'seq': max((e.get('seq', 0) for e in seed), default=0),
+                 'sessions': list(session_ids)}
         client = Mock()
-        client.call_json.return_value = {'session_id': 'dedicated-session'}
-        client._open.return_value = {'run_id': 'verified-run'}
+
+        def call_json(method, body=None, **kwargs):
+            if method == 'session.start':
+                sid = state['sessions'][0]
+                if len(state['sessions']) > 1:
+                    state['sessions'].pop(0)
+                return {'session_id': sid}
+            return {'chat_events': [dict(e) for e in state['events']]}
+
+        def _open(*args, **kwargs):
+            body = kwargs.get('body', {}) or {}
+            items = body.get('items') or []
+            if record:
+                state['seq'] += 1
+                state['events'].append({
+                    'event_name': 'message.user', 'seq': state['seq'],
+                    'payload': {'content': items[0].get('text', '') if items else ''}})
+            return 7
+
+        client.call_json.side_effect = call_json
+        client._open.side_effect = _open
+        client.close.return_value = None
+        return client, state
+
+    def _assistant(self, state, text, status='completed', reply_to=None):
+        """Append an assistant event to the scripted history."""
+        state['seq'] += 1
+        event = {'event_name': 'message.assistant', 'seq': state['seq'],
+                 'payload': {'status': status, 'display_text': text}}
+        if reply_to is not None:
+            event['reply_to_message_id'] = reply_to
+        state['events'].append(event)
+        return event
+
+    def test_muse_correlated_run_completes_only_its_own_result(self):
+        """Only the reply after the recorded baseline counts.
+
+        A stale completed reply from before this attempt's send (seq at the
+        baseline) is ignored. A completed reply after the baseline is
+        accepted even when it carries reply_to_message_id: a genuine turn
+        answer gets stamped with one whenever the turn was resumed by an
+        internal handoff, and the legacy bridge counts it
+        (native_bridge.is_turn_reply, 2026-10-07 20:47 live loss: seq
+        5222, status completed, never delivered). Session turns are
+        serialized server-side, so the first completed assistant message
+        after baseline is this turn's answer. The stream id is stored as
+        the run handle, with the baseline beside it.
+        """
+        self.receive()
+        stale = {'event_name': 'message.assistant', 'seq': 5,
+                 'payload': {'status': 'completed', 'display_text': 'stale'}}
+        client, state = self._scripted_client(seed=(stale,))
         adapter = MuseExecutor(self.store, client_factory=lambda: client)
         runner = CoreRunner(self.store, adapter, 'worker')
         self.assertEqual(runner.tick(), 'accepted')
-        client.call_json.return_value = {'chat_events': [
-            {'event_name': 'message.assistant', 'seq': 1, 'run_id': 'other',
-             'payload': {'status': 'completed', 'display_text': 'wrong'}},
-            {'event_name': 'message.assistant', 'seq': 2, 'run_id': 'verified-run',
-             'payload': {'status': 'completed', 'display_text': 'correct'}},
-        ]}
+        row = self.store.connection.execute(
+            'SELECT platform_run_id, baseline_seq FROM executor_runs').fetchone()
+        self.assertEqual((row['platform_run_id'], row['baseline_seq']), ('stream:7', 5))
+        self._assistant(state, 'resumed', reply_to='some-id')
         self.assertEqual(runner.tick(), 'succeeded')
-        self.assertEqual(self.store.connection.execute('SELECT text FROM outbound_messages').fetchone()[0], 'correct')
+        self.assertEqual(self.store.connection.execute('SELECT text FROM outbound_messages').fetchone()[0], 'resumed')
+
+    def test_muse_unrecorded_stream_stays_unknown(self):
+        """A stream the server never recorded never earns a trusted reply.
+
+        ``_open`` returned a stream id but no new history event ever appears,
+        so the submission stays unknown; a completed assistant message that
+        shows up later is still ignored because no binding was ever accepted.
+        """
+        self.receive()
+        client, state = self._scripted_client(record=False)
+        adapter = MuseExecutor(self.store, client_factory=lambda: client,
+                               confirm_timeout=0.05, poll_interval=0.01)
+        runner = CoreRunner(self.store, adapter, 'worker')
+        self.assertEqual(runner.tick(), 'unknown')
+        self._assistant(state, 'late')
+        self.assertEqual(runner.tick(), 'unknown')
+        self.assertEqual(self.store.snapshot()['outbound'], {})
+
+    def test_muse_cancel_confirms_through_history(self):
+        """Cancel reaches the platform and the terminal event ends the task."""
+        task = self.receive()
+        client, state = self._scripted_client()
+        adapter = MuseExecutor(self.store, client_factory=lambda: client)
+        runner = CoreRunner(self.store, adapter, 'worker')
+        self.assertEqual(runner.tick(), 'accepted')
+        self.store.request_cancel(task.task_id, task.conversation_id)
+        self._assistant(state, '', status='cancelled')
+        self.assertEqual(runner.tick(), 'cancelled')
+        self.assertEqual(self.store.task(task.task_id)['state'], 'cancelled')
 
     def test_new_generation_uses_a_new_muse_session(self):
         """/new changes context without overwriting older task/session bindings."""
         first = self.receive()
-        client = Mock()
-        client.call_json.return_value = {'session_id': 'old-session'}
-        client._open.return_value = {'run_id': 'old-run'}
+        client, state = self._scripted_client(session_ids=('old-session', 'new-session'))
         adapter = MuseExecutor(self.store, client_factory=lambda: client)
         runner = CoreRunner(self.store, adapter, 'worker')
-        runner.tick()
-        client.call_json.return_value = {'chat_events': [{'event_name': 'message.assistant', 'run_id': 'old-run',
-                                                         'payload': {'status': 'completed', 'display_text': 'done'}}]}
-        runner.tick()
+        self.assertEqual(runner.tick(), 'accepted')
+        self._assistant(state, 'done')
+        self.assertEqual(runner.tick(), 'succeeded')
         self.store.new_generation(first.conversation_id)
         self.receive('m2')
-        client.call_json.return_value = {'session_id': 'new-session'}
-        client._open.return_value = {'run_id': 'new-run'}
         self.assertEqual(runner.tick(), 'accepted')
         bindings = self.store.connection.execute('SELECT generation,session_id FROM executor_sessions ORDER BY generation').fetchall()
         self.assertEqual([tuple(row) for row in bindings], [(0, 'old-session'), (1, 'new-session')])

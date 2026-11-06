@@ -140,6 +140,13 @@ class ReconcileTests(unittest.TestCase):
         _write_json(wecom / "worker_platform_status.json", {
             "c1": _verdict("shutdown", NOW - 5),
         })
+        _write_json(weixin / "worker_activity.json", {
+            mid: {"ts": NOW - 2000, "run_id": RUN} for mid in (
+                "m_fresh_30", "m_fresh_120", "m_fresh_450", "m_stale_600",
+                "m_stale_1800", "m_missing", "m_future", "m_running_fresh",
+                "m_running_update_stale", "m_running_checked_stale", "m_unknown", "m_other")
+        })
+        _write_json(wecom / "worker_activity.json", {"c1": {"ts": NOW - 2000, "run_id": RUN}})
         report = self.reconcile()
         self.assertEqual(report["verdict_file_count"], 2)
         self.assertEqual(report["verdict_record_count"], 14)
@@ -225,6 +232,10 @@ class ReconcileTests(unittest.TestCase):
 
     def test_terminal_then_formal_reply_is_false_positive(self) -> None:
         channel = self.hooks / "weixin-bot"
+        _write_json(channel / "worker_activity.json", {
+            mid: {"ts": NOW - 2000, "run_id": RUN}
+            for mid in ("m1", "m_before", "m_equal", "m_update")
+        })
         _write_json(channel / "worker_platform_status.json", {
             "m1": _verdict("shutdown", NOW - 50),
             "m_before": _verdict("completed", NOW - 10),
@@ -265,6 +276,28 @@ class ReconcileTests(unittest.TestCase):
         )
         self.assertTrue(info["platform_terminal"])
         self.assertIn("m1", report["channels"][0]["usable_terminal_msgids"])
+
+    def test_unbound_verdicts_remain_raw_observations_not_terminal_proof(self) -> None:
+        """Census facts are retained while an unbound snapshot cannot drive recovery."""
+        channel = self.hooks / "weixin-bot"
+        _write_json(channel / "worker_platform_status.json", {
+            "unregistered": _verdict("shutdown", NOW - 5),
+            "missing_run": _verdict("completed", NOW - 5, run_id=None),
+            "mismatched": _verdict("errored", NOW - 5, run_id=OTHER_RUN),
+        })
+        _write_json(channel / "worker_activity.json", {
+            "missing_run": {"run_id": RUN, "ts": NOW - 2000},
+            "mismatched": {"run_id": RUN, "ts": NOW - 2000},
+        })
+        report = self.reconcile()
+        self.assertEqual(report["verdict_record_count"], 3)
+        self.assertEqual(report["terminal_status_counts"]["shutdown"], 1)
+        self.assertEqual(report["terminal_status_counts"]["completed"], 1)
+        self.assertEqual(report["terminal_status_counts"]["errored"], 1)
+        self.assertEqual(report["usable_terminal_count"], 0)
+        self.assertEqual(tool._verdict_label(_verdict("shutdown", NOW - 5), None, NOW), "unbound")
+        self.assertEqual(tool._verdict_label(_verdict("shutdown", NOW - 5, run_id=None), RUN, NOW), "unbound")
+        self.assertEqual(tool._verdict_label(_verdict("shutdown", NOW - 5, run_id=OTHER_RUN), RUN, NOW), "run_mismatch")
 
     def test_parked_formal_reply_after_verdict_is_false_positive(self) -> None:
         channel = self.hooks / "weixin-bot"

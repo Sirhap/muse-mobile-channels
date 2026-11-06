@@ -31,8 +31,9 @@ iLink, WeCom via the official smart-robot long connection.
 - `wecom-bot/` — 企业微信智能机器人网关（长连接 WebSocket）：网关本体、
   命令行工具，systemd 单元 `wecom-bot.service`。
 - `native-bridge/` — 原生桥：把网关收到的消息送进 Muse 会话；桥的
-  cookie / token 凭证可自动续期，失效时的恢复办法见
-  `native-bridge/get-muse-token.md`。
+  Cookie 会话仍有效时可重新换取连接 token，静态 token 不会自行续期。
+  失效恢复见 [凭证恢复说明](native-bridge/get-muse-token.md)，
+  分来源验活与真实收发见 [Muse 实测清单](docs/bridge-credential-health-muse-cases.md)。
 - `channel-restore/` — 双网关自愈：定时重装被冲掉的 systemd 单元并
   拉起服务，自带存活探针与心跳清单（`HEARTBEAT.md`）。
 - `cloudflare-tunnel-plugin/` — Cloudflare 隧道插件：给 Muse 一个
@@ -77,6 +78,52 @@ iLink, WeCom via the official smart-robot long connection.
 
 实现进展、模式配置、权限变化和恢复命令见 [核心接入与切换记录](docs/core-integration-and-cutover-2026-11-01.md)。其中列明尚未完成的真实平台及兼容验收条件。
 
+## 官方对齐合并与双轨执行（2026-11-06）
+
+2026-11-06 起，两路都按官方客户端的方式合并回复：执行中来的新消息并入正在跑的回合，合起来只回一句。这翻转了待办 31（当时为治漏答而关掉合并、改为逐条回复）。
+
+### 合并规则
+
+| 场景 | 行为 |
+|---|---|
+| 新消息到达时，正跑着的回合**还没开始回复** | 并入正在跑的回合，合起来只回一句，绑首条 msgid |
+| 新消息到达时，回复**已经开始**了 | 不能再并，排队等自己的回合 |
+| 被并掉的那条 | 微信走 `feedback_clear` 静默（写入失败时改发指针）；企微回指针“（已并入上一条处理）” |
+| 回复开始前就排队的第二条 | 随第一条一起走，不另起回合（见下） |
+
+关键点：**合并只看“回复开始了没有”**。回复一旦开始生成，哪怕还没发出来，后到的也只能排队。一个会话一次只能跑一个回合（官方 SDK 每 chat 一把等待锁），回复不标明回哪条消息，所以重叠的等待必须串行。
+
+- **老桥（微信／企微 legacy）**：开关是 `native-bridge/native_bridge.py` 的 `MERGE_CHANNELS = {"weixin", "test", "wecom"}`，改回 `set()` 即关掉合并、恢复严格 FIFO，不用改代码。实现是 `ChannelWorker._merge_into_active()`：新消息经同 `session_id` 新开 `chat.stream` 发进去，回合的 `ids` 追加该 msgid；收尾 `_silence_merged()` 处理被并的 msgid。`processed` 数的是**回合数**，不是 msgid 数。
+- **Core（企微 core 模式）**：`mobile_channels/storage.py` 的 `Store.foldable()`／`mark_merged()`；`runtime.py` 的 `CoreRunner.tick()` 开头先 `_try_fold()`；`executors.py` 给 `MuseExecutor` 和 `GadgetExecutor` 各实现 `reply_started()` 与 `fold()`（Native 经同会话发后续，Gadget 经只发不订阅的 worker 发后续）。`reply_started` 查不到时按“已开始”处理（绑定缺失或结果读不到时不折；Gadget 结果文件尚未写入时按“未开始”，因 worker 刚起、还没发消息），迟到的消息留着走自己的回合，宁可多回一句也不漏答。
+- **排队折叠**：排队的第一条开新回合时，剩下排队的当场并进这个还没回复的新回合，不再各走各的回合（2026-11-06 真微信实证后补的修补）。守卫：排队头就是刚起回合的那行本身时跳过（恢复行带 `nbytes=0` 不出队，重并会重消费已耗的恢复身份）。
+- **没接的东西**：入站 2 秒静默合并器有意没接，跑着的回合折叠已覆盖连发场景，再接它只会给每条消息加 2 秒延迟。
+
+### 双轨：主轨 Gadget，备轨 Native
+
+`mobile_channels/executors.py` 的 `DualTrackExecutor`（`mobile_channels/__main__.py` 里建成，服务描述即 `DualTrackExecutor: Gadget primary, Native fallback`）。
+
+| 轨道 | 执行器 | 底层 | 角色 |
+|---|---|---|---|
+| 主轨 | `GadgetExecutor` | Gadget 配对凭证（`~/.config/MuseGadgetPair/`），真 Noise 协议，一回合一进程 | 优先用。Gadget 令牌发**主会话**会被服务端 500，只走专用**侧会话**；侧会话与主会话共享上下文，不是隔离的 |
+| 备轨 | `MuseExecutor` | Cookie 桥（同老桥的 cookies／token 两条腿） | 兜底。主轨失败、没配凭证或熔断时自动降级 |
+
+降级规则：主轨没配凭证或熔断器不允许执行 → 直接走备轨；主轨提交回 `not_submitted`（且不是“已取消”）→ 记一次失败，走备轨；主轨提交回 `failed`／`unknown` 且执行器绑定里没有 `platform_run_id`（消息没落盘）→ 走备轨；主轨抛异常 → 记失败，走备轨。执行中失败时（query 回 `failed` 且结果无 `message_id`）走备轨并 `rebind_run` 把 attempt 的 run_id 换成 native run（行标 `failed_superseded`），**有 `message_id` 时绝不重发**。熔断：失败 3 次＋30 秒冷却，半开。
+
+认证两条腿（备轨／老桥共用）：`connect()` 先试 cookies 再回退 token.json，各以 `sessions.list` 探活（除非设了 `NATIVE_TOKEN_JSON`，此时只用 token）。cookie 死不等于桥死；token 自续要靠有效 cookie，cookie 死后 token 只能撑到它自己到期；两条腿同死时只有 Gadget（独立凭证）或人工换凭证能救。
+
+领 Gadget token 用扩展 `extensions/gadget-token/`（只保留了 wong2/muse-client 里能拿 token 的代码：刷新、凭证读写、SDK token 校验；不含聊天、Noise、蓝牙配对协议）。浏览器开 `https://gadgets.muse.ai/settings/sdk-tokens` 拿 SDK token，配对须在 Mac 上做一次（蓝牙），之后 `bun extensions/gadget-token/cli.ts refresh --credentials ~/.config/MuseGadgetPair` 可在任何机器上轮换 token。用法见该扩展的 README。
+
+### 验证：怎么算“过了”
+
+只看 `connected` 或单测通过不算。部署验证必须含一回合真实入站：msgid 非空＋spool／divert 记录＋正式回复 `ok=true`。当前结果：老桥合并单测 73/73、core 折叠单测 17/17、核心回归 43/43 套、模拟器 24/24、恢复集成 8/8；Gadget 折叠沙箱 live PASS（A 回“收到，第二条已收到”）；真微信合并 live PASS（“快点一张图片”并入“生成一张图片给我”，只回一张图）。跑测试／验活用 `~/muse-test-venv/bin/python`＋`PYTHONPATH=.`（系统 python3 缺 curl_cffi）。
+
+### 已知缺口
+
+- 上述改动在本地分支 `fix/bridge-connect-import-order`（提交 84d2fc4、9149b34），未推 origin、未合 main。
+- core 折叠只在沙箱验过 live，真企微生产折叠还没发生过；老桥合并已在真微信验过。
+- core 已知缺口：只收文本、媒体回未启用、审批卡片未接通。审批已全量自动放行（黑名单默认空，命中才拦截）。
+- 侧会话共享上下文：并行验证会互相污染回复文本，验活以 `merged`／`run_rebound` 等机制证据为准。
+
 ## 凭证（不进仓库）
 
 审批决策现要求显式会话/操作者授权；无来源范围时，需外部配置 `APPROVAL_ADMINS_JSON`，例如 `{"wecom":{"实际聊天ID":["管理员ID"]}}`。没有授权映射会拒绝决策，普通消息白名单不自动授予审批权。配置应保存在仓库外。
@@ -108,7 +155,7 @@ systemd 单元。
 
 - `hooks/scripts/weixin-inbox.sh`、`hooks/scripts/wecom-inbox.sh` — 轮询
   网关收件箱、把消息攒批，并监管正在干活的 worker：排队、抢占、防饿死、
-  丢消息对账，以及由 worker 内部心跳支撑的失败即停。唤醒载荷在
+  丢消息对账，以及依据真实活动与平台执行状态的任务监管。唤醒载荷在
   30000 字符预算内带同会话历史（最近回合用原文、更早的用摘要）。
   两个渠道的历史互相隔离。
 - `hooks/definitions/weixin-inbox.json`、`hooks/definitions/wecom-inbox.json`
@@ -125,7 +172,13 @@ systemd 单元。
 
 冷通道死亡监视（收件钩子里的 `DEATH_WATCH_SECS=1800`）在恢复或取消
 一个沉默批次之前，会先核查桥和 worker 的真实活动：有新鲜信号就按住
-批次不处理；探针缺失或读不到不算活着。演练方案见
+批次不处理；探针缺失或读不到只能说明状态未知，不能据此续跑或取消。
+无可靠终态时记录 `worker_review.json` 并提醒接手，保留原任务且不阻挡新消息。
+只有当前登记的 `run_id` 对应新鲜平台终态，才走一次自动续跑及后续停止流程。
+worker 的每次 beat、hold、handoff 都应带本次 `--run-id`；同一 run 的
+心跳续期不替代真实活动。处理说明与 Muse 实测见
+[任务待核查修复说明](docs/task-interruption-review-2026-11-04.md)。
+演练方案见
 `docs/cold-death-drill-2026-10-09.md`。`ops/cold_death_drill.py` 只能
 在沙箱里跑。企微在线二次判定植入点是
 `ops/cold_death_live_second_judgment.py`；只有 `DEATH_WATCH_LIVE_PLANT=1`

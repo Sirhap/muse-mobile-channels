@@ -20,6 +20,12 @@ from .models import Claim, InboundMessage, IngestResult, OwnershipError, StateEr
 SCHEMA_VERSION = 1
 ACTIVE = ("claimed", "running", "reconciling")
 TERMINAL = ("succeeded", "failed", "cancelled")
+# Bound reply for a message folded into a running turn (official-client
+# steering, matching native-bridge MERGE_POINTER_TEXT): the merged
+# msgid gets this short pointer instead of its own full reply, so the
+# gateway's think stream finishes in place and the user sees the
+# message was absorbed into the running turn's combined answer.
+MERGE_POINTER_TEXT = "（已并入上一条处理）"
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
     version INTEGER PRIMARY KEY, applied_at REAL NOT NULL
@@ -367,6 +373,104 @@ class Store:
                 (run_id, claim.attempt_id),
             )
             self._event(claim.task_id, "submitted")
+
+    def rebind_run(self, claim: Claim, run_id: str) -> None:
+        """Replace the bound run after a query-time track fallback.
+
+        The previous run is proven dead (its message never reached the
+        session) and the fallback executor has already bound this attempt
+        to the new run in executor_runs. This syncs the attempt's run_id
+        to that binding so the runner's next query polls the live run.
+        It is an explicit, audited rebind, not a silent overwrite: the
+        task must be running/reconciling and the new run must match the
+        current executor binding. (Proven live 2026-11-06: returning the
+        fallback submit's 'accepted' outcome from query crashed the
+        runner, because mark_submitted only accepts a run while the task
+        is 'reconciling'.)
+        """
+        if not run_id:
+            raise ValueError("run_id must be nonempty")
+        with self._transaction():
+            row = self._owned(claim)
+            if row["state"] not in ("running", "reconciling"):
+                raise StateError("run can only be rebound for a running task")
+            binding = self.connection.execute(
+                "SELECT platform_run_id FROM executor_runs WHERE attempt_id=?",
+                (claim.attempt_id,),
+            ).fetchone()
+            if binding is None or binding["platform_run_id"] != run_id:
+                raise StateError("rebind run must match the current executor binding")
+            self.connection.execute(
+                "UPDATE execution_attempts SET run_id=? WHERE id=?",
+                (run_id, claim.attempt_id),
+            )
+            self._event(claim.task_id, "run_rebound")
+
+    def foldable(self, owner: str) -> dict | None:
+        """Find a queued task that can fold into a running turn owned by ``owner``.
+
+        Returns {'running': <running task row>, 'queued': <queued task row>,
+        'queued_text': str, 'run_id': str|None} for the oldest queued task
+        whose conversation has a live turn (state 'running' or
+        'reconciling', i.e. submitted with a bound run/session) owned by
+        this runner, or None when no such pair exists. The caller must
+        still ask the executor whether that turn's reply has started;
+        folding is only safe while it has not.
+        """
+        row = self.connection.execute(
+            "SELECT q.id AS qid, q.message_id AS qmsg, q.conversation_id AS conv, "
+            "r.id AS rid, r.attempt_id AS rattempt, r.owner AS rowner "
+            "FROM tasks q JOIN tasks r ON r.conversation_id=q.conversation_id "
+            "WHERE q.state='queued' AND r.state IN ('running','reconciling') "
+            "AND r.owner=? AND r.sequence<q.sequence "
+            "ORDER BY q.sequence LIMIT 1",
+            (owner,),
+        ).fetchone()
+        if row is None:
+            return None
+        running = self.connection.execute(
+            "SELECT * FROM tasks WHERE id=?", (row["rid"],)).fetchone()
+        queued = self.connection.execute(
+            "SELECT * FROM tasks WHERE id=?", (row["qid"],)).fetchone()
+        qtext = self.connection.execute(
+            "SELECT text FROM inbound_messages WHERE id=?",
+            (row["qmsg"],)).fetchone()
+        run_id = self.connection.execute(
+            "SELECT run_id FROM execution_attempts WHERE id=?",
+            (row["rattempt"],)).fetchone()
+        return {
+            "running": dict(running),
+            "queued": dict(queued),
+            "queued_text": qtext["text"] if qtext else "",
+            "run_id": run_id["run_id"] if run_id else None,
+        }
+
+    def mark_merged(self, queued_task_id: str, running_task_id: str) -> str:
+        """Complete a queued task as merged into a running turn.
+
+        The queued task must still be 'queued' and unclaimed, and the
+        running task must still be active; otherwise nothing is changed
+        and a StateError is raised (the caller must re-check). The merged
+        task is completed with the pointer text as its result, so the
+        delivery path sends the short pointer reply bound to the merged
+        msgid instead of a full answer. The fold itself (sending the text
+        to the live session) must already have succeeded before this is
+        called; this only records the outcome.
+        """
+        with self._transaction():
+            row = self.connection.execute(
+                "SELECT * FROM tasks WHERE id=?", (queued_task_id,)).fetchone()
+            if row is None:
+                raise KeyError(queued_task_id)
+            if row["state"] != "queued" or row["attempt_id"] is not None:
+                raise StateError("only an unclaimed queued task can be merged")
+            running = self.connection.execute(
+                "SELECT * FROM tasks WHERE id=?", (running_task_id,)).fetchone()
+            if running is None or running["state"] not in ("running", "reconciling"):
+                raise StateError("merge target is no longer a live turn")
+            outbound_id = self._complete_result(row, MERGE_POINTER_TEXT, "merged")
+            self._event(queued_task_id, "merged_into", running_task_id)
+            return outbound_id
 
     def _complete_result(self, row: sqlite3.Row, text: str, event: str) -> str:
         """Save a result, bound outbox and audit within the caller's transaction."""

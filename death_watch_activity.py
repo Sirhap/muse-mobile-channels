@@ -1,7 +1,8 @@
 """Read-only real-activity probe for the cold-channel death watch.
 
-The inbox hooks decide resume-once and cancel from outbound silence.
-This module is the check they run first. It does not write state, does
+The inbox hooks investigate outbound silence and require evidence that the
+current execution ended before automatic replay or cancellation. This module
+is the check they run first. It does not write state, does
 not call Muse, and does not read ``heartbeats/<msgid>`` mtime.
 
 Sources, in order:
@@ -31,14 +32,16 @@ Sources, in order:
    ``{msgid: {"run_id": ..., "status": ..., "agent_updated_at":
    epoch, "checked_at": epoch}}``. A terminal status (completed /
    shutdown / errored / interrupted) whose ``checked_at`` is fresh
-   is returned as ``platform_terminal`` evidence -- positive proof
+   and whose nonempty run_id equals the current registration is returned as
+   ``platform_terminal`` evidence -- positive proof
    the worker's platform session has ended. It is NOT an alive
    signal and never sets ``alive`` by itself; the hook only acts on
    it in conjunction with worker-push silence and no delivered
    reply. ``status == "running"`` with a fresh ``agent_updated_at``
    counts as alive (source ``platform-running``), the weakest
-   signal. A verdict whose run_id disagrees with the registered
-   run_id is ignored (a newer wake re-registered the msgid). A
+   signal. Both sources require a nonempty current registration and matching
+   nonempty verdict run_id. A missing binding or mismatched run is ignored
+   (a newer wake may have re-registered the msgid). A
    stale ``checked_at``, an unknown status, or a missing/corrupt
    file is no signal, exactly like the other sources.
 4. A worker handoff record in the same ``worker_activity.json``
@@ -49,8 +52,8 @@ Sources, in order:
    this silence on purpose by transferring the batch to the
    main session, so it must not be resumed or fail-stopped.
    A handoff is bounded, not forever: after 24h it expires and
-   the normal death route resumes, so a main session that never
-   acts cannot hide a batch indefinitely. A handoff is not a
+   the hook investigates again; an unknown execution needs review instead of
+   being treated as confirmed dead. A handoff is not a
    formal reply -- the worker must still send one first (see the
    hook definitions' HANDOFF rule); it is only the safety net
    when that reply has not yet landed when the hook polls.
@@ -60,8 +63,9 @@ sources.
 
 Failure degradation: a missing file is no signal, not an error. A
 path that exists but cannot be parsed is no signal plus a degraded
-reason. No positive fresh signal means not alive, and the hook then
-uses the existing resume-once / cancel path. One unreadable source
+reason. No positive fresh signal means liveness is unverified, not that the
+execution is dead. Without a bound terminal observation the hook must retain
+the task for review rather than automatically replay or cancel it. One unreadable source
 does not hide a fresh signal from the other source.
 """
 
@@ -87,9 +91,8 @@ PLATFORM_TERMINAL_STATUSES = frozenset(
     {"completed", "shutdown", "errored", "interrupted"})
 
 # Source 4 (2026-10-29 handoff fix): a handoff marker is trusted
-# for one day. After that the batch returns to the normal death
-# route instead of being held forever by a main session that
-# never acted.
+# for one day. After that the hook rechecks execution evidence instead of
+# treating a main-session handoff as proof of unlimited ongoing activity.
 HANDOFF_MAX_AGE_SECS = 86400.0
 
 
@@ -239,27 +242,40 @@ def _platform_hit(verdicts: dict, msgid: str, now: float,
     verdict whose run_id disagrees with the registration is not
     usable at all: a newer wake may own this msgid now.
     """
-    out = {"terminal": False, "alive_ts": None, "status": None}
+    out = {"terminal": False, "alive_ts": None, "status": None,
+           "reason": "missing", "checked_at": None}
     raw = verdicts.get(msgid)
     if not isinstance(raw, dict):
         return out
     verdict_run = raw.get("run_id")
-    if (registered_run_id and isinstance(verdict_run, str)
-            and verdict_run and verdict_run != registered_run_id):
+    if (not isinstance(registered_run_id, str) or not registered_run_id.strip()
+            or not isinstance(verdict_run, str) or not verdict_run.strip()):
+        out["reason"] = "unbound"
+        return out
+    if verdict_run != registered_run_id:
+        out["reason"] = "run_mismatch"
         return out
     checked = epoch_of(raw.get("checked_at"))
+    out["checked_at"] = checked
     if not _fresh(checked, now, PLATFORM_VERDICT_MAX_AGE_SECS):
+        out["reason"] = "stale"
         return out
     status = str(raw.get("status") or "")
     if status in PLATFORM_TERMINAL_STATUSES:
         out["terminal"] = True
         out["status"] = status
+        out["reason"] = "verified"
         return out
     if status == "running":
         updated = epoch_of(raw.get("agent_updated_at"))
         if _fresh(updated, now, PLATFORM_RUNNING_FRESH_SECS):
             out["alive_ts"] = updated
             out["status"] = status
+            out["reason"] = "verified"
+        else:
+            out["reason"] = "running_stale"
+    else:
+        out["reason"] = "unknown"
     return out
 
 
@@ -304,13 +320,16 @@ def assess(msgid: str, *, now: float, window: float,
             if handoff_at is None:
                 handoff_at = epoch_of(record.get("ts"))
 
-    platform = {"terminal": False, "alive_ts": None, "status": None}
+    platform = {"terminal": False, "alive_ts": None, "status": None,
+                "reason": "missing", "checked_at": None}
     if isinstance(verdicts, dict):
         platform = _platform_hit(verdicts, msgid, now, registered_run)
 
     handoff_fresh = _fresh(handoff_at, now, HANDOFF_MAX_AGE_SECS)
     extra = {"platform_terminal": platform["terminal"],
              "platform_status": platform["status"],
+             "platform_verdict_reason": platform["reason"],
+             "platform_checked_at": platform["checked_at"],
              "worker_run_id": registered_run,
              "worker_hold_until": hold_until,
              "worker_handoff": handoff_fresh,

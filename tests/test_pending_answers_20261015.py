@@ -378,7 +378,12 @@ class HookLedgerTests(unittest.TestCase):
         env["HATCH_HOOK_RUNTIME"] = str(sbx / "runtime.sh")
         env["HATCH_HOOK_DRY_RUN"] = "0"
         env["PENDING_ANSWERS_PY"] = str(ROOT / "channel_common.py")
-        env["DEATH_WATCH_ACTIVITY_PY"] = str(sbx / "missing-probe.py")
+        # 2026-11-05: the death-watch probe runs for real (6066d03 rule:
+        # silence alone never resumes or fail-stops; only a fresh
+        # platform-terminal verdict bound to the registered run does).
+        # The bridge state is a sandbox path that does not exist, so no
+        # production signal leaks in.
+        env["DEATH_WATCH_ACTIVITY_PY"] = str(ROOT / "death_watch_activity.py")
         env["DEATH_WATCH_BRIDGE_STATE"] = str(sbx / "missing-bridge.json")
         env.pop("PENDING_ANSWERS_PATH", None)
         proc = subprocess.run(
@@ -397,11 +402,16 @@ class HookLedgerTests(unittest.TestCase):
         covered = hook_state / "covered_drops.jsonl"
         batch_path = hook_state / "active_batch.json"
         batch = json.loads(batch_path.read_text(encoding="utf-8")) if batch_path.exists() else {}
+        review_path = hook_state / "worker_review.json"
+        review = {}
+        if review_path.exists():
+            review = json.loads(review_path.read_text(encoding="utf-8")).get("tasks") or {}
         return {
             "log": (sbx / "cli.log").read_text(encoding="utf-8"),
             "ledger": ledger,
             "covered": covered,
             "batch": batch,
+            "review": review,
             "stdout": proc.stdout,
         }
 
@@ -459,6 +469,13 @@ class HookLedgerTests(unittest.TestCase):
                 self.assertNotIn("covered-follow", ledger[channel])
 
     def test_second_loss_records_fail_stop_and_first_loss_does_not(self) -> None:
+        # 6066d03 ("require verified worker termination before
+        # recovery"): silence alone never resumes or fail-stops.
+        # First loss only enters review; a fresh platform-terminal
+        # verdict bound to the registered run authorizes the one-time
+        # resume; fail-stop happens only when a REPLACEMENT run also
+        # terminates after a resume was already consumed for the
+        # earlier run.
         moment = time.time()
         for channel in ("weixin", "wecom"):
             with self.subTest(channel=channel, phase="fail-stop"):
@@ -473,8 +490,21 @@ class HookLedgerTests(unittest.TestCase):
                         "since": moment - 1900,
                         "detached": [],
                     }), encoding="utf-8")
+                    # A resume was already consumed for run-1 ...
+                    (hook_state / "recovery_attempts.json").write_text(json.dumps({
+                        "dead-1": {"source_run_id": "run-1", "attempted_at": moment - 60},
+                    }), encoding="utf-8")
                     (hook_state / "resume_attempts.json").write_text(
                         json.dumps({"dead-1": moment - 60}), encoding="utf-8")
+                    # ... and the replacement run-2 has now terminated (proven).
+                    (bot_state / "worker_activity.json").write_text(json.dumps({
+                        "dead-1": {"ts": moment - 1900, "source": "worker-register",
+                                   "run_id": "run-2"},
+                    }), encoding="utf-8")
+                    (bot_state / "worker_platform_status.json").write_text(json.dumps({
+                        "dead-1": {"run_id": "run-2", "status": "shutdown",
+                                   "checked_at": moment, "agent_updated_at": moment - 1900},
+                    }), encoding="utf-8")
 
                 result = self._run(channel, "fail", plant_stop)
                 self.assertIn("CALL: cancel --msgid dead-1", result["log"])
@@ -500,6 +530,35 @@ class HookLedgerTests(unittest.TestCase):
 
                 result = self._run(channel, "first", plant_first)
                 self.assertNotIn("CALL: cancel", result["log"])
+                self.assertNotIn("已自动续跑", result["log"])
+                self.assertFalse(result["ledger"].exists())
+                self.assertFalse(result["covered"].exists())
+                self.assertFalse(result["batch"].get("msgids"))
+                self.assertEqual(result["review"].get("live-1", {}).get("status"), "pending")
+
+            with self.subTest(channel=channel, phase="first-loss-verified"):
+                def plant_verified(bot_state: Path, hook_state: Path, moment=moment) -> None:
+                    _write_jsonl(bot_state / "inbox.jsonl", [
+                        _hook_entry(channel, "live-1", moment - 1900, "第一次丢失会续跑"),
+                    ])
+                    (hook_state / "seen_msgids.txt").write_text("live-1\n", encoding="utf-8")
+                    (hook_state / "carried_msgids.txt").write_text("live-1\n", encoding="utf-8")
+                    (hook_state / "active_batch.json").write_text(json.dumps({
+                        "msgids": ["live-1"],
+                        "since": moment - 1900,
+                        "detached": [],
+                    }), encoding="utf-8")
+                    (bot_state / "worker_activity.json").write_text(json.dumps({
+                        "live-1": {"ts": moment - 1900, "source": "worker-register",
+                                   "run_id": "run-1"},
+                    }), encoding="utf-8")
+                    (bot_state / "worker_platform_status.json").write_text(json.dumps({
+                        "live-1": {"run_id": "run-1", "status": "shutdown",
+                                   "checked_at": moment, "agent_updated_at": moment - 1900},
+                    }), encoding="utf-8")
+
+                result = self._run(channel, "first-verified", plant_verified)
+                self.assertNotIn("CALL: cancel", result["log"])
                 self.assertIn("已自动续跑", result["log"])
                 self.assertFalse(result["ledger"].exists())
                 self.assertFalse(result["covered"].exists())
@@ -513,6 +572,11 @@ class HookLedgerTests(unittest.TestCase):
                 "    raise RuntimeError('ledger down')\n",
                 encoding="utf-8",
             )
+            # 2026-11-05 (6066d03): the hook also loads worker_supervision
+            # from the SAME directory as the pending-answers module. The
+            # ledger failure is simulated only in record_pending_answers,
+            # so the real review module must sit next to the broken file.
+            shutil.copy(ROOT / "worker_supervision.py", Path(tmp) / "worker_supervision.py")
             sbx = Path(tmp) / "sbx"
             # Reuse the runner, but point the module at the broken file
             # by patching the environment inside a local copy of the call.
@@ -580,7 +644,16 @@ class HookLedgerTests(unittest.TestCase):
 
 
 def _load_bridge(base: Path):
-    """Exec native_bridge with BASE and imports pointed at the sandbox."""
+    """Exec native_bridge with BASE and imports pointed at the sandbox.
+
+    2026-11-05: BASE is now read from NATIVE_BRIDGE_HOME at import
+    time (11-01 refactor); the old source-text replacement of the
+    BASE literal no longer matches, so without the env var every
+    fallback row landed in the PRODUCTION shadow dir. The stub
+    sys.path replacement is likewise dead (gw2 now loads via
+    MUSE_CLI_SRC / the reference tree); the stub package is kept
+    only so the exec environment still has a muse_cli to import.
+    """
     stub = base / "pydeps"
     package = stub / "muse_cli"
     package.mkdir(parents=True, exist_ok=True)
@@ -596,17 +669,8 @@ def _load_bridge(base: Path):
     )
     (stub / "gw2.py").write_text("class GW2:\n    pass\n", encoding="utf-8")
     os.environ["PENDING_BRIDGE_STUB"] = str(stub)
+    os.environ["NATIVE_BRIDGE_HOME"] = str(base)
     source = (ROOT / "native-bridge" / "native_bridge.py").read_text(encoding="utf-8")
-    source = source.replace(
-        'BASE = "/home/hatch/workspace/native-bridge"',
-        f"BASE = {str(base)!r}",
-        1,
-    )
-    source = source.replace(
-        'sys.path.insert(0, "/home/hatch/workspace/native-probe")',
-        "sys.path.insert(0, os.environ['PENDING_BRIDGE_STUB'])",
-        1,
-    )
     module = types.ModuleType("native_bridge_pending")
     module.__dict__["__file__"] = str(ROOT / "native-bridge" / "native_bridge.py")
     exec(compile(source, module.__dict__["__file__"], "exec"), module.__dict__)
@@ -623,7 +687,9 @@ class BridgeFallbackTests(unittest.TestCase):
         self.ledger = Path(self.tmp.name) / "pending_answers.json"
         self._old_path = os.environ.get("PENDING_ANSWERS_PATH")
         os.environ["PENDING_ANSWERS_PATH"] = str(self.ledger)
+        self._old_home = os.environ.get("NATIVE_BRIDGE_HOME")
         self.nb = _load_bridge(self.base)
+        self.nb.load_config()
         self.assertIsNotNone(self.nb._CHANNEL_COMMON)
 
     def tearDown(self) -> None:
@@ -631,6 +697,10 @@ class BridgeFallbackTests(unittest.TestCase):
             os.environ.pop("PENDING_ANSWERS_PATH", None)
         else:
             os.environ["PENDING_ANSWERS_PATH"] = self._old_path
+        if self._old_home is None:
+            os.environ.pop("NATIVE_BRIDGE_HOME", None)
+        else:
+            os.environ["NATIVE_BRIDGE_HOME"] = self._old_home
         self.tmp.cleanup()
 
     def test_weixin_and_wecom_fallbacks_share_the_ledger(self) -> None:
@@ -648,20 +718,31 @@ class BridgeFallbackTests(unittest.TestCase):
             "weixin", {"msgid": "wx-fb", "text": "微信桥回退的问题"}, "connect refused")
         self.nb.fallback_to_inbox(
             "wecom", {"msgid": "wc-fb", "text": "企微桥回退的问题"}, "no session")
-        inbox = [
+        wx_inbox = [
             json.loads(line)
             for line in (wx / "inbox.jsonl").read_text(encoding="utf-8").splitlines()
         ]
-        self.assertEqual(len(inbox), 2)
-        self.assertEqual(inbox[0]["via"], "native-bridge-fallback")
-        self.assertEqual(inbox[0]["fallback_why"], "connect refused")
+        wc_inbox = [
+            json.loads(line)
+            for line in (wc / "inbox.jsonl").read_text(encoding="utf-8").splitlines()
+        ]
+        # The two channels SHARE the ledger, not an inbox file: each
+        # fallback lands in its own live bot_state inbox. The duplicate
+        # wx-fb call is deduped by _append_inbox_once, so each inbox
+        # holds exactly one row.
+        self.assertEqual(len(wx_inbox), 1)
+        self.assertEqual(len(wc_inbox), 1)
+        self.assertEqual(wx_inbox[0]["via"], "native-bridge-fallback")
+        self.assertEqual(wx_inbox[0]["fallback_why"], "connect refused")
+        self.assertEqual(wc_inbox[0]["via"], "native-bridge-fallback")
+        self.assertEqual(wc_inbox[0]["fallback_why"], "no session")
         fallback_log = (wx / "bridge_fallback.jsonl").read_text(encoding="utf-8")
         self.assertIn("wx-fb", fallback_log)
         data = json.loads(self.ledger.read_text(encoding="utf-8"))
         self.assertEqual(set(data["weixin"]), {"wx-fb"})
         self.assertEqual(data["weixin"]["wx-fb"]["source"], "bridge-fallback")
         self.assertEqual(data["weixin"]["wx-fb"]["summary"], "微信桥回退的问题")
-        self.assertEqual(data["weixin"]["wx-fb"]["ts"], inbox[0]["ts"])
+        self.assertEqual(data["weixin"]["wx-fb"]["ts"], wx_inbox[0]["ts"])
         self.assertEqual(data["wecom"]["wc-fb"]["source"], "bridge-fallback")
         self.assertEqual(data["wecom"]["wc-fb"]["summary"], "企微桥回退的问题")
         self.assertTrue((wc / "bridge_fallback.jsonl").exists())

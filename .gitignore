@@ -13,10 +13,17 @@
 !/.github/ISSUE_TEMPLATE/*.md
 !/weixin-bot/
 !/wecom-bot/
+!/feishu-bot/
+!/feishu-bot/*
 !/channel-restore/
 !/mobile_channels/
+# Extensions: self-contained add-ons (e.g. extensions/gadget-token/).
+# Whole directory is tracked; keep secrets out of it.
+!/extensions/
 !/pyproject.toml
 !/channel_common.py
+!/credential_health.py
+!/worker_supervision.py
 !/inbound_media.py
 !/death_watch_activity.py
 !/hooks/
@@ -89,6 +96,12 @@ reply-*.txt
 login-qr.png
 credentials.env
 .env
+# Gadget device credential filenames, at any depth (e.g. inside the
+# whitelisted extensions/ tree): never commit a pairing.
+pairing.json
+identity.json
+sdk_token
+pair.lock
 
 # Upstream reference clones (not our code)
 wecom-bot/reference/

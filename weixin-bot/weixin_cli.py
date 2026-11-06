@@ -26,6 +26,8 @@ from channel_common import (  # noqa: E402
     safe_child_name,
     subagent_outcome_default,
     update_worker_activity,
+    worker_activity_registration,
+    worker_activity_owner,
 )
 
 BASE = Path(__file__).resolve().parent
@@ -170,6 +172,37 @@ def tail_jsonl(path: Path, n: int) -> list[dict]:
     return out
 
 
+def _start_heartbeat(msgids: list[str]) -> None:
+    """Restart the detached loop only while current worker ownership is locked."""
+    hb_dir = STATE / "heartbeats"
+    hb_dir.mkdir(parents=True, exist_ok=True)
+    for m in msgids:
+        try:
+            (hb_dir / f"{m}.stop").write_text(str(time.time()), encoding="utf-8")
+        except OSError:
+            pass
+    deadline = time.time() + 3
+    while time.time() < deadline:
+        alive = False
+        for m in msgids:
+            pid = read_pid_file(hb_dir / f"{m}.pid") or 0
+            if pid_alive(pid):
+                alive = True
+        if not alive:
+            break
+        time.sleep(0.1)
+    for m in msgids:
+        try:
+            (hb_dir / f"{m}.stop").unlink()
+        except OSError:
+            pass
+    subprocess.Popen(
+        [sys.executable, str(BASE / "heartbeat.py"),
+         str(STATE), str(HOOK_STATE), ",".join(msgids)],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL, start_new_session=True)
+
+
 def main() -> int:
     """Run a legacy command only while the channel remains in legacy mode."""
     from mobile_channels.modes import lease_from_env, ModeError
@@ -234,6 +267,8 @@ def main() -> int:
     phs = sub.add_parser("heartbeat-stop")
     phs.add_argument("--msgids", required=True,
                      help="comma-separated msgids whose heartbeat should stop")
+    phs.add_argument("--run-id", dest="run_id",
+                     help="owning run id, required after an execution takeover")
 
     pwa = sub.add_parser("worker-activity",
                          help="write the worker's own activity ledger "
@@ -350,10 +385,8 @@ def main() -> int:
                 rows = []
         print(json.dumps(rows, ensure_ascii=False))
     elif args.cmd == "heartbeat-start":
-        # Spawn the detached heartbeat loop for this batch (see
-        # heartbeat.py). While it runs, the inbox hook counts the
-        # batch as alive even if the worker sends no progress: death
-        # is judged by heartbeat + outbox, not by silence alone.
+        # The detached loop is only transport feedback. Registration and
+        # renewal do not replace real worker progress or declared holds.
         msgids = [m.strip() for m in args.msgids.split(",") if m.strip()]
         if not msgids:
             print("no msgids given", file=sys.stderr)
@@ -361,44 +394,14 @@ def main() -> int:
         if any(safe_child_name(m) is None for m in msgids):
             print("refusing msgid that is not a single path segment", file=sys.stderr)
             return 2
-        hb_dir = STATE / "heartbeats"
-        hb_dir.mkdir(parents=True, exist_ok=True)
-        for m in msgids:
-            try:
-                (hb_dir / f"{m}.stop").write_text(str(time.time()), encoding="utf-8")
-            except OSError:
-                pass
-        deadline = time.time() + 3
-        while time.time() < deadline:
-            alive = False
-            for m in msgids:
-                pid = read_pid_file(hb_dir / f"{m}.pid") or 0
-                if pid_alive(pid):
-                    alive = True
-            if not alive:
-                break
-            time.sleep(0.1)
-        for m in msgids:
-            try:
-                (hb_dir / f"{m}.stop").unlink()
-            except OSError:
-                pass
-        subprocess.Popen(
-            [sys.executable, str(BASE / "heartbeat.py"),
-             str(STATE), str(HOOK_STATE), ",".join(msgids)],
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL, start_new_session=True)
-        if args.run_id:
-            # Self-registration rides the batch-start command (todo
-            # 21): the ledger is what lets the death watch ask the
-            # platform about THIS worker. Fail-soft -- a registration
-            # error must never break the proven heartbeat path.
-            try:
-                register_worker_activity(
-                    WORKER_ACTIVITY, msgids, args.run_id, time.time())
-            except Exception as e:
-                print(f"warning: worker registration failed ({e})",
-                      file=sys.stderr)
+        try:
+            with worker_activity_registration(
+                    WORKER_ACTIVITY, msgids, args.run_id, time.time()):
+                _start_heartbeat(msgids)
+        except Exception as error:
+            print(f"heartbeat registration/start failed ({type(error).__name__})",
+                  file=sys.stderr)
+            return 1
         print(json.dumps({"heartbeat_started": msgids}, ensure_ascii=False))
     elif args.cmd == "worker-activity":
         if safe_child_name(args.msgid) is None:
@@ -424,7 +427,7 @@ def main() -> int:
                 rec = update_worker_activity(
                     WORKER_ACTIVITY, args.msgid, time.time(),
                     progress=args.progress, hold_secs=args.hold_secs,
-                    handoff=True if args.handoff else None)
+                    handoff=True if args.handoff else None, run_id=args.run_id)
         except Exception as e:
             print(f"worker-activity write failed ({e})", file=sys.stderr)
             return 1
@@ -435,13 +438,18 @@ def main() -> int:
         if any(safe_child_name(m) is None for m in msgids):
             print("refusing msgid that is not a single path segment", file=sys.stderr)
             return 2
-        hb_dir = STATE / "heartbeats"
-        hb_dir.mkdir(parents=True, exist_ok=True)
-        for m in msgids:
-            try:
-                (hb_dir / f"{m}.stop").write_text(str(time.time()), encoding="utf-8")
-            except OSError:
-                pass
+        if not msgids:
+            print("no msgids given", file=sys.stderr)
+            return 2
+        try:
+            with worker_activity_owner(WORKER_ACTIVITY, msgids, args.run_id):
+                hb_dir = STATE / "heartbeats"
+                hb_dir.mkdir(parents=True, exist_ok=True)
+                for msgid in msgids:
+                    (hb_dir / f"{msgid}.stop").write_text(str(time.time()), encoding="utf-8")
+        except Exception as error:
+            print(f"heartbeat stop failed ({type(error).__name__})", file=sys.stderr)
+            return 1
         print(json.dumps({"heartbeat_stopped": msgids}, ensure_ascii=False))
     elif args.cmd == "status":
         if STATUS.exists():

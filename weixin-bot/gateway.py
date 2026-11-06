@@ -469,7 +469,7 @@ def _spool_texts(channel):
         return {}
 
 
-def _task_overview_text(channel, state_dir, hook_state_dir):
+def _task_overview_text(channel, state_dir, hook_state_dir, *, review_ids=None):
     """Unified task board appended to /status: every in-flight or queued
     task across the native bridge, the cold hook path and subagent jobs,
     plus bridge lifetime counters. A read failure is one explicit line,
@@ -560,6 +560,9 @@ def _task_overview_text(channel, state_dir, hook_state_dir):
             qparts.append(f"冷通道 {pcount} 条")
         if qparts:
             lines.append("⏳ 排队：" + "、".join(qparts))
+        review_ids = _worker_review_ids(hook_state_dir) if review_ids is None else review_ids
+        if review_ids:
+            lines.append(f"⚠ 待核查：{len(review_ids)} 条，原执行状态未确认，等待核查接手")
         jobs = _read_json_file(hook_state_dir / "subagent_jobs.json", {}) or {}
         jmap = jobs.get("jobs", {}) if isinstance(jobs, dict) else {}
         running = sum(1 for j in jmap.values()
@@ -703,18 +706,82 @@ def _bridge_admin(channel, action, msgids):
         {"action": action, "msgids": list(msgids), "ts": time.time()})
 
 
+def _worker_review_ids(hook_state_dir):
+    """Read pending review IDs without inferring activity or cancellation rights."""
+    document = _read_json_file(hook_state_dir / "worker_review.json", {}) or {}
+    tasks = document.get("tasks") if isinstance(document, dict) else None
+    if not isinstance(tasks, dict):
+        return []
+    return [str(mid) for mid, record in tasks.items()
+            if isinstance(record, dict) and record.get("status") == "pending"]
+
+
+def _scoped_worker_review_ids(state_dir, hook_state_dir, channel, operator_id,
+                              chat_id, chat_type):
+    """Authorize review operations from the original inbox sender and route.
+
+    A ledger entry is not routing evidence. Missing input or conflicting source
+    identities fail closed; another member of the same group cannot stop it.
+    """
+    pending = set(_worker_review_ids(hook_state_dir))
+    if not pending or not operator_id or not chat_id or chat_type not in {"single", "group"}:
+        return []
+    identities = {}
+    try:
+        with open(state_dir / "inbox.jsonl", encoding="utf-8") as source:
+            for line in source:
+                try:
+                    row = json.loads(line)
+                except (ValueError, TypeError):
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                mid = str(row.get("msgid") or "")
+                if mid not in pending:
+                    continue
+                if channel == "weixin":
+                    sender = row.get("from_user_id")
+                    group = row.get("group_id") or ""
+                    route = group or sender
+                    kind = "group" if group else "single"
+                elif channel == "wecom":
+                    sender = row.get("from_userid")
+                    route = row.get("chatid")
+                    kind = row.get("chattype")
+                else:
+                    return []
+                identity = (sender, route, kind)
+                if not all(isinstance(value, str) and value for value in identity):
+                    identities.setdefault(mid, set()).add((None, None, None))
+                else:
+                    identities.setdefault(mid, set()).add(identity)
+    except (OSError, UnicodeError):
+        return []
+    expected = (str(operator_id), str(chat_id), chat_type)
+    return [mid for mid in sorted(pending) if identities.get(mid) == {expected}]
+
+
 def _queue_summary(hook_state_dir):
     """(batch, running_ids, pending_count, detached_count) read from the
     hook state files; tolerant of missing/corrupt files."""
     batch = _read_json_file(hook_state_dir / "active_batch.json", {}) or {}
     if not isinstance(batch, dict):
         batch = {}
+    review = set(_worker_review_ids(hook_state_dir))
+    if review:
+        # The review commit may precede removal from an old scheduler snapshot.
+        # Those stale copies cannot grant active-task cancellation authority.
+        batch = dict(batch)
+        batch["msgids"] = [m for m in (batch.get("msgids") or []) if str(m) not in review]
+        batch["detached"] = [dict(d, msgids=[m for m in (d.get("msgids") or []) if str(m) not in review])
+                             for d in (batch.get("detached") or []) if isinstance(d, dict)
+                             and any(str(m) not in review for m in (d.get("msgids") or []))]
     ids = [str(m) for m in (batch.get("msgids") or [])]
     detached = [d for d in (batch.get("detached") or []) if isinstance(d, dict)]
     for d in detached:
         ids += [str(m) for m in (d.get("msgids") or [])]
     pending = _read_json_file(hook_state_dir / "pending.json", {}) or {}
-    pcount = len(pending) if isinstance(pending, dict) else 0
+    pcount = sum(str(mid) not in review for mid in pending) if isinstance(pending, dict) else 0
     return batch, ids, pcount, len(detached)
 
 
@@ -896,10 +963,10 @@ SLASH_HELP_TEXT = """【命令表】在聊天里直接发，网关当场回复�
 单聊纯文字在分流开启时进原生桥，桥忙时按到达顺序排队；图片、文件、群聊，以及桥不可用时，走冷通道
 /ping 连通自检：网关当场回 pong 和当前状态，不唤醒任务
 /status 渠道状态 + 任务总览（谁在跑、谁在排队、副助手、累计）；桥状态读不到时会直说
-/queue 队列明细（冷通道和原生桥都列；两边都空才说空闲）
+/queue 队列明细（冷通道、原生桥及待核查记录；全部为空才说空闲）
 /queue clear 清掉排队中未开工的消息（桥和冷通道一起清，正在跑的不动）
 /queue drop N 只删冷通道排队第 N 条；/queue drop 桥N 或 bN 删原生桥排队第 N 条
-/stop 登记正在运行任务的取消请求（含后台续跑；未开工的排队不动）。助手在下一次进度检查时处理，原生桥在下一轮处理；登记成功不代表当前操作已经结束
+/stop 登记正在运行任务的取消请求（含后台续跑；未开工的排队不动）。助手在下一次进度检查时处理，原生桥在下一轮处理；登记成功不代表当前操作已经结束。待核查任务只允许原操作者在原会话登记取消，原执行是否结束仍需核查
 /subagent <任务> 登记副助手后台执行（别名 /副助手），名额满了会先排队；/subagent list 查、/subagent stop <编号> 停
 /new 记下换会话边界（别名 /新会话）：此刻不建新会话。下一条走原生桥的文字才会新建，这之前的对话不再带入
 /check 一次性自检，跑完即结束（别名 /自检）。原生桥要心跳新鲜且该渠道为 live 才算通过
@@ -941,7 +1008,7 @@ def slash_ping_text(chan_label, state_dir, hook_state_dir=None):
     return f"pong ✅ {chan_label}网关在线（状态 {state}，{err_part}）· {now_s} · 网关直接秒回，未唤醒任务"
 
 
-def slash_status_text(chan_label, state_dir, hook_state_dir):
+def slash_status_text(chan_label, state_dir, hook_state_dir, *, review_ids=None):
     st = _read_json_file(state_dir / "status.json", {}) or {}
     state = st.get("state") or "未知"
     conn = "已连接" if st.get("connected") else "未连接"
@@ -966,6 +1033,7 @@ def slash_status_text(chan_label, state_dir, hook_state_dir):
     # Display only: the count above is unchanged. Minutes are the
     # longest elapsed across those same actives, and are omitted
     # when none of them carries a usable timestamp (previously "?").
+    review_ids = _worker_review_ids(hook_state_dir) if review_ids is None else review_ids
     running_line = f"运行中任务：{running} 条"
     if running:
         elapsed = []
@@ -994,6 +1062,7 @@ def slash_status_text(chan_label, state_dir, hook_state_dir):
         f"📊 {chan_label}通道状态",
         f"网关：{state}（{conn}，{err_part}）· 最近入站 {_fmt_hm((last_in or {}).get('ts'))} · 最近出站 {_fmt_hm((last_out or {}).get('ts'))}",
         running_line,
+        *([f"待核查任务：{len(review_ids)} 条（原执行状态未确认）"] if review_ids else []),
         f"队列：排队 {pcount} 条 · 后台续跑 {dcount} 批",
         f"上次自检：{chk_part}",
     ]
@@ -1114,8 +1183,9 @@ def _pending_sorted(hook_state_dir):
     pending = _read_json_file(hook_state_dir / "pending.json", {}) or {}
     if not isinstance(pending, dict):
         return []
+    review = set(_worker_review_ids(hook_state_dir))
     items = [(str(k), float(v)) for k, v in pending.items()
-             if isinstance(v, (int, float))]
+             if isinstance(v, (int, float)) and str(k) not in review]
     items.sort(key=lambda kv: kv[1])
     return items
 
@@ -1139,7 +1209,7 @@ def _inbox_texts(state_dir):
     return texts
 
 
-def slash_queue_text(chan_label, state_dir, hook_state_dir):
+def slash_queue_text(chan_label, state_dir, hook_state_dir, *, review_ids=None):
     """Cold-channel lines for /queue.
 
     Empty cold state returns the idle sentence. ``slash_queue_report``
@@ -1152,9 +1222,12 @@ def slash_queue_text(chan_label, state_dir, hook_state_dir):
     active = [str(m) for m in (batch.get("msgids") or [])]
     detached = [d for d in (batch.get("detached") or []) if isinstance(d, dict)]
     pend = _pending_sorted(hook_state_dir)
-    if not active and not pend and not detached:
+    review_ids = _worker_review_ids(hook_state_dir) if review_ids is None else review_ids
+    if not active and not pend and not detached and not review_ids:
         return "队列空闲：没有正在处理或排队的任务。"
     lines = [f"【任务队列】{chan_label}"]
+    if review_ids:
+        lines.append(f"⚠ 待核查（{len(review_ids)}）：原执行状态未确认；可用 /stop 登记取消")
     if active:
         since = batch.get("since")
         age = _dur_str(now - float(since)) if isinstance(since, (int, float)) else "未知"
@@ -1175,13 +1248,13 @@ def slash_queue_text(chan_label, state_dir, hook_state_dir):
     return "\n".join(lines)
 
 
-def slash_queue_report(chan_label, state_dir, hook_state_dir, channel):
+def slash_queue_report(chan_label, state_dir, hook_state_dir, channel, *, review_ids=None):
     """Full /queue reply: cold detail plus native-bridge detail.
 
     「队列空闲」 is used only when both sides are empty. A cold idle
     must not introduce a bridge that still has work.
     """
-    cold = slash_queue_text(chan_label, state_dir, hook_state_dir)
+    cold = slash_queue_text(chan_label, state_dir, hook_state_dir, review_ids=review_ids)
     cold_idle = cold.startswith("队列空闲")
     summary, _ids = _bridge_queue_lines(channel)
     active_rows = _bridge_active_detail(channel)
@@ -1230,7 +1303,7 @@ def slash_register_cancels(msgids):
     return ok, fail
 
 
-def slash_stop_ack(cold_n, bridge_n, ok, fail):
+def slash_stop_ack(cold_n, bridge_n, ok, fail, review_n=0):
     """Receipt for /stop.
 
     ``cold_n`` and ``bridge_n`` are how many running messages were
@@ -1240,7 +1313,10 @@ def slash_stop_ack(cold_n, bridge_n, ok, fail):
     """
     if not ok:
         return f"取消没有登记上（{fail} 条失败），请稍后再试。"
-    parts = [f"已登记取消 {ok} 条正在跑的消息。"]
+    parts = [f"已登记取消 {ok} 条任务消息。" if review_n else
+             f"已登记取消 {ok} 条正在跑的消息。"]
+    if review_n:
+        parts.append(f"其中 {review_n} 条待核查，仅登记取消，原执行是否结束仍需确认。")
     if cold_n:
         parts.append("助手会在下一次进度检查时处理取消，并回复确认。")
     if bridge_n:
@@ -2395,27 +2471,35 @@ class Gateway:
             if parsed is None:
                 return None
             name, arg = parsed
+            review_ids = _scoped_worker_review_ids(
+                STATE, HOOK_STATE_DIR, "weixin", str(from_user),
+                str(msg.get("group_id") or from_user),
+                "group" if msg.get("group_id") else "single") if name in {"stop", "status", "queue"} else []
             ack = None
             if name == "ping":
                 ack = slash_ping_text(CHAN_LABEL, STATE, HOOK_STATE_DIR)
             elif name == "help":
                 ack = slash_help_text()
             elif name == "status":
-                ack = slash_status_text(CHAN_LABEL, STATE, HOOK_STATE_DIR)
-                ack += _task_overview_text("weixin", STATE, HOOK_STATE_DIR)
+                ack = slash_status_text(CHAN_LABEL, STATE, HOOK_STATE_DIR, review_ids=review_ids)
+                ack += _task_overview_text("weixin", STATE, HOOK_STATE_DIR, review_ids=review_ids)
             elif name == "check":
                 ack = slash_run_check(CHAN_LABEL, STATE, HOOK_STATE_DIR)
             elif name == "stop":
                 _b, cold_ids, _p, _d = _queue_summary(HOOK_STATE_DIR)
                 _btxt, bridge_ids = _bridge_queue_lines("weixin")
                 cold_ids = [i for i in cold_ids if i]
-                bridge_ids = [i for i in bridge_ids if i]
+                pending_review = set(_worker_review_ids(HOOK_STATE_DIR))
+                bridge_ids = [i for i in bridge_ids if i and str(i) not in pending_review]
                 ids = cold_ids + [i for i in bridge_ids if i not in cold_ids]
-                if not ids:
+                review_only = [mid for mid in review_ids if mid not in ids]
+                if not ids and not review_only:
                     ack = "当前没有正在跑的任务。"
                 else:
-                    ok, fail = await asyncio.to_thread(slash_register_cancels, ids)
-                    ack = slash_stop_ack(len(cold_ids), len(bridge_ids), ok, fail)
+                    ok, fail = await asyncio.to_thread(slash_register_cancels, ids) if ids else (0, 0)
+                    review_ok, review_fail = await asyncio.to_thread(slash_register_cancels, review_only) if review_only else (0, 0)
+                    ack = slash_stop_ack(len(cold_ids), len(bridge_ids),
+                                         ok + review_ok, fail + review_fail, review_n=review_ok)
             elif name == "new":
                 if _write_hook_json(HOOK_STATE_DIR, "topic_boundary.json",
                                     {"ts": time.time()}):
@@ -2426,7 +2510,7 @@ class Gateway:
                 qtokens = arg.split()
                 if not qtokens:
                     ack = slash_queue_report(
-                        CHAN_LABEL, STATE, HOOK_STATE_DIR, "weixin")
+                        CHAN_LABEL, STATE, HOOK_STATE_DIR, "weixin", review_ids=review_ids)
                 elif qtokens[0] == "clear":
                     pend = _pending_sorted(HOOK_STATE_DIR)
                     brows = _bridge_queued_rows("weixin")

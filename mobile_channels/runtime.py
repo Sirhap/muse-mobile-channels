@@ -1,13 +1,16 @@
 """Small execution and delivery loops with explicit external outcome semantics."""
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
 
 from .delivery import DeliveryClaim, DeliveryStore
-from .models import Claim, OwnershipError
+from .models import Claim, OwnershipError, StateError
 from .storage import Store
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -32,6 +35,12 @@ class ExecutionOutcome:
     run_id: str | None = None
     text: str | None = None
     evidence: str | None = None
+    # Platform message id when the attempt's message provably reached a
+    # session (set by GadgetExecutor from the worker result). DualTrack
+    # uses it to decide whether a failed primary may safely fall back:
+    # no message id means the send never completed, so a native retry
+    # cannot double-deliver.
+    message_id: str | None = None
 
 
 class Executor(Protocol):
@@ -47,6 +56,24 @@ class Executor(Protocol):
 
     def cancel(self, context: ExecutionContext, run_id: str | None) -> ExecutionOutcome:
         """Confirm actual cancellation or return unknown/running, not an assumed stop."""
+        ...
+
+    def reply_started(self, context: ExecutionContext, run_id: str | None) -> bool:
+        """True when the live turn's reply has started generating.
+
+        A fold is only safe while this is False. Implementations must
+        fail safe: when the answer cannot be determined, return True so
+        the caller does NOT fold.
+        """
+        ...
+
+    def fold(self, context: ExecutionContext, run_id: str | None, text: str) -> ExecutionOutcome:
+        """Send follow-up text into the live session (official-client steering).
+
+        Only called while reply_started is False. The outcome must be
+        'accepted' with evidence the text was recorded before the caller
+        marks the message merged; any other outcome leaves it queued.
+        """
         ...
 
 
@@ -92,6 +119,52 @@ class CoreRunner:
                     return claim
         return None
 
+    def _try_fold(self) -> str | None:
+        """Fold one queued message into a running turn (official-client steering).
+
+        When a message arrives while its conversation has a live turn whose
+        reply has not started yet, send the message's text into that
+        session and close the queued task out with the pointer reply, so
+        the running turn's single combined answer covers both. Returns
+        'folded' on success, None when there is nothing foldable, the
+        reply already started, or the fold send was not confirmed (the
+        queued task is left queued for its own turn in all those cases).
+        """
+        pair = self.store.foldable(self.owner)
+        if pair is None:
+            return None
+        running = pair["running"]
+        queued = pair["queued"]
+        claim = Claim(running["id"], running["conversation_id"], running["generation"],
+                      self.owner, running["attempt_id"], running["token"])
+        context = self._context(claim)
+        run_id = pair["run_id"]
+        try:
+            if self.executor.reply_started(context, run_id):
+                return None
+        except Exception:
+            return None
+        try:
+            outcome = self.executor.fold(context, run_id, pair["queued_text"])
+        except Exception:
+            return None
+        if not isinstance(outcome, ExecutionOutcome) or outcome.state != 'accepted':
+            return None
+        try:
+            self.store.mark_merged(queued["id"], running["id"])
+        except (StateError, KeyError):
+            # The fold text is already in the session, but the running
+            # turn closed between the send and the merge, so the queued
+            # task stays queued and its text will be sent again when it
+            # gets its own turn (duplicate send, not a loss). Log it so
+            # the duplicate is visible instead of silent.
+            LOGGER.warning(
+                "fold sent but merge refused: target %s closed; queued %s "
+                "stays queued and will send again",
+                running["id"], queued["id"])
+            return None
+        return 'folded'
+
     def _apply(self, claim: Claim, outcome: ExecutionOutcome) -> str:
         """Persist only outcomes backed by the adapter's explicit evidence."""
         if outcome.state == 'succeeded' and isinstance(outcome.text, str):
@@ -110,6 +183,9 @@ class CoreRunner:
 
     def tick(self) -> str:
         """Execute a new submission or poll one known attempt; never resubmit unknowns."""
+        folded = self._try_fold()
+        if folded is not None:
+            return folded
         claim = self.store.claim(self.owner, self.concurrency, self.lease_seconds)
         if claim is None:
             claim = self._active_claim()

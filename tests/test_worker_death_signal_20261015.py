@@ -78,11 +78,13 @@ class ProbePlatformTests(unittest.TestCase):
         self.assertEqual(info["worker_run_id"], RUN)
 
     def test_each_terminal_status_counts(self) -> None:
+        self.write_worker({"m1": {"ts": NOW - 2000, "run_id": RUN}})
         for status in ("completed", "shutdown", "errored", "interrupted"):
             self.write_verdict(self.verdict(status=status))
             self.assertTrue(self.assess()["platform_terminal"], status)
 
     def test_running_fresh_is_alive(self) -> None:
+        self.write_worker({"m1": {"ts": NOW - 2000, "run_id": RUN}})
         self.write_verdict(self.verdict(status="running",
                                          agent_updated_at=NOW - 30))
         info = self.assess()
@@ -91,6 +93,7 @@ class ProbePlatformTests(unittest.TestCase):
         self.assertFalse(info["platform_terminal"])
 
     def test_running_stale_update_is_no_signal(self) -> None:
+        self.write_worker({"m1": {"ts": NOW - 2000, "run_id": RUN}})
         self.write_verdict(self.verdict(status="running",
                                          agent_updated_at=NOW - 400))
         info = self.assess()
@@ -98,6 +101,7 @@ class ProbePlatformTests(unittest.TestCase):
         self.assertFalse(info["platform_terminal"])
 
     def test_stale_verdict_is_ignored(self) -> None:
+        self.write_worker({"m1": {"ts": NOW - 2000, "run_id": RUN}})
         self.write_verdict(self.verdict(checked_at=NOW - 601))
         info = self.assess()
         self.assertFalse(info["platform_terminal"])
@@ -122,13 +126,14 @@ class ProbePlatformTests(unittest.TestCase):
         info = self.assess()
         self.assertFalse(info["platform_terminal"])
 
-    def test_verdict_without_registration_still_counts(self) -> None:
-        # No worker record at all: the verdict is keyed by msgid and
-        # carries the run_id itself -- usable evidence.
+    def test_verdict_without_registration_is_unbound(self) -> None:
+        # A msgid alone cannot prove this verdict belongs to the current run.
         self.write_verdict(self.verdict())
-        self.assertTrue(self.assess()["platform_terminal"])
+        self.assertFalse(self.assess()["platform_terminal"])
+        self.assertEqual(self.assess()["platform_verdict_reason"], "unbound")
 
     def test_unknown_status_word_is_no_signal(self) -> None:
+        self.write_worker({"m1": {"ts": NOW - 2000, "run_id": RUN}})
         self.write_verdict(self.verdict(status="unknown"))
         info = self.assess()
         self.assertFalse(info["platform_terminal"])

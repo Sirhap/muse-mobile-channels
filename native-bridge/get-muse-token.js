@@ -2,9 +2,10 @@
 //
 // 用途
 //   桥（native_bridge.py）的凭证有两条路：cookies.txt + vm_id.txt（主力、
-//   可自动续期）和 token.json（回退）。服务端把 cookies 失效时（auth/check
-//   回 401 hatchAdmissionInvalidated、旧 token WSS 403），就靠这段脚本
-//   重新导出一份 token JSON 装回去，桥即可恢复（2026-10-14 实操过一次）。
+//   会话有效时可换连接 token）和 token.json（回退）。本脚本仅导出 token，
+//   无法读取 HttpOnly Cookie，不能恢复仅使用 Cookie 的 approval-relay。
+//   完整恢复请安装 muse-cred-extension，导出 muse-credentials.zip 交给 Muse。
+//   Cookie/token 均可能提前失效，平台未提供有效期时标为未知。
 //
 // 使用方法（详细版见同目录 get-muse-token.md）
 //   【执行人：用户本人。靠的是用户自己的浏览器登录态，Muse
@@ -18,9 +19,9 @@
 //          "issued_at": "...", "issued_at_local": "...", "exp": null }
 //   5. 把 JSON 存成文件交给 Muse，由 Muse 保存为
 //      ~/.config/native-bridge/token.json 并设权限 0600；
-//      若输出的 vm_id 与 ~/.config/native-bridge/vm_id.txt 里不同，
-//      一并把 vm_id.txt 更新为新值。桥靠 cred_stamp 变化自动感知新凭证，
-//      一般无需重启。
+//      先备份并核对预期 VM；VM 不一致时停止，不自动改 vm_id.txt。
+//      用同目录 check_credentials.py --source all --json 分路验活，
+//      然后记录真实入站 msgid、回复队列 ID 和投递 ok=true；文件更新不等于恢复。
 //
 // 安全须知
 //   输出里是等同登录凭证的真 token：不要贴进聊天、issue 或任何会同步/

@@ -31,7 +31,27 @@ def load_relay():
     return relay
 
 
+def require_approval_engine(relay):
+    """Stub policy engine returning REQUIRE_APPROVAL for every item.
+
+    The default engine auto-approves everything since the 2026-11-06
+    all-allow policy, so notification/grouping tests inject this stub to
+    exercise the notify path (the old behaviour for these records).
+    """
+    class _RequireApproval:
+        def evaluate(self, record, what=""):
+            return types.SimpleNamespace(
+                action=relay.PolicyAction.REQUIRE_APPROVAL,
+                risk_level=relay.RiskLevel.NORMAL,
+                is_high_risk=False,
+                rule_name="normal_approval",
+                reason="test stub: manual approval required",
+            )
+    return _RequireApproval()
+
+
 class ApprovalNotifyResilienceTests(unittest.TestCase):
+
     """缺失或故障的通道不能阻止健康通道，也不能伪造通知成功。"""
 
     def setUp(self):
@@ -120,12 +140,12 @@ class ApprovalNotifyResilienceTests(unittest.TestCase):
         }]}
         state = {"next_num": 1, "items": {}}
         with self.assertRaises(OSError):
-            self.relay.poll_once(gateway, state)
+            self.relay.poll_once(gateway, state, policy_engine=require_approval_engine(self.relay))
         self.assertFalse(state["items"]["1"]["notified"])
         (self.base / "wecom").mkdir()
-        self.relay.poll_once(gateway, state)
+        self.relay.poll_once(gateway, state, policy_engine=require_approval_engine(self.relay))
         self.assertTrue(state["items"]["1"]["notified"])
-        self.relay.poll_once(gateway, state)
+        self.relay.poll_once(gateway, state, policy_engine=require_approval_engine(self.relay))
         self.assertEqual(len(self.rows("wecom")), 1)
 
     def test_promoted_group_retries_after_storage_recovers(self):
@@ -140,10 +160,10 @@ class ApprovalNotifyResilienceTests(unittest.TestCase):
                   "grouped_with": "1", "who": "test", "what": "命令：echo child"},
         }}
         with self.assertRaises(OSError):
-            self.relay.poll_once(gateway, state)
+            self.relay.poll_once(gateway, state, policy_engine=require_approval_engine(self.relay))
         self.assertFalse(state["items"]["2"]["notified"])
         (self.base / "wecom").mkdir()
-        self.relay.poll_once(gateway, state)
+        self.relay.poll_once(gateway, state, policy_engine=require_approval_engine(self.relay))
         self.assertTrue(state["items"]["2"]["notified"])
         self.assertEqual(len(self.rows("wecom")), 1)
 

@@ -23,7 +23,9 @@
 
 如需手机审批，按 README 配置 approval-relay 和明确的会话、操作者授权；普通消息白名单不自动授予审批权限。先核实当前部署读取 APPROVAL_ADMINS_JSON 的服务环境以及实际会话/操作者 ID；不要猜或在聊天中打印这些值。无法核实时告诉我。
 
-完成后报告安装版本、所选服务及未完成项；让我在每个已启用渠道先发 /ping，再发一条普通问题。两者分别确认网关连通与正式回复。进一步测试参照 docs/muse-live-test-cases-2026-11-01.md；不要在未获同意时停止生产服务或修改在途状态。
+完成后报告安装版本、所选服务及未完成项；让我在每个已启用渠道先发 /ping，再发一条普通问题。两者分别确认网关连通与正式回复，记录入站 msgid、回复队列 ID 和对应 ok=true；只代表平台接收，不代表用户已读。进一步测试参照 docs/muse-live-test-cases-2026-11-01.md 和 docs/bridge-credential-health-muse-cases.md；不要在未获同意时停止生产服务或修改在途状态。
+
+最后引导我按 native-bridge/muse-cred-extension/README.md 安装浏览器扩展，登录 muse.ai，在目标 VM 导出 muse-credentials.zip，以安全文件形式交给 Muse。先确认 Cookie、VM 和 token 均成功，再备份、核对 VM 并安装为目录 0700/文件 0600。运行 native-bridge/check_credentials.py --source all --json 分别验证 Cookie、token 和审批，随后完成真实消息验收。控制台脚本只能导出 token，不能修复审批中继的 Cookie。以后桥凭证失效时，重新登录并导出新 ZIP 交给 Muse；名义到期时间仅作参考，可能提前失效，不能承诺固定一个月。
 ```
 
 ## 工作方式
@@ -46,7 +48,7 @@
 
 ## 桥凭证
 
-桥凭证保存在仓库外。需要导出或更新 token 时，按 [桥凭证恢复说明](../native-bridge/get-muse-token.md) 和 [导出脚本](../native-bridge/get-muse-token.js) 操作。导出的 JSON 等同登录凭证，不要贴进聊天、日志或仓库。
+桥凭证保存在仓库外。推荐安装 [浏览器扩展](../native-bridge/muse-cred-extension/README.md)，登录 Muse 后导出包含 Cookie、VM 与 token 的 `muse-credentials.zip`，通过安全文件方式交给 Muse，再按 [恢复说明](../native-bridge/get-muse-token.md) 备份、核对、安装和验活。控制台脚本只能导出 token，不能恢复审批中继。凭证可能提前失效，失效后重新导出新 ZIP；不要把内容贴进聊天、日志或仓库。
 
 ## 日常使用
 
@@ -72,4 +74,4 @@
 
 ## 验收
 
-每个启用的渠道先发送 `/ping`，再发送普通问题，分别确认网关连通和正式回复。完整用例见 [Muse 实测用例](muse-live-test-cases-2026-11-01.md)。故障注入应在隔离环境执行，涉及生产服务的操作须先取得同意。
+每个启用的渠道先发送 `/ping`，再发送普通问题，分别确认网关连通和正式回复。完整用例见 [Muse 实测用例](muse-live-test-cases-2026-11-01.md) 和 [桥凭证健康实测清单](bridge-credential-health-muse-cases.md)。故障注入应在隔离环境执行，涉及生产服务的操作须先取得同意。

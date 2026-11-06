@@ -20,7 +20,7 @@ class ModeDisabled(ModeError):
 
 def validate_settings(channel: str, settings: dict) -> None:
     """Reject malformed modes before publishing a configuration to any writer."""
-    if channel not in ('weixin', 'wecom') or not isinstance(settings, dict):
+    if channel not in ('weixin', 'wecom', 'feishu') or not isinstance(settings, dict):
         raise ModeError('invalid channel settings')
     if settings.get('mode') not in ('legacy', 'core'):
         raise ModeError('channel mode must be legacy or core')

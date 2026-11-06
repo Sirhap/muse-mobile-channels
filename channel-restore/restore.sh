@@ -204,6 +204,7 @@ main() {
   heal_one weixin-bot weixin-bot "$HOME_DIR/.config/weixin-bot/credentials.env" || FAIL=1
   heal_bridge "$WS" "$HOME_DIR" || FAIL=1
   heal_relay "$WS" "$HOME_DIR" || FAIL=1
+  heal_core_run "$WS" "$HOME_DIR" || FAIL=1
 
   # Outbound delivery probe (2026-10-14): process-alive is not the
   # same as can-deliver — a channel whose sends keep failing (e.g.
@@ -238,6 +239,39 @@ heal_relay() {
   fi
   if ! systemctl is-active --quiet "$svc" 2>/dev/null; then
     systemctl start "$svc" 2>/dev/null && echo "$svc: started"
+  fi
+  systemctl is-active --quiet "$svc" 2>/dev/null && echo "$svc: active"
+}
+
+heal_core_run() {
+  # muse-core-run: WeCom core-mode runner (DualTrackExecutor: Gadget
+  # primary, Native fallback). Added 2026-11-06 after a VM replacement
+  # (boot 14:37) wiped /etc/systemd/system and this unit was the only
+  # one channel-restore did not cover, so the core trial sat dead
+  # until the missing unit was noticed. Unit copy lives in this
+  # directory (channel-restore) so it survives with the rest.
+  local WS="$1" HOME_DIR="$2"
+  local svc=muse-core-run
+  local src="$WS/channel-restore/muse-core-run.service"
+  local dst="/etc/systemd/system/$svc.service"
+  if [[ ! -x "$HOME_DIR/muse-test-venv/bin/python" ]]; then
+    echo "$svc: FAIL venv python missing at $HOME_DIR/muse-test-venv/bin/python"
+    return 1
+  fi
+  if [[ ! -f "$src" ]]; then
+    echo "$svc: FAIL workspace unit copy missing: $src"
+    return 1
+  fi
+  if [[ ! -f "$dst" ]] || ! cmp -s "$src" "$dst"; then
+    cp "$src" "$dst" && echo "$svc: unit (re)installed from workspace copy"
+    systemctl daemon-reload
+  fi
+  if ! systemctl is-enabled --quiet "$svc" 2>/dev/null; then
+    systemctl enable "$svc" >/dev/null 2>&1 && echo "$svc: enabled"
+  fi
+  if ! systemctl is-active --quiet "$svc" 2>/dev/null; then
+    systemctl start "$svc" 2>/dev/null && echo "$svc: started"
+    sleep 3
   fi
   systemctl is-active --quiet "$svc" 2>/dev/null && echo "$svc: active"
 }

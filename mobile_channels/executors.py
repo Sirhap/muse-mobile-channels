@@ -1,30 +1,67 @@
 """Muse execution adapter with persisted sessions and explicit run correlation.
 
-The legacy stream API does not promise a run identifier. A stream accepted
-without such an identifier remains unknown; this adapter never associates an
-arbitrary later assistant message with the task merely by its history position.
+The legacy stream API does not promise a run identifier: ``_open`` returns
+only a per-connection stream id, never a run id (proven live 2026-11-06).
+Correlation therefore rests on three facts recorded before the reply can
+exist: the session is dedicated to one conversation generation, the highest
+history sequence seen before sending (the baseline), and confirmation that
+the sent message itself was recorded in that session's history. A reply is
+accepted when it is a ``message.assistant`` event after the baseline with a
+completed status. No reply_to exclusion: a genuine turn answer gets stamped
+with reply_to_message_id whenever the turn was resumed by an internal
+handoff, and the legacy bridge counts it (native_bridge.is_turn_reply,
+2026-10-07 20:47 live loss). A submission whose recording was never confirmed stays
+unknown, and its history is never trusted.
 """
 from __future__ import annotations
 
 import importlib.util
 import os
+import threading
+import time
+import uuid
 from pathlib import Path
 from typing import Callable
 
+from .gadget_client import GadgetAuthError, GadgetClient, GadgetCredentials, GadgetError, GadgetNetworkError
 from .runtime import ExecutionContext, ExecutionOutcome
 from .storage import Store
+
+# History window for reply_started / query. The fold window is early in
+# the turn, so 100 events usually cover it, but a long session can push
+# the reply-start event out of the latest 100; 500 gives headroom. The
+# history API has no after_seq cursor, so this is a plain limit.
+HISTORY_LIMIT = 500
 
 SCHEMA = '''
 CREATE TABLE IF NOT EXISTS executor_sessions (
     conversation_id TEXT NOT NULL REFERENCES conversations(id), generation INTEGER NOT NULL,
     session_id TEXT NOT NULL UNIQUE, PRIMARY KEY(conversation_id,generation)
 );
+CREATE TABLE IF NOT EXISTS gadget_sessions (
+    conversation_id TEXT NOT NULL, generation INTEGER NOT NULL,
+    session_id TEXT NOT NULL UNIQUE, PRIMARY KEY(conversation_id,generation)
+);
 CREATE TABLE IF NOT EXISTS executor_runs (
     attempt_id TEXT PRIMARY KEY REFERENCES execution_attempts(id),
     session_id TEXT NOT NULL, platform_run_id TEXT, status TEXT NOT NULL,
-    created_at REAL NOT NULL
+    created_at REAL NOT NULL, track TEXT NOT NULL DEFAULT 'native',
+    baseline_seq INTEGER
 );
 '''
+
+
+def ensure_executor_schema(store: Store) -> None:
+    """确保执行器表结构存在，并向前兼容升级已有表结构以支持双轨 track 字段。"""
+    with store.transaction():
+        for statement in SCHEMA.split(';'):
+            if statement.strip():
+                store.connection.execute(statement)
+        columns = [row['name'] for row in store.connection.execute("PRAGMA table_info(executor_runs)").fetchall()]
+        if 'track' not in columns:
+            store.connection.execute("ALTER TABLE executor_runs ADD COLUMN track TEXT NOT NULL DEFAULT 'native'")
+        if 'baseline_seq' not in columns:
+            store.connection.execute("ALTER TABLE executor_runs ADD COLUMN baseline_seq INTEGER")
 
 
 def validate_transport_source() -> Path:
@@ -63,16 +100,52 @@ def bridge_client():
 
 
 class MuseExecutor:
-    """Bind sessions to conversation generations and query only a platform run ID."""
+    """Bind sessions to conversation generations and correlate by recorded history.
+
+    Each conversation generation gets its own side session. A submission is
+    accepted only after the sent message is confirmed recorded in that
+    session's history; the reply is then matched by sequence after the
+    pre-send baseline, an empty reply-to, and a completed status.
+    """
 
     def __init__(self, store: Store, client_factory: Callable = bridge_client,
-                 node_id: str = 'native-bridge'):
-        """Use a short-lived client per operation and never persist credentials."""
+                 node_id: str = 'native-bridge', confirm_timeout: float = 10.0,
+                 poll_interval: float = 1.0):
+        """Use a short-lived client per operation and never persist credentials.
+
+        The submit call keeps its client open until the sent message is
+        confirmed recorded: closing right after ``_open`` drops the stream
+        before the server records it (proven live 2026-11-06).
+        """
         self.store, self.client_factory, self.node_id = store, client_factory, node_id
-        with store.transaction():
-            for statement in SCHEMA.split(';'):
-                if statement.strip():
-                    store.connection.execute(statement)
+        self.confirm_timeout, self.poll_interval = confirm_timeout, poll_interval
+        ensure_executor_schema(store)
+
+    def _baseline(self, client, session_id: str) -> int:
+        """Highest history sequence in the session before this attempt sends."""
+        response = client.call_json('chat.history', body={
+            'limit': 1, 'session_id': session_id,
+        }, timeout=15)
+        events = response.get('chat_events', []) if isinstance(response, dict) else []
+        return max((event.get('seq', 0) for event in events), default=0)
+
+    def _confirm_recorded(self, client, session_id: str, baseline: int) -> bool:
+        """Poll history on the same connection until a new event appears.
+
+        ``_open`` is fire-and-forget: the frame alone does not prove the
+        message landed. Only a history event after the baseline proves it.
+        """
+        deadline = time.time() + self.confirm_timeout
+        while True:
+            response = client.call_json('chat.history', body={
+                'limit': 10, 'session_id': session_id,
+            }, timeout=15)
+            events = response.get('chat_events', []) if isinstance(response, dict) else []
+            if any(event.get('seq', 0) > baseline for event in events):
+                return True
+            if time.time() >= deadline:
+                return False
+            time.sleep(self.poll_interval)
 
     def _session(self, client, context: ExecutionContext) -> str:
         """Create a separate external session for each bound conversation generation."""
@@ -106,7 +179,17 @@ class MuseExecutor:
                 raise PermissionError('task cancellation was requested before submission')
 
     def submit(self, context: ExecutionContext) -> ExecutionOutcome:
-        """Persist the external session binding before opening exactly one stream."""
+        """Persist the external session binding before opening exactly one stream.
+
+        The stream API returns no run id (``_open`` yields only a
+        per-connection stream id), so the run handle stored here is that
+        stream id; correlation itself rests on the recorded baseline, not on
+        the handle. The client stays open until the sent message is confirmed
+        recorded in history -- closing right after ``_open`` drops the stream.
+        A submission whose recording was never confirmed stays unknown and its
+        history is never trusted; the ambiguous row is preserved, never
+        deleted, so the attempt cannot be silently sent twice.
+        """
         client = None
         try:
             client = self.client_factory()
@@ -116,32 +199,43 @@ class MuseExecutor:
             existing = self.store.connection.execute(
                 'SELECT * FROM executor_runs WHERE attempt_id=?', (context.claim.attempt_id,)
             ).fetchone()
-            if existing:
+            if existing and existing['status'] != 'failed_superseded':
                 return ExecutionOutcome('unknown', evidence='attempt_already_has_external_binding')
             self._validate_owner(context, submitting=True)
             sid = self._session(client, context)
+            try:
+                baseline = self._baseline(client, sid)
+            except Exception:
+                return ExecutionOutcome('unknown', evidence='baseline_unavailable')
             with self.store.transaction():
                 task = self.store._owned(context.claim)
                 if task['cancel_requested']:
                     return ExecutionOutcome('not_submitted', evidence='cancelled_before_stream')
                 self.store.connection.execute(
-                    'INSERT INTO executor_runs VALUES (?,?,?,?,?)',
+                    "INSERT INTO executor_runs (attempt_id, session_id, platform_run_id, status, created_at, track) "
+                    "VALUES (?,?,?,?,?,'native') "
+                    "ON CONFLICT(attempt_id) DO UPDATE SET session_id=excluded.session_id, "
+                    "platform_run_id=excluded.platform_run_id, status=excluded.status, "
+                    "created_at=excluded.created_at, track=excluded.track",
                     (context.claim.attempt_id, sid, None, 'submission_unknown', self.store.clock()),
                 )
             self._validate_owner(context, submitting=True)
-            response = client._open('chat.stream', body={
+            stream = client._open('chat.stream', body={
                 'items': [{'type': 'text', 'text': context.text}], 'node_id': self.node_id,
                 'capabilities': {}, 'session_id': sid,
             })
-            # Do not invent support for correlation: only an explicit platform
-            # run ID returned by this call makes automated polling safe.
-            run_id = response.get('run_id') if isinstance(response, dict) else None
-            if not isinstance(run_id, str) or not run_id:
+            if isinstance(stream, dict) and isinstance(stream.get('run_id'), str) and stream['run_id']:
+                run_id = stream['run_id']
+            elif isinstance(stream, int):
+                run_id = f'stream:{stream}'
+            else:
                 return ExecutionOutcome('unknown', evidence='platform_run_identity_unavailable')
+            if not self._confirm_recorded(client, sid, baseline):
+                return ExecutionOutcome('unknown', evidence='submission_not_recorded')
             with self.store.transaction():
                 self.store.connection.execute(
-                    "UPDATE executor_runs SET platform_run_id=?,status='accepted' WHERE attempt_id=?",
-                    (run_id, context.claim.attempt_id),
+                    "UPDATE executor_runs SET platform_run_id=?,baseline_seq=?,status='accepted' WHERE attempt_id=?",
+                    (run_id, baseline, context.claim.attempt_id),
                 )
             return ExecutionOutcome('accepted', run_id=run_id)
         except Exception:
@@ -165,7 +259,14 @@ class MuseExecutor:
         return row
 
     def query(self, context: ExecutionContext, run_id: str | None) -> ExecutionOutcome:
-        """Read only events explicitly correlated with the original platform run."""
+        """Read only replies correlated with the confirmed submission.
+
+        The binding guarantees the sent message was recorded; the reply is
+        the first completed assistant event after the recorded baseline, in
+        this attempt's dedicated session, with an empty reply-to (genuine
+        replies, not proactive pushes). Events at or before the baseline --
+        including any earlier attempt's output in this session -- are ignored.
+        """
         self._validate_owner(context)
         binding = self._binding(context, run_id)
         if binding is None:
@@ -174,22 +275,106 @@ class MuseExecutor:
         try:
             self._validate_owner(context)
             response = client.call_json('chat.history', body={
-                'limit': 100, 'session_id': binding['session_id'],
+                'limit': HISTORY_LIMIT, 'session_id': binding['session_id'],
             }, timeout=15)
             events = response.get('chat_events', [])
+            baseline = binding['baseline_seq'] or 0
             for event in sorted(events, key=lambda value: value.get('seq', 0)):
-                payload = event.get('payload') or {}
-                if (event.get('run_id') or payload.get('run_id')) != binding['platform_run_id']:
+                if event.get('seq', 0) <= baseline:
                     continue
+                if event.get('event_name') != 'message.assistant':
+                    continue
+                payload = event.get('payload') or {}
+                # No reply_to exclusion: a genuine turn answer gets stamped
+                # with reply_to_message_id whenever the turn was resumed by
+                # an internal handoff, and the legacy bridge counts it
+                # (native_bridge.is_turn_reply, 2026-10-07 20:47 live loss:
+                # seq 5222, status completed, never delivered). Session
+                # turns are serialized server-side, so the first completed
+                # assistant message after baseline is this turn's answer.
                 if payload.get('status') in ('cancelled', 'canceled'):
                     return ExecutionOutcome('cancelled', evidence='platform_run_cancelled')
                 if payload.get('status') in ('failed', 'error'):
                     return ExecutionOutcome('failed', evidence='platform_run_failed')
-                if event.get('event_name') == 'message.assistant' and payload.get('status') in ('completed', 'complete', 'succeeded'):
+                if payload.get('status') in ('completed', 'complete', 'succeeded'):
                     text = payload.get('display_text')
                     if isinstance(text, str):
                         return ExecutionOutcome('succeeded', text=text)
             return ExecutionOutcome('running')
+        finally:
+            client.close()
+
+    def reply_started(self, context: ExecutionContext, run_id: str | None) -> bool:
+        """True when the live turn's reply has started generating.
+
+        Any assistant message after the submission baseline — any status,
+        not just completed — means the model has begun its reply, so a
+        fold would arrive too late to be integrated. Fail safe: when the
+        binding is missing or history cannot be read, report started so
+        the caller does NOT fold.
+        """
+        try:
+            self._validate_owner(context)
+        except Exception:
+            return True
+        binding = self._binding(context, run_id)
+        if binding is None:
+            return True
+        client = self.client_factory()
+        try:
+            response = client.call_json('chat.history', body={
+                'limit': HISTORY_LIMIT, 'session_id': binding['session_id'],
+            }, timeout=15)
+            events = response.get('chat_events', []) if isinstance(response, dict) else []
+            baseline = binding['baseline_seq'] or 0
+            for event in events:
+                if event.get('seq', 0) <= baseline:
+                    continue
+                if event.get('event_name') != 'message.assistant':
+                    continue
+                # No reply_to exclusion: a genuine answer gets stamped
+                # with reply_to_message_id when the turn was resumed by
+                # an internal handoff (legacy poll_turn counts any
+                # assistant event after baseline as started).
+                return True
+            return False
+        except Exception:
+            return True
+        finally:
+            client.close()
+
+    def fold(self, context: ExecutionContext, run_id: str | None, text: str) -> ExecutionOutcome:
+        """Send follow-up text into the live session (official-client steering).
+
+        Opens a new stream on the same session with the follow-up text,
+        mirroring the legacy bridge's _merge_into_active. The text is
+        only reported accepted after history confirms it was recorded;
+        otherwise the outcome is unknown and the caller must NOT mark
+        the message merged.
+        """
+        if not isinstance(text, str) or not text:
+            return ExecutionOutcome('failed', evidence='fold_text_empty')
+        self._validate_owner(context)
+        binding = self._binding(context, run_id)
+        if binding is None:
+            return ExecutionOutcome('unknown', evidence='platform_run_identity_unavailable')
+        client = self.client_factory()
+        try:
+            self._validate_owner(context)
+            sid = binding['session_id']
+            try:
+                pre = self._baseline(client, sid)
+            except Exception:
+                return ExecutionOutcome('unknown', evidence='baseline_unavailable')
+            client._open('chat.stream', body={
+                'items': [{'type': 'text', 'text': text}], 'node_id': self.node_id,
+                'capabilities': {}, 'session_id': sid,
+            })
+            if not self._confirm_recorded(client, sid, pre):
+                return ExecutionOutcome('unknown', evidence='fold_not_recorded')
+            return ExecutionOutcome('accepted', run_id=run_id)
+        except Exception:
+            return ExecutionOutcome('unknown')
         finally:
             client.close()
 
@@ -206,3 +391,516 @@ class MuseExecutor:
         finally:
             client.close()
         return self.query(context, run_id)
+
+
+class CircuitBreaker:
+    """轻量级熔断器，连续失败达到阈值时触发熔断，冷却后进入半开试探。"""
+
+    def __init__(
+        self,
+        failure_threshold: int = 3,
+        cooldown_seconds: float = 30.0,
+        clock: Callable[[], float] = time.time,
+    ):
+        self.failure_threshold = failure_threshold
+        self.cooldown_seconds = cooldown_seconds
+        self.clock = clock
+        self.failure_count = 0
+        self._state = "CLOSED"
+        self.last_failure_time = 0.0
+        self._lock = threading.Lock()
+
+    @property
+    def status(self) -> str:
+        """返回当前熔断器状态：'CLOSED'、'OPEN' 或 'HALF_OPEN'。"""
+        with self._lock:
+            if self._state == "OPEN":
+                if self.clock() - self.last_failure_time >= self.cooldown_seconds:
+                    return "HALF_OPEN"
+            return self._state
+
+    def can_execute(self) -> bool:
+        """判断当前是否允许执行。"""
+        state = self.status
+        return state in ("CLOSED", "HALF_OPEN")
+
+    def record_success(self) -> None:
+        """执行成功，重置失败计数并闭合熔断器。"""
+        with self._lock:
+            self.failure_count = 0
+            self._state = "CLOSED"
+
+    def record_failure(self) -> None:
+        """执行失败，记录时间并增加计数，若达到阈值或处于半开状态则开启熔断。"""
+        with self._lock:
+            was_half_open = (
+                self._state == "OPEN"
+                and (self.clock() - self.last_failure_time >= self.cooldown_seconds)
+            )
+            self.failure_count += 1
+            self.last_failure_time = self.clock()
+            if was_half_open or self.failure_count >= self.failure_threshold:
+                self._state = "OPEN"
+
+
+class GadgetExecutor:
+    """Gadget side-session executor: one worker process per turn, real Noise protocol.
+
+    The worker (mobile_channels/gadget_worker/turn.ts) owns the Noise
+    connection: it sends the message -- which creates the side chat -- then
+    subscribes and follows the bound reply to completion, recording its
+    outcome in a per-attempt result file. This executor only spawns the
+    worker, polls the file, and kills the worker on cancel. It never
+    touches the cookie track: the Gadget track stays usable when the bridge
+    credentials are dead, which is the point of the track.
+
+    Sessions are dedicated per conversation generation and persisted in
+    gadget_sessions (separate from the native track's executor_sessions, so
+    a fallback never reuses the other track's session). A session id is only
+    a name until the worker's first send creates it server-side.
+    """
+
+    def __init__(
+        self,
+        store: Store,
+        client: GadgetClient | None = None,
+        client_factory: Callable[[], GadgetClient] | None = None,
+    ):
+        self.store = store
+        self._client = client
+        self.client_factory = client_factory
+        ensure_executor_schema(store)
+
+    @property
+    def client(self) -> GadgetClient:
+        if self._client is not None:
+            return self._client
+        if self.client_factory is not None:
+            return self.client_factory()
+        self._client = GadgetClient()
+        return self._client
+
+    def is_configured(self) -> bool:
+        """Check the pairing credentials are installed and complete."""
+        try:
+            return self.client.is_configured()
+        except Exception:
+            return False
+
+    def _session(self, context: ExecutionContext) -> str:
+        """Dedicated side-session id for this conversation generation, persisted.
+
+        No network call happens here: the id is only a name until the
+        worker's first send creates the session server-side.
+        """
+        key = (context.claim.conversation_id, context.claim.generation)
+        row = self.store.connection.execute(
+            'SELECT session_id FROM gadget_sessions WHERE conversation_id=? AND generation=?', key
+        ).fetchone()
+        if row:
+            return row['session_id']
+        session_id = str(uuid.uuid4())
+        with self.store.transaction():
+            self.store.connection.execute(
+                'INSERT OR IGNORE INTO gadget_sessions VALUES (?,?,?)', (*key, session_id))
+            row = self.store.connection.execute(
+                'SELECT session_id FROM gadget_sessions WHERE conversation_id=? AND generation=?', key
+            ).fetchone()
+        return row['session_id']
+
+    @staticmethod
+    def _worker_pid(platform_run_id: str | None) -> int | None:
+        """Parse the 'worker:<pid>' handle stored as the run id."""
+        if not isinstance(platform_run_id, str) or not platform_run_id.startswith('worker:'):
+            return None
+        try:
+            return int(platform_run_id.split(':', 1)[1])
+        except ValueError:
+            return None
+
+    def _validate_owner(self, context: ExecutionContext, *, submitting: bool = False) -> None:
+        """Recheck fenced ownership immediately before an external operation."""
+        with self.store.transaction():
+            task = self.store._owned(context.claim)
+            if submitting and task['cancel_requested']:
+                raise PermissionError('task cancellation was requested before submission')
+
+    def _binding(self, context: ExecutionContext, run_id: str | None):
+        """Validate and fetch the attempt's persisted execution binding."""
+        row = self.store.connection.execute(
+            'SELECT * FROM executor_runs WHERE attempt_id=?', (context.claim.attempt_id,)
+        ).fetchone()
+        if row is None or not row['platform_run_id']:
+            return None
+        if run_id is not None and run_id != row['platform_run_id']:
+            raise ValueError('platform run identity does not match this attempt')
+        return row
+
+    def _drop_placeholder(self, attempt_id: str) -> None:
+        """Remove the pre-send placeholder row; only valid when nothing was sent."""
+        with self.store.transaction():
+            self.store.connection.execute(
+                'DELETE FROM executor_runs WHERE attempt_id=? AND platform_run_id IS NULL',
+                (attempt_id,)
+            )
+
+    def submit(self, context: ExecutionContext) -> ExecutionOutcome:
+        """Spawn the Gadget worker for this attempt and record track='gadget'."""
+        if not self.is_configured():
+            return ExecutionOutcome('not_submitted', evidence='gadget_credentials_missing')
+
+        try:
+            existing = self.store.connection.execute(
+                'SELECT * FROM executor_runs WHERE attempt_id=?', (context.claim.attempt_id,)
+            ).fetchone()
+            if existing and existing['status'] != 'failed_superseded':
+                return ExecutionOutcome('unknown', evidence='attempt_already_has_external_binding')
+
+            self._validate_owner(context, submitting=True)
+            session_id = self._session(context)
+
+            with self.store.transaction():
+                task = self.store._owned(context.claim)
+                if task['cancel_requested']:
+                    return ExecutionOutcome('not_submitted', evidence='cancelled_before_submission')
+                self.store.connection.execute(
+                    "INSERT INTO executor_runs (attempt_id, session_id, platform_run_id, status, created_at, track) "
+                    "VALUES (?,?,?,?,?,'gadget') "
+                    "ON CONFLICT(attempt_id) DO UPDATE SET session_id=excluded.session_id, "
+                    "platform_run_id=excluded.platform_run_id, status=excluded.status, "
+                    "created_at=excluded.created_at, track=excluded.track",
+                    (context.claim.attempt_id, session_id, None, 'submission_unknown', self.store.clock()),
+                )
+
+            self._validate_owner(context, submitting=True)
+            proc = self.client.start_turn(context.claim.attempt_id, session_id, context.text)
+            run_id = f"worker:{proc.pid}"
+
+            with self.store.transaction():
+                self.store.connection.execute(
+                    "UPDATE executor_runs SET platform_run_id=?,status='accepted' WHERE attempt_id=?",
+                    (run_id, context.claim.attempt_id),
+                )
+            return ExecutionOutcome('accepted', run_id=run_id)
+        except PermissionError:
+            self._drop_placeholder(context.claim.attempt_id)
+            return ExecutionOutcome('not_submitted', evidence='cancelled_before_submission')
+        except (GadgetAuthError, GadgetNetworkError, GadgetError) as exc:
+            # The worker never started, so nothing was sent: the placeholder
+            # row may go. Any failure after the spawn keeps its row.
+            self._drop_placeholder(context.claim.attempt_id)
+            return ExecutionOutcome('unknown', evidence=str(exc))
+        except Exception as exc:
+            # Unknown failure with a placeholder row in place. The worker may
+            # have started: preserve the ambiguous binding, never delete it.
+            return ExecutionOutcome('unknown', evidence=str(exc))
+
+    def query(self, context: ExecutionContext, run_id: str | None) -> ExecutionOutcome:
+        """Read the worker's result file; a live worker with no file yet is running."""
+        self._validate_owner(context)
+        binding = self._binding(context, run_id)
+        if binding is None:
+            return ExecutionOutcome('unknown', evidence='platform_run_identity_unavailable')
+
+        try:
+            result = self.client.read_result(context.claim.attempt_id)
+        except Exception as exc:
+            return ExecutionOutcome('unknown', evidence=str(exc))
+        if result is None:
+            pid = self._worker_pid(binding['platform_run_id'])
+            if pid is not None and self.client.worker_alive(pid):
+                return ExecutionOutcome('running')
+            return ExecutionOutcome('unknown', evidence='worker_exited_without_result')
+
+        state = result.get('state')
+        mid = result.get('message_id')
+        message_id = mid if isinstance(mid, str) and mid else None
+        if state == 'running':
+            return ExecutionOutcome('running', message_id=message_id)
+        if state == 'succeeded':
+            text = result.get('text')
+            if not isinstance(text, str) or not text:
+                return ExecutionOutcome('unknown', evidence='worker_succeeded_without_text', message_id=message_id)
+            return ExecutionOutcome('succeeded', text=text, message_id=message_id)
+        if state == 'failed':
+            return ExecutionOutcome('failed', evidence=str(result.get('evidence') or 'platform_turn_failed'), message_id=message_id)
+        if state == 'cancelled':
+            return ExecutionOutcome('cancelled', evidence=str(result.get('evidence') or 'platform_turn_cancelled'), message_id=message_id)
+        if state == 'unknown':
+            return ExecutionOutcome('unknown', evidence=str(result.get('evidence') or 'worker_unknown'), message_id=message_id)
+        return ExecutionOutcome('unknown', evidence=f'unrecognized_result_state_{state}', message_id=message_id)
+
+    def reply_started(self, context: ExecutionContext, run_id: str | None) -> bool:
+        """True when the live turn's reply has started generating.
+
+        The worker records reply_started in its result file the first
+        time it observes an assistant message with text. A terminal
+        result also means the reply started (it finished). Fail safe:
+        when the binding is missing or the result cannot be read,
+        report started so the caller does NOT fold.
+        """
+        try:
+            self._validate_owner(context)
+        except Exception:
+            return True
+        binding = self._binding(context, run_id)
+        if binding is None:
+            return True
+        try:
+            result = self.client.read_result(context.claim.attempt_id)
+        except Exception:
+            return True
+        if result is None:
+            # No result file yet. The worker writes its running
+            # placeholder shortly after spawn (connect + sendMessage).
+            # If the attempt is old enough that it should have written
+            # one, no file means the worker died before writing and
+            # the turn is dead — do NOT fold (the combined reply will
+            # never come). A fresh attempt may simply not have written
+            # yet; folding is allowed then.
+            try:
+                age = self.store.clock() - float(binding['created_at'] or 0)
+            except Exception:
+                age = 0.0
+            return age >= 30.0
+        if result.get('reply_started') is True:
+            return True
+        if result.get('state') in ('succeeded', 'failed', 'cancelled', 'unknown'):
+            return True
+        return False
+
+    def fold(self, context: ExecutionContext, run_id: str | None, text: str) -> ExecutionOutcome:
+        """Send follow-up text into the live side session (official-client steering).
+
+        Spawns a send-only worker that sends the text to the same side
+        session and exits without subscribing, so it never races the
+        running turn's own worker. The fold is only reported accepted
+        when the send-only worker's result carries a message id (the
+        send landed); otherwise the outcome is unknown and the caller
+        must NOT mark the message merged.
+        """
+        if not isinstance(text, str) or not text:
+            return ExecutionOutcome('failed', evidence='fold_text_empty')
+        self._validate_owner(context)
+        binding = self._binding(context, run_id)
+        if binding is None:
+            return ExecutionOutcome('unknown', evidence='platform_run_identity_unavailable')
+        try:
+            session_id = self._session(context)
+            result = self.client.send_only(session_id, text)
+        except Exception as exc:
+            return ExecutionOutcome('unknown', evidence=str(exc))
+        if isinstance(result, dict) and result.get('state') == 'sent':
+            mid = result.get('message_id')
+            if isinstance(mid, str) and mid:
+                return ExecutionOutcome('accepted', run_id=run_id, message_id=mid)
+        return ExecutionOutcome('unknown', evidence='fold_send_unconfirmed')
+
+    def cancel(self, context: ExecutionContext, run_id: str | None) -> ExecutionOutcome:
+        """Kill the worker and report the turn cancelled."""
+        self._validate_owner(context)
+        binding = self._binding(context, run_id)
+        if binding is None:
+            return ExecutionOutcome('unknown', evidence='platform_run_identity_unavailable')
+        pid = self._worker_pid(binding['platform_run_id'])
+        if pid is not None:
+            try:
+                self.client.stop_turn(pid)
+            except Exception as exc:
+                return ExecutionOutcome('unknown', evidence=str(exc))
+        result = self.client.read_result(context.claim.attempt_id)
+        if isinstance(result, dict) and result.get('state') == 'cancelled':
+            return ExecutionOutcome('cancelled', evidence=str(result.get('evidence') or 'platform_turn_cancelled'))
+        return ExecutionOutcome('cancelled', evidence='worker_terminated')
+
+    def close(self) -> None:
+        """Close the underlying client; live workers keep running so their results survive."""
+        if self._client is not None:
+            try:
+                self._client.close()
+            except Exception:
+                pass
+
+    def __enter__(self) -> GadgetExecutor:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self.close()
+
+
+class DualTrackExecutor:
+    """双轨高可用执行器，实现 Executor 协议。
+
+    组合 GadgetExecutor（主轨）与 MuseExecutor（备轨）。
+    优先使用 Gadget 侧会话，遇故障或凭证缺失时无缝降级至 Native 备轨。
+    根据 attempt_id 在 executor_runs 中绑定的 track 精确分发 query 与 cancel，严禁跨轨串话。
+    """
+
+    def __init__(
+        self,
+        store: Store,
+        primary: GadgetExecutor | None = None,
+        fallback: MuseExecutor | None = None,
+        circuit: CircuitBreaker | None = None,
+    ):
+        self.store = store
+        ensure_executor_schema(store)
+        self.primary = primary or GadgetExecutor(store)
+        self.fallback = fallback or MuseExecutor(store)
+        self.circuit = circuit or CircuitBreaker()
+
+    def current_track(self, attempt_id: str) -> str | None:
+        """根据 attempt_id 查询当前任务绑定的执行轨 ('gadget' 或 'native')。"""
+        row = self.store.connection.execute(
+            'SELECT track FROM executor_runs WHERE attempt_id=?', (attempt_id,)
+        ).fetchone()
+        if row and row['track']:
+            return row['track']
+        return None
+
+    def circuit_status(self) -> str:
+        """获取当前熔断器状态。"""
+        return self.circuit.status
+
+    def submit(self, context: ExecutionContext) -> ExecutionOutcome:
+        """提交任务：优先主轨，故障/熔断时平滑降级至备轨。"""
+        # 1. 检查主轨凭证与熔断状态
+        if not self.primary.is_configured() or not self.circuit.can_execute():
+            return self.fallback.submit(context)
+
+        # 2. 尝试主轨提交
+        try:
+            outcome = self.primary.submit(context)
+            if outcome.state == 'not_submitted':
+                # 若任务已被显式取消，无需向备轨降级重试
+                if outcome.evidence in ('cancelled_before_submission', 'cancelled_before_stream'):
+                    return outcome
+                self.circuit.record_failure()
+                return self.fallback.submit(context)
+            elif outcome.state == 'accepted':
+                self.circuit.record_success()
+                return outcome
+            elif outcome.state in ('failed', 'unknown'):
+                row = self.store.connection.execute(
+                    'SELECT platform_run_id FROM executor_runs WHERE attempt_id=?',
+                    (context.claim.attempt_id,)
+                ).fetchone()
+                if not row or not row['platform_run_id']:
+                    self.circuit.record_failure()
+                    return self.fallback.submit(context)
+            return outcome
+        except Exception:
+            self.circuit.record_failure()
+            return self.fallback.submit(context)
+
+    def query(self, context: ExecutionContext, run_id: str | None) -> ExecutionOutcome:
+        """根据持久化绑定的 track 严格分发，严禁跨轨串话。"""
+        track = self.current_track(context.claim.attempt_id)
+        if track == 'gadget':
+            try:
+                outcome = self.primary.query(context, run_id)
+            except Exception as exc:
+                return ExecutionOutcome('unknown', evidence=str(exc))
+            if outcome.state == 'failed' and not outcome.message_id:
+                # Primary died before its message reached the session (the
+                # worker result carries no message_id), so a native retry
+                # cannot double-deliver: supersede the gadget binding and
+                # fall back. A failed result WITH a message_id means the
+                # message was sent and a reply may exist -- never re-send.
+                self.circuit.record_failure()
+                with self.store.transaction():
+                    self.store.connection.execute(
+                        "UPDATE executor_runs SET status='failed_superseded' WHERE attempt_id=?",
+                        (context.claim.attempt_id,),
+                    )
+                fallback_outcome = self.fallback.submit(context)
+                if fallback_outcome.state == 'accepted' and fallback_outcome.run_id:
+                    # The fallback bound a new run for this attempt. The
+                    # CoreRunner state machine binds one run per attempt at
+                    # submit time and cannot accept a second 'accepted'
+                    # outcome during the query phase (mark_submitted
+                    # requires the 'reconciling' state), so rebind the
+                    # attempt to the native run and report 'running': the
+                    # runner keeps polling the live run on the next tick.
+                    self.store.rebind_run(context.claim, fallback_outcome.run_id)
+                    return ExecutionOutcome('running')
+                return fallback_outcome
+            return outcome
+        elif track == 'native':
+            try:
+                return self.fallback.query(context, run_id)
+            except Exception as exc:
+                return ExecutionOutcome('unknown', evidence=str(exc))
+        else:
+            return ExecutionOutcome('unknown', evidence='no_track_binding')
+
+    def cancel(self, context: ExecutionContext, run_id: str | None) -> ExecutionOutcome:
+        """根据持久化绑定的 track 严格分发取消请求。"""
+        track = self.current_track(context.claim.attempt_id)
+        if track == 'gadget':
+            try:
+                return self.primary.cancel(context, run_id)
+            except Exception as exc:
+                return ExecutionOutcome('unknown', evidence=str(exc))
+        elif track == 'native':
+            try:
+                return self.fallback.cancel(context, run_id)
+            except Exception as exc:
+                return ExecutionOutcome('unknown', evidence=str(exc))
+        else:
+            return ExecutionOutcome('unknown', evidence='no_track_binding')
+
+    def reply_started(self, context: ExecutionContext, run_id: str | None) -> bool:
+        """Route the reply-started check to the track bound to this attempt.
+
+        Fail safe: no track binding means the reply is treated as started,
+        so the caller does NOT fold.
+        """
+        track = self.current_track(context.claim.attempt_id)
+        if track == 'gadget':
+            try:
+                return self.primary.reply_started(context, run_id)
+            except Exception:
+                return True
+        elif track == 'native':
+            try:
+                return self.fallback.reply_started(context, run_id)
+            except Exception:
+                return True
+        else:
+            return True
+
+    def fold(self, context: ExecutionContext, run_id: str | None, text: str) -> ExecutionOutcome:
+        """Route the fold send to the track bound to this attempt."""
+        track = self.current_track(context.claim.attempt_id)
+        if track == 'gadget':
+            try:
+                return self.primary.fold(context, run_id, text)
+            except Exception as exc:
+                return ExecutionOutcome('unknown', evidence=str(exc))
+        elif track == 'native':
+            try:
+                return self.fallback.fold(context, run_id, text)
+            except Exception as exc:
+                return ExecutionOutcome('unknown', evidence=str(exc))
+        else:
+            return ExecutionOutcome('unknown', evidence='no_track_binding')
+
+    def close(self) -> None:
+        """关闭底层资源。"""
+        if hasattr(self.primary, 'close'):
+            try:
+                self.primary.close()
+            except Exception:
+                pass
+        if hasattr(self.fallback, 'close'):
+            try:
+                self.fallback.close()
+            except Exception:
+                pass
+
+    def __enter__(self) -> DualTrackExecutor:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self.close()

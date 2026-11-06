@@ -4,6 +4,13 @@
 B1 a detached batch that dies while another batch is in flight puts
    its msgids on the orphan list, so the "wake the orphans now and
    demote the in-flight batch" branch is reachable.
+   Since 6066d03 ("require verified worker termination before
+   recovery") silence alone never proves death: a silent detached
+   batch only enters review and waits for a platform verdict. So B1
+   now asserts both sides -- silence-only holds (no wake, no
+   demotion, no resume notice), and a fresh platform-terminal
+   verdict bound to the batch's registered run wakes the orphans
+   exactly as before.
 B2 a subagent failure notice goes to the job's own inbox row (found
    by the job's msgid), not to the latest inbox row.
 B3 a formal answer delivered purely as reply_file shows up as an
@@ -12,6 +19,9 @@ B3 a formal answer delivered purely as reply_file shows up as an
 The hook scripts are copied into a sandbox with state paths and the
 channel CLI redirected to a stub, then executed for real. Hook script
 location: MUSE_HOOK_SCRIPTS_DIR env, defaulting to hooks/scripts.
+The death-watch probe runs for real (DEATH_WATCH_ACTIVITY_PY points
+at the repo's death_watch_activity.py) and the bridge state is a
+sandbox path that does not exist, so no production signal leaks in.
 """
 import json
 import os
@@ -23,9 +33,10 @@ from pathlib import Path
 
 NOW = time.time()
 RESULTS = []
+ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS = Path(os.environ.get(
     "MUSE_HOOK_SCRIPTS_DIR",
-    str(Path(__file__).resolve().parent.parent / "hooks" / "scripts")))
+    str(ROOT / "hooks" / "scripts")))
 
 CHANNELS = {
     "weixin": {"botdir": "weixin-bot", "script": "weixin-inbox.sh",
@@ -103,10 +114,24 @@ class Sandbox:
         env = dict(os.environ, HOME=f"{self.sbx}/home",
                    HATCH_HOOK_RUNTIME=f"{self.sbx}/runtime.sh",
                    HATCH_HOOK_DRY_RUN="0",
-                   DEATH_WATCH_ACTIVITY_PY=f"{self.sbx}/none.py")
+                   DEATH_WATCH_ACTIVITY_PY=str(ROOT / "death_watch_activity.py"),
+                   DEATH_WATCH_BRIDGE_STATE=f"{self.sbx}/bridge-state.json")
         r = subprocess.run(["bash", f"{self.sbx}/hook.sh"], env=env,
                            capture_output=True, text=True, timeout=60)
         return r.stdout + r.stderr
+
+    def register(self, mid, run_id, ts=None):
+        """Plant a worker-activity registration for one msgid."""
+        self.write(f"{self.botdir}/state/worker_activity.json",
+                   {mid: {"ts": NOW - 3700 if ts is None else ts,
+                          "source": "worker-register", "run_id": run_id}})
+
+    def verdict(self, mid, run_id, status="shutdown"):
+        """Plant a fresh platform-terminal verdict bound to the run."""
+        self.write(f"{self.botdir}/state/worker_platform_status.json",
+                   {mid: {"run_id": run_id, "status": status,
+                          "checked_at": NOW,
+                          "agent_updated_at": NOW - 3700}})
 
     def calls(self):
         return open(f"{self.sbx}/cli.log").read()
@@ -131,7 +156,7 @@ def check(name, cond, detail=""):
 
 
 def test_b1(chan):
-    """Dead detached batch while a live batch is in flight."""
+    """Silent detached batch holds for a verdict (6066d03 rule)."""
     sb = Sandbox(chan)
     sb.rows("inbox", [entry(chan, "D1", NOW - 3700, "u1", "老任务"),
                       entry(chan, "A1", NOW - 60, "u1", "新任务")])
@@ -141,6 +166,42 @@ def test_b1(chan):
               "detached": [{"msgids": ["D1"], "since": NOW - 3700}]})
     sb.rows("outbox", [{"id": "U1", "mode": "update", "msgid": "A1",
                         "content": "进度", "queued_at": NOW - 30}])
+    out = sb.run()
+    pay = payload_of(out)
+    orphans = [o.get("msgid") for o in (pay or {}).get("orphaned", [])]
+    check(f"B1 {chan} silent detached batch is held, not woken",
+          "DECISION silent" in out and orphans == [], out)
+    batch = sb.batch()
+    review_path = f"{sb.sbx}/home/hooks/state/{sb.botdir}/worker_review.json"
+    review = {}
+    try:
+        with open(review_path, encoding="utf-8") as f:
+            review = json.load(f).get("tasks") or {}
+    except (OSError, ValueError):
+        pass
+    check(f"B1 {chan} silent detached batch stays detached, in-flight intact",
+          batch.get("msgids") == ["A1"]
+          and "D1" not in [m for d in batch.get("detached") or []
+                           for m in d.get("msgids") or []]
+          and review.get("D1", {}).get("status") == "pending",
+          json.dumps(batch) + " review=" + json.dumps(review))
+    check(f"B1 {chan} silent detached batch sends no resume notice",
+          sb.calls().count("已自动续跑") == 0, sb.calls())
+
+
+def test_b1_verified(chan):
+    """Dead detached batch with a bound terminal verdict wakes orphans."""
+    sb = Sandbox(chan)
+    sb.rows("inbox", [entry(chan, "D1", NOW - 3700, "u1", "老任务"),
+                      entry(chan, "A1", NOW - 60, "u1", "新任务")])
+    sb.mark_seen("D1", "A1")
+    sb.state("active_batch.json",
+             {"msgids": ["A1"], "since": NOW - 60,
+              "detached": [{"msgids": ["D1"], "since": NOW - 3700}]})
+    sb.rows("outbox", [{"id": "U1", "mode": "update", "msgid": "A1",
+                        "content": "进度", "queued_at": NOW - 30}])
+    sb.register("D1", "run-D1")
+    sb.verdict("D1", "run-D1")
     out = sb.run()
     pay = payload_of(out)
     orphans = [o.get("msgid") for o in (pay or {}).get("orphaned", [])]
@@ -254,6 +315,7 @@ def test_b3_text_plus_file(chan):
 
 for _chan in CHANNELS:
     test_b1(_chan)
+    test_b1_verified(_chan)
     test_b1_no_orphans_no_demotion(_chan)
     test_b2(_chan)
     test_b2_fallback(_chan)

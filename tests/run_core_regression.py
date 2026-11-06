@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 CHECKS = (
     'tests/test_core_storage.py',
     'tests/test_core_runtime.py',
+    'tests/test_core_fold.py',
     'tests/test_core_ingress_rejection.py',
     'tests/test_core_late_delivery.py',
     'tests/test_executor_install.py',
@@ -34,6 +35,8 @@ CHECKS = (
     'tests/test_shadow_inventory.py',
     'tests/test_tunnel_relay.py',
     'tests/test_bridge_runtime.py',
+    'tests/test_bridge_credential_health.py',
+    'tests/test_credential_diagnostics.py',
     'tests/test_bridge_reconnect_policy.py',
     'tests/test_bridge_diversion_health.py',
     'tests/test_bridge_submission_recovery.py',
@@ -43,8 +46,15 @@ CHECKS = (
     'tests/test_wecom_durable_handoff.py',
     'tests/test_bridge_queue_recovery.py',
     'tests/test_approval_notify_resilience.py',
+    'tests/test_approval_credential_health.py',
     'tests/test_death_watch_activity.py',
     'tests/test_worker_death_signal_20261015.py',
+    'tests/test_worker_lifecycle_scenario.py',
+    'tests/test_worker_registration_history.py',
+    'tests/test_worker_verdict_binding.py',
+    'tests/test_hook_unknown_worker.py',
+    'tests/test_gateway_worker_review.py',
+    'tests/test_death_watch_reconcile.py',
     'tests/test_sonnet_fix_weixin_20261017.py',
 )
 
