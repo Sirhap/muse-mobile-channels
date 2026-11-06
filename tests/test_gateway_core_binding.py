@@ -179,7 +179,7 @@ class GatewayCoreBindingTests(unittest.IsolatedAsyncioTestCase):
         await self.inbound('wecom', identifier='reset', text='/new', chat='shared-room', sender='admin')
         self.assertEqual(self.rows('conversations')[0]['generation'], 1)
         self.assertEqual(len(self.rows('outbound_messages')), 1)
-        self.assertIn('已开启当前聊天', self.rows('outbound_messages')[0]['text'])
+        self.assertIn('已开启新会话', self.rows('outbound_messages')[0]['text'])
 
     async def test_new_receipt_uses_current_context_without_late_result_prefix(self):
         """A context reset receipt belongs to the context it just created."""
@@ -192,7 +192,7 @@ class GatewayCoreBindingTests(unittest.IsolatedAsyncioTestCase):
         with Store(self.database) as store:
             self.assertEqual(DeliveryRunner(store, transport, 'sender').tick(), 'delivered')
         self.assertEqual(sent[0].generation, 1)
-        self.assertTrue(sent[0].text.startswith('已开启当前聊天的新上下文'))
+        self.assertTrue(sent[0].text.startswith('已开启新会话'))
         self.assertNotIn('补充此前对话的结果', sent[0].text)
 
     async def test_group_member_cannot_cancel_active_task(self):

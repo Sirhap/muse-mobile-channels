@@ -204,8 +204,8 @@ class GatewayBinding:
         if command in ('/ping', 'ping'):
             return 'pong ✅ 网关在线'
         if command in ('/new', '/新会话'):
-            generation = store.new_generation(item.conversation_id)
-            return f'已开启当前聊天的新上下文（第 {generation} 代）。旧任务保留原回复路由。'
+            store.new_generation(item.conversation_id)
+            return '已开启新会话。'
         if command in ('/stop', '/停止'):
             rows = store.connection.execute(
                 "SELECT id FROM tasks WHERE conversation_id=? AND id!=? AND state IN ('queued','claimed','running','reconciling')",
