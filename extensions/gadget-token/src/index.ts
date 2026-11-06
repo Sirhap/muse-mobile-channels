@@ -6,7 +6,6 @@
 export { MuseError, MuseHttpError, MuseProtocolError } from './errors.js';
 export { MuseAccount } from './account.js';
 export type { DeviceCredentials, AccountOptions } from './account.js';
-export { object, requiredString } from './account.js';
 export {
   defaultCredentialsDirectory,
   loadCredentials,

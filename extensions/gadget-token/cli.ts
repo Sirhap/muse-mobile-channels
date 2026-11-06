@@ -9,6 +9,8 @@
 // token age, SDK-token hint).
 
 import { readFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { join } from 'node:path';
 import {
   MuseAccount,
@@ -20,6 +22,20 @@ import {
   SDK_TOKEN_URL,
 } from './src/index.js';
 
+/** This project's Gadget credential directory. */
+export const PROJECT_CREDENTIALS_DIR = join(homedir(), '.config', 'MuseGadgetPair');
+
+/** Resolve the credentials directory: --credentials flag, then the
+ * MUSE_GADGET_CREDENTIALS env var, then this project's directory when
+ * it exists, then the upstream default. */
+export function resolveCredentialsDir(args: string[]): string {
+  const fromFlag = flag(args, '--credentials');
+  if (fromFlag) return fromFlag;
+  if (process.env.MUSE_GADGET_CREDENTIALS) return process.env.MUSE_GADGET_CREDENTIALS;
+  if (existsSync(PROJECT_CREDENTIALS_DIR)) return PROJECT_CREDENTIALS_DIR;
+  return defaultCredentialsDirectory();
+}
+
 function usage(): never {
   console.error(`Usage: bun cli.ts <command> [options]
 Commands:
@@ -30,9 +46,11 @@ Commands:
   unpair  [--credentials <dir>]   Remove pairing.json (keeps identity + sdk_token)
 
 Options:
-  --credentials <dir>   Credentials directory. Default: ${defaultCredentialsDirectory()}
-                        This project keeps Gadget credentials at ~/.config/MuseGadgetPair/
-  --sdk-token-file <file>  File holding the SDK token (for pair). Or pipe it on stdin.
+  --credentials <dir>   Credentials directory. Default: MUSE_GADGET_CREDENTIALS
+                        env var, else ~/.config/MuseGadgetPair when it exists,
+                        else ${defaultCredentialsDirectory()}
+  --sdk-token-file <file>  File holding the SDK token (for pair). Or pipe it on stdin,
+                        or keep it in <credentials>/sdk_token.
 
 Get an SDK token in a browser: ${SDK_TOKEN_URL}`);
   process.exit(2);
@@ -40,10 +58,15 @@ Get an SDK token in a browser: ${SDK_TOKEN_URL}`);
 
 function flag(args: string[], name: string): string | undefined {
   const i = args.indexOf(name);
-  return i >= 0 && i + 1 < args.length ? args[i + 1] : undefined;
+  if (i < 0) return undefined;
+  const value = args[i + 1];
+  if (value === undefined || value.startsWith('--')) {
+    throw new Error(`${name} needs a value`);
+  }
+  return value;
 }
 
-async function readSdkToken(args: string[]): Promise<string> {
+async function readSdkToken(args: string[], dir: string): Promise<string> {
   const file = flag(args, '--sdk-token-file');
   if (file) return validateSDKToken(await readFile(file, 'utf8'));
   if (!process.stdin.isTTY) {
@@ -51,7 +74,12 @@ async function readSdkToken(args: string[]): Promise<string> {
     for await (const chunk of process.stdin) data += chunk;
     if (data.trim()) return validateSDKToken(data);
   }
-  throw new Error(`No SDK token given. Put it in a file and pass --sdk-token-file <file>, or pipe it on stdin. Get one at ${SDK_TOKEN_URL}`);
+  try {
+    return validateSDKToken(await readFile(join(dir, 'sdk_token'), 'utf8'));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  throw new Error(`No SDK token given. Put it in a file and pass --sdk-token-file <file>, pipe it on stdin, or keep it in ${join(dir, 'sdk_token')}. Get one at ${SDK_TOKEN_URL}`);
 }
 
 function ageText(savedAt?: number): string {
@@ -66,7 +94,7 @@ function ageText(savedAt?: number): string {
 async function main(): Promise<void> {
   const [command, ...args] = process.argv.slice(2);
   if (!command) usage();
-  const dir = flag(args, '--credentials') ?? defaultCredentialsDirectory();
+  const dir = resolveCredentialsDir(args);
 
   if (command === 'refresh') {
     const creds = await loadCredentials(dir);
@@ -75,7 +103,16 @@ async function main(): Promise<void> {
       onCredentials: (next) => saveCredentials(next, dir),
       onWarning: (m) => console.error(`warning: ${m}`),
     });
-    const next = await account.refresh();
+    let next;
+    try {
+      next = await account.refresh();
+    } catch (error) {
+      // The tokens may already be rotated server-side while the disk
+      // save failed: the stored refresh token may no longer work.
+      // Say so loudly instead of a bare error.
+      console.error('WARNING: token rotation may have succeeded server-side but the new tokens were NOT saved to disk. The stored refresh token may no longer work; re-pair if refresh keeps failing.');
+      throw error;
+    }
     console.log(`refreshed device ${next.deviceId}; new access token saved at ${new Date((next.savedAt ?? 0) * 1000).toISOString()} (saved to ${join(dir, 'pairing.json')})`);
     return;
   }
@@ -93,14 +130,14 @@ async function main(): Promise<void> {
   }
 
   if (command === 'pair') {
-    const token = await readSdkToken(args);
+    const token = await readSdkToken(args, dir);
     console.log(`SDK token format OK (hint ${token.slice(0, 12)}).`);
     if (process.platform !== 'darwin') {
       console.log('Pairing needs macOS + Bluetooth and cannot run on this machine.');
       console.log('Do it once on a Mac:');
       console.log(`  1. Open ${SDK_TOKEN_URL} in a browser and copy the SDK token.`);
       console.log('  2. On the Mac, run the full client pairing (reference/muse-client):');
-      console.log('       bun run cli pair');
+      console.log('       cd reference/muse-client && bun run cli pair');
       console.log('     Paste the SDK token when prompted and allow Bluetooth access.');
       console.log('  3. Copy the resulting credential files to this machine:');
       console.log(`       pairing.json, identity.json, sdk_token  ->  ${dir}/`);
@@ -109,7 +146,7 @@ async function main(): Promise<void> {
     }
     console.log('This is macOS. This extension does not reimplement Bluetooth pairing.');
     console.log('Pair with the full client (reference/muse-client, vendored in this repo):');
-    console.log('  bun run cli pair --credentials ' + dir);
+    console.log('  cd reference/muse-client && bun run cli pair --credentials ' + dir);
     console.log('Paste the SDK token when prompted, allow Bluetooth, open Muse > Settings > Devices > Add Device (Developer mode enabled), and wait for `Paired successfully`.');
     return;
   }

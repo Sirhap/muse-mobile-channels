@@ -6,10 +6,11 @@ Correlation therefore rests on three facts recorded before the reply can
 exist: the session is dedicated to one conversation generation, the highest
 history sequence seen before sending (the baseline), and confirmation that
 the sent message itself was recorded in that session's history. A reply is
-accepted only when it is a ``message.assistant`` event after the baseline,
-with an empty ``reply_to_message_id`` and a completed status -- the
-discriminator the reference client uses to tell genuine replies apart from
-proactive pushes. A submission whose recording was never confirmed stays
+accepted when it is a ``message.assistant`` event after the baseline with a
+completed status. No reply_to exclusion: a genuine turn answer gets stamped
+with reply_to_message_id whenever the turn was resumed by an internal
+handoff, and the legacy bridge counts it (native_bridge.is_turn_reply,
+2026-10-07 20:47 live loss). A submission whose recording was never confirmed stays
 unknown, and its history is never trusted.
 """
 from __future__ import annotations
@@ -25,6 +26,12 @@ from typing import Callable
 from .gadget_client import GadgetAuthError, GadgetClient, GadgetCredentials, GadgetError, GadgetNetworkError
 from .runtime import ExecutionContext, ExecutionOutcome
 from .storage import Store
+
+# History window for reply_started / query. The fold window is early in
+# the turn, so 100 events usually cover it, but a long session can push
+# the reply-start event out of the latest 100; 500 gives headroom. The
+# history API has no after_seq cursor, so this is a plain limit.
+HISTORY_LIMIT = 500
 
 SCHEMA = '''
 CREATE TABLE IF NOT EXISTS executor_sessions (
@@ -268,7 +275,7 @@ class MuseExecutor:
         try:
             self._validate_owner(context)
             response = client.call_json('chat.history', body={
-                'limit': 100, 'session_id': binding['session_id'],
+                'limit': HISTORY_LIMIT, 'session_id': binding['session_id'],
             }, timeout=15)
             events = response.get('chat_events', [])
             baseline = binding['baseline_seq'] or 0
@@ -278,8 +285,13 @@ class MuseExecutor:
                 if event.get('event_name') != 'message.assistant':
                     continue
                 payload = event.get('payload') or {}
-                if event.get('reply_to_message_id') or payload.get('reply_to_message_id'):
-                    continue
+                # No reply_to exclusion: a genuine turn answer gets stamped
+                # with reply_to_message_id whenever the turn was resumed by
+                # an internal handoff, and the legacy bridge counts it
+                # (native_bridge.is_turn_reply, 2026-10-07 20:47 live loss:
+                # seq 5222, status completed, never delivered). Session
+                # turns are serialized server-side, so the first completed
+                # assistant message after baseline is this turn's answer.
                 if payload.get('status') in ('cancelled', 'canceled'):
                     return ExecutionOutcome('cancelled', evidence='platform_run_cancelled')
                 if payload.get('status') in ('failed', 'error'):
@@ -311,7 +323,7 @@ class MuseExecutor:
         client = self.client_factory()
         try:
             response = client.call_json('chat.history', body={
-                'limit': 100, 'session_id': binding['session_id'],
+                'limit': HISTORY_LIMIT, 'session_id': binding['session_id'],
             }, timeout=15)
             events = response.get('chat_events', []) if isinstance(response, dict) else []
             baseline = binding['baseline_seq'] or 0
@@ -320,9 +332,10 @@ class MuseExecutor:
                     continue
                 if event.get('event_name') != 'message.assistant':
                     continue
-                payload = event.get('payload') or {}
-                if event.get('reply_to_message_id') or payload.get('reply_to_message_id'):
-                    continue
+                # No reply_to exclusion: a genuine answer gets stamped
+                # with reply_to_message_id when the turn was resumed by
+                # an internal handoff (legacy poll_turn counts any
+                # assistant event after baseline as started).
                 return True
             return False
         except Exception:
@@ -638,7 +651,18 @@ class GadgetExecutor:
         except Exception:
             return True
         if result is None:
-            return False
+            # No result file yet. The worker writes its running
+            # placeholder shortly after spawn (connect + sendMessage).
+            # If the attempt is old enough that it should have written
+            # one, no file means the worker died before writing and
+            # the turn is dead — do NOT fold (the combined reply will
+            # never come). A fresh attempt may simply not have written
+            # yet; folding is allowed then.
+            try:
+                age = self.store.clock() - float(binding['created_at'] or 0)
+            except Exception:
+                age = 0.0
+            return age >= 30.0
         if result.get('reply_started') is True:
             return True
         if result.get('state') in ('succeeded', 'failed', 'cancelled', 'unknown'):

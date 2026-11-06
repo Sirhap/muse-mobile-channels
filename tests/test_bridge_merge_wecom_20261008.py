@@ -426,6 +426,51 @@ for CH in ("wecom", "weixin"):
                    and "提交结果尚未确认" in (r.get("content") or "")]) == 1
           and w.queued_ids() == ["m-c"])
 
+    # 8. Recovery row in merge: a merge-kind pending resolved as
+    #    not_submitted while A's turn is still active. The recovery
+    #    row is prepended with nbytes=0, so _reserve_submission does
+    #    NOT pop it; _merge_into_active must drop it from the
+    #    in-memory queue once the merge is committed, or the while
+    #    loop reprocesses it and _consume_recovery raises on the
+    #    already-spent identity (SubmissionPersistenceError), wedging
+    #    the channel: the row stays at the queue head and every later
+    #    step raises. Regression for the parallel-review Major 1.
+    w = World(CH)
+    w.arrive("m-a", "TXT-A")
+    w.step()
+    st = nb.load_state()
+    nb.ch_state(st, CH)["recovery_queue"] = [
+        {"recovery_id": "rec-b",
+         "row": {"msgid": "m-b", "text": "TXT-B", "ts": 1760000001}}]
+    nb.save_state(st)
+    raised = None
+    try:
+        w.step()
+    except Exception as e:  # noqa: BLE001 - the bug is the raise itself
+        raised = e
+    check(f"{CH} recovery merge: step does not raise on a recovery row",
+          raised is None)
+    check(f"{CH} recovery merge: B merged into A's turn, queue drained",
+          w.turn_ids() == ["m-a", "m-b"]
+          and w.queued_ids() == []
+          and w.cs().get("recovery_queue") == []
+          and user_texts(w) == ["TXT-A", "TXT-B"])
+    w.platform.answer("ANS-A")
+    w.step()
+    if CH == "weixin":
+        check(f"{CH} recovery merge: combined reply bound to A alone",
+              [(r["msgid"], r["content"]) for r in w.replies()]
+              == [("m-a", "ANS-A")])
+        check(f"{CH} recovery merge: B closed silently via feedback_clear",
+              feedback_cleared(w) == ["m-b"])
+    else:
+        check(f"{CH} recovery merge: combined reply bound to A, B gets pointer",
+              [(r["msgid"], r["content"]) for r in w.replies()]
+              == [("m-a", "ANS-A"), ("m-b", nb.MERGE_POINTER_TEXT)])
+    check(f"{CH} recovery merge: no active turn and no queue at the end",
+          w.active_ids() == [] and w.queued_ids() == []
+          and w.cs()["processed"] == 1)
+
 # 5. Disable proof: emptying MERGE_CHANNELS restores strict FIFO
 #    (the todo 31 stage-1 behaviour), so the merge can be switched
 #    off again without a code change.

@@ -248,12 +248,18 @@ class RuntimeTests(unittest.TestCase):
         return event
 
     def test_muse_correlated_run_completes_only_its_own_result(self):
-        """Only the reply after the recorded baseline, with no reply-to, counts.
+        """Only the reply after the recorded baseline counts.
 
         A stale completed reply from before this attempt's send (seq at the
-        baseline) and a self-referential push (non-empty reply-to) are both
-        ignored; the genuine completed reply after the baseline is accepted.
-        The stream id is stored as the run handle, with the baseline beside it.
+        baseline) is ignored. A completed reply after the baseline is
+        accepted even when it carries reply_to_message_id: a genuine turn
+        answer gets stamped with one whenever the turn was resumed by an
+        internal handoff, and the legacy bridge counts it
+        (native_bridge.is_turn_reply, 2026-10-07 20:47 live loss: seq
+        5222, status completed, never delivered). Session turns are
+        serialized server-side, so the first completed assistant message
+        after baseline is this turn's answer. The stream id is stored as
+        the run handle, with the baseline beside it.
         """
         self.receive()
         stale = {'event_name': 'message.assistant', 'seq': 5,
@@ -265,10 +271,9 @@ class RuntimeTests(unittest.TestCase):
         row = self.store.connection.execute(
             'SELECT platform_run_id, baseline_seq FROM executor_runs').fetchone()
         self.assertEqual((row['platform_run_id'], row['baseline_seq']), ('stream:7', 5))
-        self._assistant(state, 'push', reply_to='some-id')
-        self._assistant(state, 'correct')
+        self._assistant(state, 'resumed', reply_to='some-id')
         self.assertEqual(runner.tick(), 'succeeded')
-        self.assertEqual(self.store.connection.execute('SELECT text FROM outbound_messages').fetchone()[0], 'correct')
+        self.assertEqual(self.store.connection.execute('SELECT text FROM outbound_messages').fetchone()[0], 'resumed')
 
     def test_muse_unrecorded_stream_stays_unknown(self):
         """A stream the server never recorded never earns a trusted reply.

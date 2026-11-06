@@ -33,7 +33,7 @@ refresh (anywhere, pure HTTPS)             -> fresh access_token + refresh_token
 | File | From wong2/muse-client | What it does |
 |---|---|---|
 | `src/errors.ts` | `src/errors.ts` (verbatim) | `MuseError`, `MuseHttpError`, `MuseProtocolError` |
-| `src/account.ts` | `src/api.ts`, token part only | `MuseAccount.refresh()` / `rotate()` (POST `/device_token/refresh`); `listVMs` deliberately dropped |
+| `src/account.ts` | `src/api.ts`, token part only | `MuseAccount.refresh()` (POST `/device_token/refresh`); `listVMs` deliberately dropped |
 | `src/credentials.ts` | `src/credentials.ts` | `loadCredentials` / `saveCredentials` / `unpair` / `defaultCredentialsDirectory` (same file formats) |
 | `src/sdk-token.ts` | `src/pairing.ts` (`validateSDKToken` only) | SDK-token format check + the token URL |
 | `src/index.ts` | — | Re-exports the public surface |
@@ -74,7 +74,7 @@ Pairing needs **macOS + Bluetooth** and cannot run on this Linux machine.
 1. Open `https://gadgets.muse.ai/settings/sdk-tokens` in a browser, copy the SDK token.
 2. On a Mac, pair with the full client (vendored at `reference/muse-client`):
    ```sh
-   bun run cli pair
+   cd reference/muse-client && bun run cli pair
    ```
    Paste the SDK token when prompted, allow Bluetooth access, open
    Muse > Settings > Devices > Add Device (Developer mode enabled), and wait
@@ -92,9 +92,13 @@ device.
 ## Use it from code
 
 ```ts
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { MuseAccount, loadCredentials, saveCredentials } from './src/index.js';
 
-const dir = process.env.MUSE_GADGET_CREDENTIALS ?? '~/.config/MuseGadgetPair';
+// Node does not expand `~` in a string literal; build the path from homedir.
+const dir = process.env.MUSE_GADGET_CREDENTIALS
+  ?? join(homedir(), '.config', 'MuseGadgetPair');
 const account = new MuseAccount({
   credentials: await loadCredentials(dir),
   onCredentials: (next) => saveCredentials(next, dir),

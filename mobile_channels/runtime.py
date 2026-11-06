@@ -1,6 +1,7 @@
 """Small execution and delivery loops with explicit external outcome semantics."""
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
@@ -8,6 +9,8 @@ from typing import Protocol
 from .delivery import DeliveryClaim, DeliveryStore
 from .models import Claim, OwnershipError, StateError
 from .storage import Store
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -150,6 +153,15 @@ class CoreRunner:
         try:
             self.store.mark_merged(queued["id"], running["id"])
         except (StateError, KeyError):
+            # The fold text is already in the session, but the running
+            # turn closed between the send and the merge, so the queued
+            # task stays queued and its text will be sent again when it
+            # gets its own turn (duplicate send, not a loss). Log it so
+            # the duplicate is visible instead of silent.
+            LOGGER.warning(
+                "fold sent but merge refused: target %s closed; queued %s "
+                "stays queued and will send again",
+                running["id"], queued["id"])
             return None
         return 'folded'
 

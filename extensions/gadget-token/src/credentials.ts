@@ -6,7 +6,7 @@
 // unchanged, and vice versa.
 //
 // Layout of a credentials directory (0600 files, 0700 directory):
-//   pairing.json   access_token, refresh_token, token_type= device,
+//   pairing.json   access_token, refresh_token, token_type: 'device',
 //                  api_url_v2, noise_host, access_token_saved_at,
 //                  sdk_token_hint (first 12 chars of the SDK token)
 //   identity.json  { mac: "aa:bb:cc:dd:ee:ff" }  (device identity)
@@ -14,7 +14,7 @@
 //
 // Never log token values. The helpers below only read/write files.
 
-import { readFile, mkdir, open, rename, unlink } from 'node:fs/promises';
+import { readFile, mkdir, open, rename, unlink, chmod } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -86,6 +86,10 @@ export async function loadCredentials(directory = defaultCredentialsDirectory())
 /** Atomically updates the original pairing file; never logs tokens. */
 export async function saveCredentials(credentials: DeviceCredentials, directory = defaultCredentialsDirectory()): Promise<void> {
   await mkdir(directory, { recursive: true, mode: 0o700 });
+  // mkdir only applies the mode when it creates the directory; tighten
+  // a pre-existing directory explicitly so a loose one is corrected
+  // rather than silently accepted.
+  await chmod(directory, 0o700);
   const path = join(directory, 'pairing.json');
   let previous: Record<string, unknown> = {};
   try {

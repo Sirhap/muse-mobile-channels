@@ -2297,6 +2297,14 @@ class ChannelWorker(threading.Thread):
                              f"{str(e)[:100]}; will retry")
                     self._note_reconnect_failure(e)
                     self.drop_gw()
+                    # Fail safe: a poll failure leaves reply_started
+                    # unknown, and the merge block below must not fold
+                    # into a turn whose reply may already have started.
+                    # Mark it started and persist it via _turns_dirty
+                    # (the post-loop update_cs(turns=alive) only fires
+                    # when a turn field changed).
+                    turn["reply_started"] = True
+                    self._turns_dirty = True
                     alive.append(turn)
                     alive.extend(turns[turns.index(turn) + 1:])
                     break
@@ -2582,6 +2590,16 @@ class ChannelWorker(threading.Thread):
                 current = self.cs()
                 self.update_cs(turns=[merged_turn] + list(current["turns"][1:]),
                                submission_pending=None)
+                # The merge is committed (message sent, recovery identity
+                # consumed). _reserve_submission only pops the queue head
+                # when nbytes is truthy, so a recovery row (nbytes=0)
+                # would otherwise stay at the head and be re-merged,
+                # re-consuming an already-spent recovery identity and
+                # wedging the channel. Drop it from the in-memory queue;
+                # the spool offset must NOT advance for it (nbytes=0),
+                # so this is a plain pop, not a spool commit.
+                if self.queue and self.queue[0][0].get("msgid") == row.get("msgid"):
+                    self.queue.pop(0)
             except Exception as error:
                 self.log("merge submission requires reconciliation:", type(error).__name__)
                 self.drop_gw()

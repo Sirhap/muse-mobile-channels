@@ -58,9 +58,14 @@ class ReconnectPolicyTests(unittest.TestCase):
                 self.now += 100
         self.assertEqual(connect.call_count, 3)
         self.assertEqual(self.worker.poll_turn.call_count, 3)
-        self.assertEqual(self.worker.cs()['turns'], [turn])
+        # The turn is preserved, and a poll failure marks it reply_started
+        # (fail safe: unknown means do not fold into it). Regression for
+        # the parallel-review minor 4.
+        self.assertEqual(self.worker.cs()['turns'],
+                         [dict(turn, reply_started=True)])
         self.worker._send_alert_text.assert_called_once()
-        self.assertEqual(self.worker._send_alert_text.call_args.args[1], turn)
+        self.assertEqual(self.worker._send_alert_text.call_args.args[1],
+                         dict(turn, reply_started=True))
         self.assertTrue(self.worker.cs()['reconnect_exhausted'])
 
     def test_real_idle_success_clears_failure_budget(self):

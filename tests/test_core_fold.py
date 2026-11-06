@@ -228,6 +228,30 @@ class MuseFoldTests(unittest.TestCase):
         assistant_event(self.state, 'partial', status='running')
         self.assertTrue(self.executor.reply_started(context, run_id))
 
+    def test_reply_to_stamped_answer_counts(self):
+        """A handoff-resumed answer carries reply_to_message_id; it is
+        still this turn's answer. The legacy bridge counts it
+        (native_bridge.is_turn_reply, 2026-10-07 20:47 live loss: seq
+        5222, status completed, never delivered). Regression for the
+        parallel-review Major 2: the core used to skip reply_to events
+        in both reply_started and query, so such a turn could be folded
+        into after it answered and its query never completed."""
+        first, run_id = self.submit_one()
+        claim = self.store.connection.execute(
+            "SELECT * FROM tasks WHERE id=?", (first.task_id,)).fetchone()
+        from mobile_channels.models import Claim
+        real_claim = Claim(claim['id'], claim['conversation_id'], claim['generation'],
+                           claim['owner'], claim['attempt_id'], claim['token'])
+        context = CoreRunner(self.store, self.executor, 'worker')._context(real_claim)
+        self.assertFalse(self.executor.reply_started(context, run_id))
+        event = assistant_event(self.state, 'RESUMED-ANSWER', status='completed')
+        event['reply_to_message_id'] = 'u1'
+        event['payload']['reply_to_message_id'] = 'u1'
+        self.assertTrue(self.executor.reply_started(context, run_id))
+        outcome = self.executor.query(context, run_id)
+        self.assertEqual(outcome.state, 'succeeded')
+        self.assertEqual(outcome.text, 'RESUMED-ANSWER')
+
 
 class FakeGadgetClient:
     """In-memory stand-in for GadgetClient, with the fold send_only."""
@@ -317,6 +341,18 @@ class GadgetFoldTests(unittest.TestCase):
         self.assertTrue(self.executor.reply_started(context, run_id))
         self.fake.results[attempt_id] = {'state': 'succeeded', 'text': 'done',
                                          'message_id': 'a1'}
+        self.assertTrue(self.executor.reply_started(context, run_id))
+
+    def test_reply_started_old_attempt_without_result_is_started(self):
+        """No result file on a fresh attempt means the worker just
+        spawned (fold allowed). No result file on an attempt old enough
+        that the worker should have written its running placeholder
+        means the worker died before writing: fail safe, report
+        started so the caller does NOT fold into a dead turn.
+        Regression for the parallel-review minor 3."""
+        first, real_claim, context, run_id = self.submit_one()
+        self.assertFalse(self.executor.reply_started(context, run_id))
+        self.now = 200.0  # 100s after submit; worker should have written by now
         self.assertTrue(self.executor.reply_started(context, run_id))
 
 

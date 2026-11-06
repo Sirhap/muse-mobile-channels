@@ -59,6 +59,8 @@ export class MuseAccount {
     }
   }
 
+  // Kept for upstream parity (wong2 MuseAccount exposes it); the
+  // extension itself never reads it.
   get credentials(): DeviceCredentials { return { ...this.current }; }
 
   private async call(path: string, token: string, body?: unknown): Promise<unknown> {
