@@ -292,6 +292,79 @@ class MuseExecutor:
         finally:
             client.close()
 
+    def reply_started(self, context: ExecutionContext, run_id: str | None) -> bool:
+        """True when the live turn's reply has started generating.
+
+        Any assistant message after the submission baseline — any status,
+        not just completed — means the model has begun its reply, so a
+        fold would arrive too late to be integrated. Fail safe: when the
+        binding is missing or history cannot be read, report started so
+        the caller does NOT fold.
+        """
+        try:
+            self._validate_owner(context)
+        except Exception:
+            return True
+        binding = self._binding(context, run_id)
+        if binding is None:
+            return True
+        client = self.client_factory()
+        try:
+            response = client.call_json('chat.history', body={
+                'limit': 100, 'session_id': binding['session_id'],
+            }, timeout=15)
+            events = response.get('chat_events', []) if isinstance(response, dict) else []
+            baseline = binding['baseline_seq'] or 0
+            for event in events:
+                if event.get('seq', 0) <= baseline:
+                    continue
+                if event.get('event_name') != 'message.assistant':
+                    continue
+                payload = event.get('payload') or {}
+                if event.get('reply_to_message_id') or payload.get('reply_to_message_id'):
+                    continue
+                return True
+            return False
+        except Exception:
+            return True
+        finally:
+            client.close()
+
+    def fold(self, context: ExecutionContext, run_id: str | None, text: str) -> ExecutionOutcome:
+        """Send follow-up text into the live session (official-client steering).
+
+        Opens a new stream on the same session with the follow-up text,
+        mirroring the legacy bridge's _merge_into_active. The text is
+        only reported accepted after history confirms it was recorded;
+        otherwise the outcome is unknown and the caller must NOT mark
+        the message merged.
+        """
+        if not isinstance(text, str) or not text:
+            return ExecutionOutcome('failed', evidence='fold_text_empty')
+        self._validate_owner(context)
+        binding = self._binding(context, run_id)
+        if binding is None:
+            return ExecutionOutcome('unknown', evidence='platform_run_identity_unavailable')
+        client = self.client_factory()
+        try:
+            self._validate_owner(context)
+            sid = binding['session_id']
+            try:
+                pre = self._baseline(client, sid)
+            except Exception:
+                return ExecutionOutcome('unknown', evidence='baseline_unavailable')
+            client._open('chat.stream', body={
+                'items': [{'type': 'text', 'text': text}], 'node_id': self.node_id,
+                'capabilities': {}, 'session_id': sid,
+            })
+            if not self._confirm_recorded(client, sid, pre):
+                return ExecutionOutcome('unknown', evidence='fold_not_recorded')
+            return ExecutionOutcome('accepted', run_id=run_id)
+        except Exception:
+            return ExecutionOutcome('unknown')
+        finally:
+            client.close()
+
     def cancel(self, context: ExecutionContext, run_id: str | None) -> ExecutionOutcome:
         """Request cancellation, then require a correlated terminal platform event."""
         self._validate_owner(context)
@@ -544,6 +617,61 @@ class GadgetExecutor:
             return ExecutionOutcome('unknown', evidence=str(result.get('evidence') or 'worker_unknown'), message_id=message_id)
         return ExecutionOutcome('unknown', evidence=f'unrecognized_result_state_{state}', message_id=message_id)
 
+    def reply_started(self, context: ExecutionContext, run_id: str | None) -> bool:
+        """True when the live turn's reply has started generating.
+
+        The worker records reply_started in its result file the first
+        time it observes an assistant message with text. A terminal
+        result also means the reply started (it finished). Fail safe:
+        when the binding is missing or the result cannot be read,
+        report started so the caller does NOT fold.
+        """
+        try:
+            self._validate_owner(context)
+        except Exception:
+            return True
+        binding = self._binding(context, run_id)
+        if binding is None:
+            return True
+        try:
+            result = self.client.read_result(context.claim.attempt_id)
+        except Exception:
+            return True
+        if result is None:
+            return False
+        if result.get('reply_started') is True:
+            return True
+        if result.get('state') in ('succeeded', 'failed', 'cancelled', 'unknown'):
+            return True
+        return False
+
+    def fold(self, context: ExecutionContext, run_id: str | None, text: str) -> ExecutionOutcome:
+        """Send follow-up text into the live side session (official-client steering).
+
+        Spawns a send-only worker that sends the text to the same side
+        session and exits without subscribing, so it never races the
+        running turn's own worker. The fold is only reported accepted
+        when the send-only worker's result carries a message id (the
+        send landed); otherwise the outcome is unknown and the caller
+        must NOT mark the message merged.
+        """
+        if not isinstance(text, str) or not text:
+            return ExecutionOutcome('failed', evidence='fold_text_empty')
+        self._validate_owner(context)
+        binding = self._binding(context, run_id)
+        if binding is None:
+            return ExecutionOutcome('unknown', evidence='platform_run_identity_unavailable')
+        try:
+            session_id = self._session(context)
+            result = self.client.send_only(session_id, text)
+        except Exception as exc:
+            return ExecutionOutcome('unknown', evidence=str(exc))
+        if isinstance(result, dict) and result.get('state') == 'sent':
+            mid = result.get('message_id')
+            if isinstance(mid, str) and mid:
+                return ExecutionOutcome('accepted', run_id=run_id, message_id=mid)
+        return ExecutionOutcome('unknown', evidence='fold_send_unconfirmed')
+
     def cancel(self, context: ExecutionContext, run_id: str | None) -> ExecutionOutcome:
         """Kill the worker and report the turn cancelled."""
         self._validate_owner(context)
@@ -693,6 +821,42 @@ class DualTrackExecutor:
         elif track == 'native':
             try:
                 return self.fallback.cancel(context, run_id)
+            except Exception as exc:
+                return ExecutionOutcome('unknown', evidence=str(exc))
+        else:
+            return ExecutionOutcome('unknown', evidence='no_track_binding')
+
+    def reply_started(self, context: ExecutionContext, run_id: str | None) -> bool:
+        """Route the reply-started check to the track bound to this attempt.
+
+        Fail safe: no track binding means the reply is treated as started,
+        so the caller does NOT fold.
+        """
+        track = self.current_track(context.claim.attempt_id)
+        if track == 'gadget':
+            try:
+                return self.primary.reply_started(context, run_id)
+            except Exception:
+                return True
+        elif track == 'native':
+            try:
+                return self.fallback.reply_started(context, run_id)
+            except Exception:
+                return True
+        else:
+            return True
+
+    def fold(self, context: ExecutionContext, run_id: str | None, text: str) -> ExecutionOutcome:
+        """Route the fold send to the track bound to this attempt."""
+        track = self.current_track(context.claim.attempt_id)
+        if track == 'gadget':
+            try:
+                return self.primary.fold(context, run_id, text)
+            except Exception as exc:
+                return ExecutionOutcome('unknown', evidence=str(exc))
+        elif track == 'native':
+            try:
+                return self.fallback.fold(context, run_id, text)
             except Exception as exc:
                 return ExecutionOutcome('unknown', evidence=str(exc))
         else:

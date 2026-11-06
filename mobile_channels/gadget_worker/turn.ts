@@ -36,12 +36,19 @@ interface Args {
   timeoutSeconds: number;
   credentialsDir: string;
   vmId?: string;
+  // Send-only mode (fold): connect, send the message to the existing
+  // session, record the ack and exit WITHOUT subscribing. The running
+  // turn's own worker keeps the subscription; a second subscriber
+  // would race it. Used by the core fold (official-client steering).
+  sendOnly?: boolean;
 }
 
 function parseArgs(argv: string[]): Args {
   const values = new Map<string, string>();
+  let sendOnly = false;
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!;
+    if (arg === '--send-only') { sendOnly = true; continue; }
     if (!arg.startsWith('--')) throw new Error(`unexpected argument: ${arg}`);
     const key = arg.slice(2);
     const value = argv[++i];
@@ -52,7 +59,7 @@ function parseArgs(argv: string[]): Args {
   const messageFile = values.get('message-file');
   const out = values.get('out');
   if (!session || !messageFile || !out) {
-    throw new Error('usage: turn --session <uuid> --message-file <path> --out <path> [--timeout <seconds>] [--credentials <dir>] [--vm <id>]');
+    throw new Error('usage: turn --session <uuid> --message-file <path> --out <path> [--timeout <seconds>] [--credentials <dir>] [--vm <id>] [--send-only]');
   }
   return {
     session,
@@ -61,10 +68,11 @@ function parseArgs(argv: string[]): Args {
     timeoutSeconds: Number(values.get('timeout') ?? 900),
     credentialsDir: values.get('credentials') ?? join(homedir(), '.config', 'MuseGadgetPair'),
     vmId: values.get('vm'),
+    sendOnly,
   };
 }
 
-type ResultState = 'running' | 'succeeded' | 'failed' | 'cancelled' | 'unknown';
+type ResultState = 'running' | 'succeeded' | 'failed' | 'cancelled' | 'unknown' | 'sent';
 
 interface TurnResult {
   state: ResultState;
@@ -72,6 +80,10 @@ interface TurnResult {
   message_id?: string;
   session_id?: string;
   evidence?: string;
+  // True once any assistant message has been observed in this turn.
+  // The executor reads it to decide whether a fold would still be
+  // integrated (reply not started) or would arrive too late.
+  reply_started?: boolean;
 }
 
 function writeResult(out: string, result: TurnResult): void {
@@ -121,6 +133,12 @@ async function main(): Promise<number> {
 
     const ack = await client.sendMessage(text, { sessionId: args.session });
     console.error(`sent, message id ${ack.messageId}`);
+    if (args.sendOnly) {
+      // Fold send: the message is in the session; the running turn's
+      // own worker keeps the subscription and will see the reply.
+      settle({ state: 'sent', message_id: ack.messageId, session_id: args.session });
+      return 0;
+    }
     settle({ state: 'running', message_id: ack.messageId, session_id: args.session });
 
     // A subscribe on a just-created side chat can stall server-side (seen
@@ -164,6 +182,7 @@ async function main(): Promise<number> {
     let terminalTaskStatus: string | undefined;
     let timedOut = false;
     let subEnded = false;
+    let replyStartedRecorded = false;
     let next = iterator.next();
     void next.catch(() => {});
     while (true) {
@@ -189,6 +208,16 @@ async function main(): Promise<number> {
         terminalTaskStatus = event.payload.status;
       }
       turn.feed(event);
+      // The reply has started once any assistant message carries text,
+      // even before it is done. Record it so the executor can refuse a
+      // fold that would arrive too late to be integrated.
+      if (!replyStartedRecorded) {
+        const started = [...turn.replies.values()].some((r) => r.text && r.text.trim());
+        if (started) {
+          replyStartedRecorded = true;
+          settle({ state: 'running', message_id: ack.messageId, session_id: args.session, reply_started: true });
+        }
+      }
       next = iterator.next();
       void next.catch(() => {});
     }

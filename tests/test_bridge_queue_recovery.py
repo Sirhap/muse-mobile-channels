@@ -38,6 +38,11 @@ class QueueRecoveryTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name)
         self.bridge = load_bridge()
+        # Queue recovery is pinned under strict FIFO: merging is OFF
+        # here (the 'test' channel has no gateway object in this
+        # harness, so a merge would fail on gw._open). Merging itself
+        # is pinned separately in test_bridge_merge_wecom_20261008.py.
+        self.bridge.MERGE_CHANNELS = set()
         self.bridge.BASE = str(self.base)
         self.bridge.STATE_F = str(self.base / 'state.json')
         self.bridge.CFG = {'channels': {'test': {}}}

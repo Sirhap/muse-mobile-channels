@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 CHECKS = (
     'tests/test_core_storage.py',
     'tests/test_core_runtime.py',
+    'tests/test_core_fold.py',
     'tests/test_core_ingress_rejection.py',
     'tests/test_core_late_delivery.py',
     'tests/test_executor_install.py',

@@ -19,6 +19,7 @@ import shutil
 import signal
 import subprocess
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -170,6 +171,63 @@ class GadgetClient:
         finally:
             log_file.close()
         return proc
+
+    def send_only(
+        self,
+        session_id: str,
+        text: str,
+        timeout_seconds: int = 60,
+    ) -> dict | None:
+        """Send one message to an existing session without subscribing.
+
+        Spawns a send-only worker (``--send-only``) under a fresh fold id,
+        so it never touches a running turn's result file. Waits for the
+        worker to exit and returns its result dict (state 'sent' with a
+        message_id when the send landed), or None when it produced no
+        result. Used by the core fold (official-client steering).
+        """
+        if self._closed:
+            raise GadgetError("GadgetClient is closed")
+        if not self.is_configured():
+            raise GadgetAuthError("Gadget pairing credentials are not installed")
+        fold_id = f"fold-{uuid.uuid4().hex}"
+        result_path, message_path, log_path = self._paths(fold_id)
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(self.run_dir, 0o700)
+        except OSError:
+            pass
+        message_path.write_text(text, encoding="utf-8")
+        os.chmod(message_path, 0o600)
+        log_file = open(log_path, "ab")
+        try:
+            proc = subprocess.Popen(
+                [self.runner, str(self.worker_script),
+                 "--session", session_id,
+                 "--message-file", str(message_path),
+                 "--out", str(result_path),
+                 "--timeout", str(int(timeout_seconds)),
+                 "--credentials", str(self.credentials.directory),
+                 "--send-only"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=log_file,
+                start_new_session=True,
+                close_fds=True,
+            )
+        except OSError as exc:
+            raise GadgetNetworkError(f"cannot start Gadget worker: {exc}") from exc
+        finally:
+            log_file.close()
+        try:
+            proc.wait(timeout=timeout_seconds + 10)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            return None
+        return self.read_result(fold_id)
 
     def read_result(self, attempt_id: str) -> dict | None:
         """The worker's latest recorded outcome, or None when it has written nothing yet."""
