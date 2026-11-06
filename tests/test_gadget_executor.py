@@ -367,7 +367,7 @@ class TestDualTrackExecutor(unittest.TestCase):
         # 模拟 GadgetExecutor 成功写入 executor_runs
         with self.store.transaction():
             self.store.connection.execute(
-                "INSERT INTO executor_runs VALUES (?,?,?,?,?,?)",
+                "INSERT INTO executor_runs (attempt_id, session_id, platform_run_id, status, created_at, track) VALUES (?,?,?,?,?,?)",
                 (context.claim.attempt_id, "s1", "gadget_run_1", "accepted", self.now, "gadget"),
             )
 
@@ -388,7 +388,7 @@ class TestDualTrackExecutor(unittest.TestCase):
         def fallback_submit_side_effect(ctx):
             with self.store.transaction():
                 self.store.connection.execute(
-                    "INSERT INTO executor_runs VALUES (?,?,?,?,?,?)",
+                    "INSERT INTO executor_runs (attempt_id, session_id, platform_run_id, status, created_at, track) VALUES (?,?,?,?,?,?)",
                     (ctx.claim.attempt_id, "s_nat", "native_run_1", "accepted", self.now, "native"),
                 )
             return ExecutionOutcome("accepted", run_id="native_run_1")
@@ -411,7 +411,7 @@ class TestDualTrackExecutor(unittest.TestCase):
         def fallback_side_effect(ctx):
             with self.store.transaction():
                 self.store.connection.execute(
-                    "INSERT INTO executor_runs VALUES (?,?,?,?,?,?)",
+                    "INSERT INTO executor_runs (attempt_id, session_id, platform_run_id, status, created_at, track) VALUES (?,?,?,?,?,?)",
                     (ctx.claim.attempt_id, "s_nat", f"native_{ctx.claim.attempt_id}", "accepted", self.now, "native"),
                 )
             return ExecutionOutcome("accepted", run_id=f"native_{ctx.claim.attempt_id}")
@@ -446,7 +446,7 @@ class TestDualTrackExecutor(unittest.TestCase):
         context1 = self._create_context("m_task1")
         with self.store.transaction():
             self.store.connection.execute(
-                "INSERT INTO executor_runs VALUES (?,?,?,?,?,?)",
+                "INSERT INTO executor_runs (attempt_id, session_id, platform_run_id, status, created_at, track) VALUES (?,?,?,?,?,?)",
                 (context1.claim.attempt_id, "s_gadget", "gadget_run_1", "accepted", self.now, "gadget"),
             )
         self.assertEqual(self.dual_executor.current_track(context1.claim.attempt_id), "gadget")
@@ -455,7 +455,7 @@ class TestDualTrackExecutor(unittest.TestCase):
         context2 = self._create_context("m_task2")
         with self.store.transaction():
             self.store.connection.execute(
-                "INSERT INTO executor_runs VALUES (?,?,?,?,?,?)",
+                "INSERT INTO executor_runs (attempt_id, session_id, platform_run_id, status, created_at, track) VALUES (?,?,?,?,?,?)",
                 (context2.claim.attempt_id, "s_native", "native_run_2", "accepted", self.now, "native"),
             )
         self.assertEqual(self.dual_executor.current_track(context2.claim.attempt_id), "native")
@@ -538,7 +538,7 @@ class TestEdgeCasesAndHttpErrors(unittest.TestCase):
 
         with self.store.transaction():
             self.store.connection.execute(
-                "INSERT INTO executor_runs VALUES (?, 's_1', 'run_orig', 'accepted', 100.0, 'gadget')",
+                "INSERT INTO executor_runs (attempt_id, session_id, platform_run_id, status, created_at, track) VALUES (?, 's_1', 'run_orig', 'accepted', 100.0, 'gadget')",
                 (claim.attempt_id,)
             )
 

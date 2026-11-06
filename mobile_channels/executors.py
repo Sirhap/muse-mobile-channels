@@ -1,8 +1,16 @@
 """Muse execution adapter with persisted sessions and explicit run correlation.
 
-The legacy stream API does not promise a run identifier. A stream accepted
-without such an identifier remains unknown; this adapter never associates an
-arbitrary later assistant message with the task merely by its history position.
+The legacy stream API does not promise a run identifier: ``_open`` returns
+only a per-connection stream id, never a run id (proven live 2026-11-06).
+Correlation therefore rests on three facts recorded before the reply can
+exist: the session is dedicated to one conversation generation, the highest
+history sequence seen before sending (the baseline), and confirmation that
+the sent message itself was recorded in that session's history. A reply is
+accepted only when it is a ``message.assistant`` event after the baseline,
+with an empty ``reply_to_message_id`` and a completed status -- the
+discriminator the reference client uses to tell genuine replies apart from
+proactive pushes. A submission whose recording was never confirmed stays
+unknown, and its history is never trusted.
 """
 from __future__ import annotations
 
@@ -25,7 +33,8 @@ CREATE TABLE IF NOT EXISTS executor_sessions (
 CREATE TABLE IF NOT EXISTS executor_runs (
     attempt_id TEXT PRIMARY KEY REFERENCES execution_attempts(id),
     session_id TEXT NOT NULL, platform_run_id TEXT, status TEXT NOT NULL,
-    created_at REAL NOT NULL, track TEXT NOT NULL DEFAULT 'native'
+    created_at REAL NOT NULL, track TEXT NOT NULL DEFAULT 'native',
+    baseline_seq INTEGER
 );
 '''
 
@@ -39,6 +48,8 @@ def ensure_executor_schema(store: Store) -> None:
         columns = [row['name'] for row in store.connection.execute("PRAGMA table_info(executor_runs)").fetchall()]
         if 'track' not in columns:
             store.connection.execute("ALTER TABLE executor_runs ADD COLUMN track TEXT NOT NULL DEFAULT 'native'")
+        if 'baseline_seq' not in columns:
+            store.connection.execute("ALTER TABLE executor_runs ADD COLUMN baseline_seq INTEGER")
 
 
 def validate_transport_source() -> Path:
@@ -77,13 +88,52 @@ def bridge_client():
 
 
 class MuseExecutor:
-    """Bind sessions to conversation generations and query only a platform run ID."""
+    """Bind sessions to conversation generations and correlate by recorded history.
+
+    Each conversation generation gets its own side session. A submission is
+    accepted only after the sent message is confirmed recorded in that
+    session's history; the reply is then matched by sequence after the
+    pre-send baseline, an empty reply-to, and a completed status.
+    """
 
     def __init__(self, store: Store, client_factory: Callable = bridge_client,
-                 node_id: str = 'native-bridge'):
-        """Use a short-lived client per operation and never persist credentials."""
+                 node_id: str = 'native-bridge', confirm_timeout: float = 10.0,
+                 poll_interval: float = 1.0):
+        """Use a short-lived client per operation and never persist credentials.
+
+        The submit call keeps its client open until the sent message is
+        confirmed recorded: closing right after ``_open`` drops the stream
+        before the server records it (proven live 2026-11-06).
+        """
         self.store, self.client_factory, self.node_id = store, client_factory, node_id
+        self.confirm_timeout, self.poll_interval = confirm_timeout, poll_interval
         ensure_executor_schema(store)
+
+    def _baseline(self, client, session_id: str) -> int:
+        """Highest history sequence in the session before this attempt sends."""
+        response = client.call_json('chat.history', body={
+            'limit': 1, 'session_id': session_id,
+        }, timeout=15)
+        events = response.get('chat_events', []) if isinstance(response, dict) else []
+        return max((event.get('seq', 0) for event in events), default=0)
+
+    def _confirm_recorded(self, client, session_id: str, baseline: int) -> bool:
+        """Poll history on the same connection until a new event appears.
+
+        ``_open`` is fire-and-forget: the frame alone does not prove the
+        message landed. Only a history event after the baseline proves it.
+        """
+        deadline = time.time() + self.confirm_timeout
+        while True:
+            response = client.call_json('chat.history', body={
+                'limit': 10, 'session_id': session_id,
+            }, timeout=15)
+            events = response.get('chat_events', []) if isinstance(response, dict) else []
+            if any(event.get('seq', 0) > baseline for event in events):
+                return True
+            if time.time() >= deadline:
+                return False
+            time.sleep(self.poll_interval)
 
     def _session(self, client, context: ExecutionContext) -> str:
         """Create a separate external session for each bound conversation generation."""
@@ -117,7 +167,17 @@ class MuseExecutor:
                 raise PermissionError('task cancellation was requested before submission')
 
     def submit(self, context: ExecutionContext) -> ExecutionOutcome:
-        """Persist the external session binding before opening exactly one stream."""
+        """Persist the external session binding before opening exactly one stream.
+
+        The stream API returns no run id (``_open`` yields only a
+        per-connection stream id), so the run handle stored here is that
+        stream id; correlation itself rests on the recorded baseline, not on
+        the handle. The client stays open until the sent message is confirmed
+        recorded in history -- closing right after ``_open`` drops the stream.
+        A submission whose recording was never confirmed stays unknown and its
+        history is never trusted; the ambiguous row is preserved, never
+        deleted, so the attempt cannot be silently sent twice.
+        """
         client = None
         try:
             client = self.client_factory()
@@ -131,6 +191,10 @@ class MuseExecutor:
                 return ExecutionOutcome('unknown', evidence='attempt_already_has_external_binding')
             self._validate_owner(context, submitting=True)
             sid = self._session(client, context)
+            try:
+                baseline = self._baseline(client, sid)
+            except Exception:
+                return ExecutionOutcome('unknown', evidence='baseline_unavailable')
             with self.store.transaction():
                 task = self.store._owned(context.claim)
                 if task['cancel_requested']:
@@ -141,19 +205,22 @@ class MuseExecutor:
                     (context.claim.attempt_id, sid, None, 'submission_unknown', self.store.clock()),
                 )
             self._validate_owner(context, submitting=True)
-            response = client._open('chat.stream', body={
+            stream = client._open('chat.stream', body={
                 'items': [{'type': 'text', 'text': context.text}], 'node_id': self.node_id,
                 'capabilities': {}, 'session_id': sid,
             })
-            # Do not invent support for correlation: only an explicit platform
-            # run ID returned by this call makes automated polling safe.
-            run_id = response.get('run_id') if isinstance(response, dict) else None
-            if not isinstance(run_id, str) or not run_id:
+            if isinstance(stream, dict) and isinstance(stream.get('run_id'), str) and stream['run_id']:
+                run_id = stream['run_id']
+            elif isinstance(stream, int):
+                run_id = f'stream:{stream}'
+            else:
                 return ExecutionOutcome('unknown', evidence='platform_run_identity_unavailable')
+            if not self._confirm_recorded(client, sid, baseline):
+                return ExecutionOutcome('unknown', evidence='submission_not_recorded')
             with self.store.transaction():
                 self.store.connection.execute(
-                    "UPDATE executor_runs SET platform_run_id=?,status='accepted' WHERE attempt_id=?",
-                    (run_id, context.claim.attempt_id),
+                    "UPDATE executor_runs SET platform_run_id=?,baseline_seq=?,status='accepted' WHERE attempt_id=?",
+                    (run_id, baseline, context.claim.attempt_id),
                 )
             return ExecutionOutcome('accepted', run_id=run_id)
         except Exception:
@@ -177,7 +244,14 @@ class MuseExecutor:
         return row
 
     def query(self, context: ExecutionContext, run_id: str | None) -> ExecutionOutcome:
-        """Read only events explicitly correlated with the original platform run."""
+        """Read only replies correlated with the confirmed submission.
+
+        The binding guarantees the sent message was recorded; the reply is
+        the first completed assistant event after the recorded baseline, in
+        this attempt's dedicated session, with an empty reply-to (genuine
+        replies, not proactive pushes). Events at or before the baseline --
+        including any earlier attempt's output in this session -- are ignored.
+        """
         self._validate_owner(context)
         binding = self._binding(context, run_id)
         if binding is None:
@@ -189,15 +263,20 @@ class MuseExecutor:
                 'limit': 100, 'session_id': binding['session_id'],
             }, timeout=15)
             events = response.get('chat_events', [])
+            baseline = binding['baseline_seq'] or 0
             for event in sorted(events, key=lambda value: value.get('seq', 0)):
+                if event.get('seq', 0) <= baseline:
+                    continue
+                if event.get('event_name') != 'message.assistant':
+                    continue
                 payload = event.get('payload') or {}
-                if (event.get('run_id') or payload.get('run_id')) != binding['platform_run_id']:
+                if event.get('reply_to_message_id') or payload.get('reply_to_message_id'):
                     continue
                 if payload.get('status') in ('cancelled', 'canceled'):
                     return ExecutionOutcome('cancelled', evidence='platform_run_cancelled')
                 if payload.get('status') in ('failed', 'error'):
                     return ExecutionOutcome('failed', evidence='platform_run_failed')
-                if event.get('event_name') == 'message.assistant' and payload.get('status') in ('completed', 'complete', 'succeeded'):
+                if payload.get('status') in ('completed', 'complete', 'succeeded'):
                     text = payload.get('display_text')
                     if isinstance(text, str):
                         return ExecutionOutcome('succeeded', text=text)
