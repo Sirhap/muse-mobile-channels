@@ -137,7 +137,16 @@ Muse 账号；接个人微信需要一个能当 iLink 机器人的微信号，�
 
 ### 双轨：主轨 Gadget，备轨 Native
 
-`mobile_channels/executors.py` 的 `DualTrackExecutor`（`mobile_channels/__main__.py` 里建成，服务描述即 `DualTrackExecutor: Gadget primary, Native fallback`）。
+**默认还是走 Cookie（Native 桥）。** Gadget 是可选的，不配也能跑，
+不配时自动走 Native 备轨，不用改配置。
+
+Gadget 是 Meta 的 Muse 设备凭证，跟浏览器 Cookie 完全独立：配对一次
+后得到 `pairing.json`／`identity.json`／`sdk_token` 三个文件，存在
+`~/.config/MuseGadgetPair/`，之后靠 refresh token 在任何机器上轮换
+access token，不依赖浏览器登录态。所以 Cookie 死的时候 Gadget 还能用，
+反过来也一样。配对须在 Mac 上做一次（蓝牙），步骤见扩展的 README。
+
+`mobile_channels/executors.py` 的 `DualTrackExecutor`（`mobile_channels/__main__.py` 里建成，服务描述即 `DualTrackExecutor: Gadget primary, Native fallback`）。配了 Gadget 时优先走它，没配、熔断或失败时自动降级到 Native。
 
 | 轨道 | 执行器 | 底层 | 角色 |
 |---|---|---|---|
@@ -166,10 +175,19 @@ Muse 账号；接个人微信需要一个能当 iLink 机器人的微信号，�
 
 审批决策现要求显式会话/操作者授权；无来源范围时，需外部配置 `APPROVAL_ADMINS_JSON`，例如 `{"wecom":{"实际聊天ID":["管理员ID"]}}`。没有授权映射会拒绝决策，普通消息白名单不自动授予审批权。配置应保存在仓库外。
 
-本仓库不含任何凭证。两个网关各自从仓库外的 env 文件读凭证：
+本仓库不含任何凭证。凭证分三类，都只存本机配置目录：
 
-- 个人微信：`~/.config/weixin-bot/credentials.env`（`ILINK_CRED_FILE`）
-- 企业微信：`~/.config/wecom-bot/credentials.env`（`WECOM_CRED_FILE`）
+- 渠道凭证（两个网关各自从仓库外的 env 文件读）：
+  - 个人微信：`~/.config/weixin-bot/credentials.env`（`ILINK_CRED_FILE`）
+  - 企业微信：`~/.config/wecom-bot/credentials.env`（`WECOM_CRED_FILE`）
+- 桥凭证（默认走 Cookie，见下）：`~/.config/native-bridge/` 下的
+  `cookies.txt`、`vm_id.txt`、`token.json`（目录 0700、文件 0600）。
+  Cookie 就是你在浏览器登录 muse.ai 后的会话凭证，桥拿它去换连接
+  token；`token.json` 是静态 token 回退。拿取与恢复见
+  [凭证恢复说明](native-bridge/get-muse-token.md)。
+- Gadget 凭证（可选，不配也能跑）：`~/.config/MuseGadgetPair/` 下的
+  `pairing.json`、`identity.json`、`sdk_token`（目录 0700、文件
+  0600）。配对与轮换见 `extensions/gadget-token/README.md`。
 
 运行时状态（`state/`）、虚拟环境（`.venv/`）、备份（`*.bak-*`）都已被
 gitignore 排除；探针结果转储（`native-probe/probe*_results.txt`、
