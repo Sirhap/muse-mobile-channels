@@ -90,7 +90,7 @@ def main(argv: list[str] | None = None) -> int:
 
 def run_core(database: Path, modes: Path, once: bool = False) -> dict:
     """Hold all account mode leases while advancing the opt-in execution core."""
-    from .executors import MuseExecutor, validate_transport_source
+    from .executors import DualTrackExecutor, validate_transport_source
     from .modes import ChannelLease, ModeError
     from .runtime import CoreRunner
     from .readiness import ensure_executable_database
@@ -111,7 +111,9 @@ def run_core(database: Path, modes: Path, once: bool = False) -> dict:
         routes = set(map(tuple, store.connection.execute('SELECT DISTINCT channel,account_id FROM conversations')))
         if not routes <= scopes:
             raise ModeError('database contains accounts not owned by this runner configuration')
-        runner = CoreRunner(store, MuseExecutor(store), f'core-{os.getpid()}')
+        # Dual track: Gadget side chats first, native MuseExecutor as fallback.
+        # Without this the core path would never exercise the Gadget track.
+        runner = CoreRunner(store, DualTrackExecutor(store), f'core-{os.getpid()}')
         while True:
             state = runner.tick()
             if once:
