@@ -2432,7 +2432,20 @@ class ChannelWorker(threading.Thread):
             cs = self.cs()
         if self.queue and not cs["turns"]:
             self._start_next()
-        cs = self.cs()
+            cs = self.cs()
+            # A freshly started turn has not replied yet: fold any
+            # messages still queued into it, so they ride this turn
+            # instead of each waiting for a turn of their own. Skip
+            # when the queue head is the row that just started (a
+            # recovery row carries nbytes=0, so _reserve_submission
+            # does not pop it, and re-merging it would re-consume
+            # an already-spent recovery identity).
+            if self.queue and cs["turns"] and self.ch in MERGE_CHANNELS:
+                started_ids = cs["turns"][-1].get("ids") or [
+                    cs["turns"][-1].get("msgid")]
+                if self.queue[0][0].get("msgid") not in started_ids:
+                    self._merge_into_active()
+                    cs = self.cs()
         if not cs["turns"] and not self.queue:
             self.idle_push_scan(cs)
         cs = self.cs()

@@ -156,6 +156,16 @@ class FakePlatform:
                         "message_id": f"a{self.seq}",
                         "status": "completed"}})
 
+    def start_reply(self, text):
+        """An assistant row with text but no completed status: the
+        model has started replying (reply_started) without finishing,
+        so the turn stays open and later arrivals must queue."""
+        self.seq += 1
+        self.events.append({
+            "event_name": "message.assistant", "seq": self.seq,
+            "payload": {"display_text": text, "role": "assistant",
+                        "message_id": f"a{self.seq}"}})
+
     def close(self):
         pass
 
@@ -320,6 +330,52 @@ for CH in ("wecom", "weixin"):
           w.active_ids() == [] and w.queued_ids() == []
           # One turn covered m-a+m-b+m-c.
           and w.cs()["processed"] == 1)
+
+    # 3b. Queued messages fold into the NEXT turn when it starts.
+    # B and C arrive after A's reply has started, so they cannot
+    # merge into A and must queue. When A closes and B starts as
+    # the new turn, C (still queued, arrived before B's reply
+    # started) folds into B's turn at once instead of waiting for
+    # a turn of its own — one combined reply for B+C.
+    w = World(CH)
+    w.arrive("m-a", "TXT-A")
+    w.step()
+    w.platform.start_reply("ANS-A-PARTIAL")
+    w.step()
+    check(f"{CH} queue-fold: A reply started, turn still open",
+          w.active_ids() == ["m-a"]
+          and w.cs()["turns"][0].get("reply_started") is True)
+    w.arrive("m-b", "TXT-B")
+    w.arrive("m-c", "TXT-C")
+    w.step()
+    check(f"{CH} queue-fold: B and C queue behind started A, "
+          "they do NOT merge into it",
+          w.queued_ids() == ["m-b", "m-c"]
+          and user_texts(w) == ["TXT-A"]
+          and w.turn_ids() == ["m-a"])
+    w.platform.answer("ANS-A")
+    w.step()
+    check(f"{CH} queue-fold: when B starts, C folds into B at once",
+          w.active_ids() == ["m-b"] and w.queued_ids() == []
+          and w.turn_ids() == ["m-b", "m-c"]
+          and user_texts(w) == ["TXT-A", "TXT-B", "TXT-C"])
+    w.platform.answer("ANS-B")
+    w.step()
+    if CH == "weixin":
+        check(f"{CH} queue-fold: combined reply bound to B alone",
+              [(r["msgid"], r["content"]) for r in w.replies()]
+              == [("m-a", "ANS-A"), ("m-b", "ANS-B")])
+        check(f"{CH} queue-fold: C closed silently via feedback_clear",
+              feedback_cleared(w) == ["m-c"])
+    else:
+        check(f"{CH} queue-fold: combined reply + pointer for C",
+              [(r["msgid"], r["content"]) for r in w.replies()]
+              == [("m-a", "ANS-A"), ("m-b", "ANS-B"),
+                  ("m-c", nb.MERGE_POINTER_TEXT)])
+    check(f"{CH} queue-fold: two turns total (A, then B+C), "
+          "no queue left",
+          w.active_ids() == [] and w.queued_ids() == []
+          and w.cs()["processed"] == 2)
 
     # 4. Terminal receipt: a queued message whose merge send is refused
     #    AFTER the submission was reserved takes the reconciliation
