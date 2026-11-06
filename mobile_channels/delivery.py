@@ -1,10 +1,21 @@
 """Transactional delivery claims; uncertain platform outcomes never auto-retry."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+from dataclasses import dataclass, field
 
 from .models import OwnershipError, StateError
 from .storage import Store
+
+# A delivery_unknown part is auto-rejected after 10 minutes without a
+# resolution, or immediately once it has gone unknown twice (the retry
+# itself failed): either way it must stop head-blocking its conversation
+# forever. 10 minutes is long enough for an operator to resolve a real
+# uncertain send, and short enough that a stuck reply does not block
+# the whole session for hours.
+DELIVERY_UNKNOWN_MAX_SECONDS = 600.0
+DELIVERY_UNKNOWN_MAX_ATTEMPTS = 2
+DELIVERY_FAILED_RECEIPT_TEXT = "回复已生成但发送失败，请再发一次。"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS outbound_parts (
@@ -12,7 +23,7 @@ CREATE TABLE IF NOT EXISTS outbound_parts (
     part_index INTEGER NOT NULL, text TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending'
         CHECK(state IN ('pending','sending','retry_wait','delivered','delivery_unknown','rejected')),
     owner TEXT, token INTEGER NOT NULL DEFAULT 0, lease_until REAL,
-    retry_at REAL NOT NULL DEFAULT 0, receipt TEXT,
+    retry_at REAL NOT NULL DEFAULT 0, receipt TEXT, media_json TEXT NOT NULL DEFAULT '[]',
     UNIQUE(outbound_id,part_index)
 );
 CREATE INDEX IF NOT EXISTS delivery_queue ON outbound_parts(state,retry_at);
@@ -47,6 +58,10 @@ class DeliveryClaim:
     chat_type: str
     chat_id: str
     generation: int
+    # Media for this outbound message, passed through verbatim from
+    # outbound_messages.media_json. Only the first part carries it, so
+    # the transport sends each file once; later parts carry [].
+    media: list = field(default_factory=list)
 
 
 class DeliveryStore:
@@ -60,9 +75,30 @@ class DeliveryStore:
             for statement in SCHEMA.split(";"):
                 if statement.strip():
                     self.connection.execute(statement)
+            columns = {row["name"] for row in self.connection.execute(
+                "PRAGMA table_info(outbound_parts)")}
+            if "media_json" not in columns:
+                self.connection.execute(
+                    "ALTER TABLE outbound_parts ADD COLUMN media_json "
+                    "TEXT NOT NULL DEFAULT '[]'")
 
-    def prepare(self, outbound_id: str, chunks: list[str]) -> list[str]:
-        """Save stable ordered part IDs once, preserving the original message text."""
+    def _delivery_failed_receipt(self, outbound_id: str) -> None:
+        """Write the user-facing notice for a terminally failed delivery."""
+        row = self.connection.execute(
+            "SELECT task_id,conversation_id FROM outbound_messages WHERE id=?",
+            (outbound_id,)).fetchone()
+        if row is not None:
+            self.store.add_receipt(row["task_id"], row["conversation_id"],
+                                   "delivery_failed", DELIVERY_FAILED_RECEIPT_TEXT)
+
+    def prepare(self, outbound_id: str, chunks: list[str],
+                media: list | None = None) -> list[str]:
+        """Save stable ordered part IDs once, preserving the original message text.
+
+        Media is copied verbatim from the outbound message (or the
+        caller's explicit list) onto the parts; it never participates
+        in the 1200-character text chunking.
+        """
         if not chunks or any(not isinstance(text, str) for text in chunks):
             raise ValueError("at least one text chunk is required")
         with self.store.transaction():
@@ -82,10 +118,19 @@ class DeliveryStore:
                 return [row["id"] for row in existing]
             if message["state"] != "pending":
                 raise StateError("cannot prepare a nonpending outbound message")
+            if media is None:
+                try:
+                    media = json.loads(message["media_json"] or "[]")
+                except (ValueError, TypeError, KeyError, IndexError):
+                    media = []
+            if not isinstance(media, list):
+                media = []
+            media_json = json.dumps(media, ensure_ascii=False)
             ids = [f"{outbound_id}:{index}" for index in range(len(chunks))]
             self.connection.executemany(
-                "INSERT INTO outbound_parts(id,outbound_id,part_index,text) VALUES (?,?,?,?)",
-                [(part_id, outbound_id, index, chunks[index]) for index, part_id in enumerate(ids)],
+                "INSERT INTO outbound_parts(id,outbound_id,part_index,text,media_json) VALUES (?,?,?,?,?)",
+                [(part_id, outbound_id, index, chunks[index], media_json)
+                 for index, part_id in enumerate(ids)],
             )
             return ids
 
@@ -117,6 +162,41 @@ class DeliveryStore:
             )
             self._aggregate(row["outbound_id"])
 
+    def _expire_unknown(self) -> None:
+        """Auto-reject stale or twice-unknown parts instead of blocking forever.
+
+        Runs inside the caller's claim transaction. A part in
+        delivery_unknown is rejected when its oldest unknown attempt is
+        at least DELIVERY_UNKNOWN_MAX_SECONDS old, or when it has gone
+        unknown DELIVERY_UNKNOWN_MAX_ATTEMPTS times (an operator retry
+        that failed again). Rejection writes a delivery_failed receipt
+        and unblocks later replies in the same conversation.
+        """
+        rows = self.connection.execute(
+            "SELECT p.id,p.outbound_id FROM outbound_parts p "
+            "WHERE p.state='delivery_unknown'"
+        ).fetchall()
+        for row in rows:
+            attempts = self.connection.execute(
+                "SELECT started_at FROM outbound_attempts WHERE part_id=? "
+                "AND outcome='delivery_unknown' ORDER BY started_at",
+                (row["id"],)).fetchall()
+            if not attempts:
+                continue
+            oldest = attempts[0]["started_at"]
+            if (len(attempts) < DELIVERY_UNKNOWN_MAX_ATTEMPTS
+                    and self.store.clock() - oldest < DELIVERY_UNKNOWN_MAX_SECONDS):
+                continue
+            self.connection.execute(
+                "UPDATE outbound_parts SET state='rejected',owner=NULL,lease_until=NULL,"
+                "token=token+1 WHERE id=?", (row["id"],))
+            self.connection.execute(
+                "INSERT INTO delivery_resolutions(part_id,state,evidence,created_at) "
+                "VALUES (?,?,?,?)",
+                (row["id"], "rejected", "delivery_unknown_expired", self.store.clock()))
+            self._aggregate(row["outbound_id"])
+            self._delivery_failed_receipt(row["outbound_id"])
+
     def claim(self, owner: str, lease_seconds: float = 60, *,
               channel: str | None = None, account_id: str | None = None) -> DeliveryClaim | None:
         """Persist one sending attempt with conversation FIFO and optional account scope."""
@@ -126,9 +206,10 @@ class DeliveryStore:
             raise ValueError('channel and account_id filters must be supplied together')
         with self.store.transaction():
             self._expire()
+            self._expire_unknown()
             row = self.connection.execute(
                 "SELECT p.*,c.channel,c.account_id,c.chat_type,c.chat_id,m.generation, "
-                "c.generation AS current_generation "
+                "c.generation AS current_generation, m.media_json AS message_media_json "
                 "FROM outbound_parts p JOIN outbound_messages m ON m.id=p.outbound_id "
                 "JOIN conversations c ON c.id=m.conversation_id JOIN tasks task ON task.id=m.task_id "
                 "WHERE p.state IN ('pending','retry_wait') AND p.retry_at<=? "
@@ -170,9 +251,15 @@ class DeliveryStore:
                 (row["id"], token, owner, self.store.clock(), "sending"),
             )
             self._aggregate(row["outbound_id"])
+            try:
+                media = json.loads(row["message_media_json"] or "[]")
+            except (ValueError, TypeError, KeyError, IndexError):
+                media = []
+            if not isinstance(media, list) or row["part_index"] != 0:
+                media = []
             return DeliveryClaim(row["id"], row["outbound_id"], owner, token, text,
                                  row["channel"], row["account_id"], row["chat_type"], row["chat_id"],
-                                 row["generation"])
+                                 row["generation"], media=media)
 
     def _owned(self, claim: DeliveryClaim):
         """Validate current sending ownership and never trust caller-supplied route data."""
@@ -201,6 +288,8 @@ class DeliveryStore:
                                         "VALUES (?,?,?,?)",
                                         (claim.part_id, state, evidence, self.store.clock()))
             self._aggregate(claim.outbound_id)
+            if state == "rejected":
+                self._delivery_failed_receipt(claim.outbound_id)
 
     def delivered(self, claim: DeliveryClaim, receipt: str) -> None:
         """Commit a confirmed platform acceptance; require an explicit receipt."""

@@ -150,7 +150,11 @@ class RuntimeTests(unittest.TestCase):
         runner.tick()
         sender = Mock(side_effect=TimeoutError('send may have succeeded'))
         self.assertEqual(DeliveryRunner(self.store, sender, 'sender').tick(), 'unknown')
-        with Store(self.path) as reopened:
+        # Reopen with the same fake clock: the unknown part is seconds
+        # old, inside the 10-minute auto-reject window, so it stays
+        # delivery_unknown (a real wall clock here would make it look
+        # years old and trip the sweep).
+        with Store(self.path, clock=lambda: self.now) as reopened:
             self.assertEqual(DeliveryRunner(reopened, sender, 'new-sender').tick(), 'idle')
         sender.assert_called_once()
         self.assertEqual(self.store.snapshot()['outbound'], {'delivery_unknown': 1})

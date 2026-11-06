@@ -10,6 +10,7 @@ Credentials: ~/.config/native-bridge/ only. Test mode:
 APPROVAL_RELAY_TEST=1 redirects outbox writes to ./shadow/."""
 import fcntl
 import json, os, sys, time, uuid
+import sqlite3
 from pathlib import Path
 from contextlib import nullcontext
 
@@ -215,6 +216,55 @@ def resolve_notify_channels(item=None, explicit=None):
     return both
 
 
+APPROVAL_NOTICES_DDL = (
+    "CREATE TABLE IF NOT EXISTS approval_notices ("
+    "id TEXT PRIMARY KEY, channel TEXT NOT NULL, "
+    "chat_id TEXT NOT NULL DEFAULT '', text TEXT NOT NULL, "
+    "state TEXT NOT NULL DEFAULT 'pending' "
+    "CHECK(state IN ('pending','delivered','failed')), "
+    "created_at REAL NOT NULL)")
+
+
+def _core_notice_chat_id(channel, item):
+    """Chat route for a core-mode notice: explicit scope wins, else the env pin."""
+    scope = item.get("decision_scope") if isinstance(item, dict) else None
+    if isinstance(scope, dict) and scope.get("channel") == channel and scope.get("chat_id"):
+        return str(scope["chat_id"])
+    row = CHANNELS[channel]["row"]
+    if channel == "wecom":
+        return str(row.get("chatid") or "")
+    if channel == "feishu":
+        return str(row.get("chat_id") or "")
+    return str(row.get("to_user_id") or "")
+
+
+def _write_core_approval_notice(db_path, notice_id, channel, chat_id, text):
+    """Append one pending approval notice to the core database.
+
+    Raises OSError when the core database is missing or the write
+    fails, so the caller keeps the item unnotified and retries.
+    """
+    if not db_path or not os.path.exists(db_path):
+        raise OSError(f"core database is missing: {db_path}")
+    try:
+        conn = sqlite3.connect(db_path, timeout=5)
+    except sqlite3.Error as exc:
+        raise OSError(f"core database could not be opened: {db_path}") from exc
+    try:
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute(APPROVAL_NOTICES_DDL)
+        conn.execute(
+            "INSERT INTO approval_notices "
+            "(id, channel, chat_id, text, state, created_at) "
+            "VALUES (?, ?, ?, ?, 'pending', ?)",
+            (notice_id, channel, chat_id, text, time.time()))
+        conn.commit()
+    except sqlite3.Error as exc:
+        raise OSError("core approval notice could not be queued") from exc
+    finally:
+        conn.close()
+
+
 def notify(text, tag, approval=None, channels=None, item=None, event_id=None):
     """Push a notice to selected channels (prefer_source_else_both).
 
@@ -226,6 +276,11 @@ def notify(text, tag, approval=None, channels=None, item=None, event_id=None):
     Missing evidence still notifies both channels.
     ``event_id`` gives health retries a stable id per target; ordinary approval
     notifications keep their existing randomly generated ids.
+
+    A core-mode channel has no legacy outbox loop, so its notice goes
+    to the core database's approval_notices table (pending) for the
+    core delivery_loop instead of its outbox.jsonl. Legacy-mode
+    channels keep the outbox.jsonl path.
 
     各通道写入独立处理，单渠道部署也能收到通知。全部目标写入
     失败时抛出 OSError，调用方保留未通知状态，等待下一轮重试。
@@ -289,22 +344,28 @@ def notify(text, tag, approval=None, channels=None, item=None, event_id=None):
         path = cfg["outbox"]
         lease = None
         try:
-            expected_mode = "legacy" if ch in ("weixin", "wecom") else None
             try:
-                lease = lease_from_env(ch, expected_mode)
+                lease = lease_from_env(ch)
             except KeyError:
                 lease = None
-            if TEST:
-                path = os.path.join(BASE, "shadow", f"{ch}-outbox.jsonl")
-                os.makedirs(os.path.dirname(path), exist_ok=True)
-            if event_id is not None:
-                append_health_notice_once(path, row)
+            if lease is not None and lease.mode == "core":
+                # Core-owned channel: the legacy outbox loop never runs,
+                # so the notice goes to the core database for delivery_loop.
+                _write_core_approval_notice(
+                    lease.settings.get("database"), row_id, ch,
+                    _core_notice_chat_id(ch, item), text)
             else:
-                with open(path, "a", encoding="utf-8") as output:
-                    fcntl.flock(output, fcntl.LOCK_EX)
-                    output.write(json.dumps(row, ensure_ascii=False) + "\n")
-                    output.flush()
-                    os.fsync(output.fileno())
+                if TEST:
+                    path = os.path.join(BASE, "shadow", f"{ch}-outbox.jsonl")
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                if event_id is not None:
+                    append_health_notice_once(path, row)
+                else:
+                    with open(path, "a", encoding="utf-8") as output:
+                        fcntl.flock(output, fcntl.LOCK_EX)
+                        output.write(json.dumps(row, ensure_ascii=False) + "\n")
+                        output.flush()
+                        os.fsync(output.fileno())
             queued = True
         except (OSError, ValueError, ModeError) as exc:
             last_error = exc
@@ -725,9 +786,13 @@ def poll_once(gw, st, response=None, policy_engine=None):
                             item["notified"] = True
                             log("grouped auto-allow-failed pending", num, "->", primary)
                         else:
-                            send_approval_notice(num, item)
-                            item["notified"] = True
-                            log("auto allow decide failed, fell back to manual", num, aid[:12], type(exc).__name__, str(exc))
+                            try:
+                                send_approval_notice(num, item)
+                            except OSError:
+                                log("auto allow decide failed; approval notice could not be queued", num, aid[:12])
+                            else:
+                                item["notified"] = True
+                                log("auto allow decide failed, fell back to manual", num, aid[:12], type(exc).__name__, str(exc))
                         save_state(st)
                 elif decision.action == PolicyAction.AUTO_DENY:
                     # 黑名单命中：不再静默自动拦截，改发手机人工审批通知，
@@ -741,9 +806,13 @@ def poll_once(gw, st, response=None, policy_engine=None):
                         item["notified"] = True
                         log("grouped blacklist pending", num, "->", primary)
                     else:
-                        send_approval_notice(num, item)
-                        item["notified"] = True
-                        log("blacklist held for manual decision", num, aid[:12], decision.reason)
+                        try:
+                            send_approval_notice(num, item)
+                        except OSError:
+                            log("blacklist held for manual decision; approval notice could not be queued", num, aid[:12])
+                        else:
+                            item["notified"] = True
+                            log("blacklist held for manual decision", num, aid[:12], decision.reason)
                     save_state(st)
                 else:
                     # Level 1 / Level 2: 需要手机人工审批 (普通审批或高危强审)
@@ -753,9 +822,13 @@ def poll_once(gw, st, response=None, policy_engine=None):
                         item["notified"] = True
                         log("grouped scoped pending", num, "->", primary)
                     else:
-                        send_approval_notice(num, item)
-                        item["notified"] = True
-                        log("notified pending", num, aid[:12], who)
+                        try:
+                            send_approval_notice(num, item)
+                        except OSError:
+                            log("approval notice could not be queued", num, aid[:12])
+                        else:
+                            item["notified"] = True
+                            log("notified pending", num, aid[:12], who)
             else:
                 # Hold the notification: an empty one would ask the
                 # user to approve blind. The item stays pending and
@@ -776,9 +849,14 @@ def poll_once(gw, st, response=None, policy_engine=None):
         item.pop("grouped_with", None)
         item["notified"] = False
         if has_content(item.get("who"), item.get("what")):
-            send_approval_notice(num, item)
-            item["notified"] = True
-            log("promoted grouped pending", num)
+            try:
+                send_approval_notice(num, item)
+            except OSError:
+                item["notified"] = False
+                log("promoted grouped pending notice could not be queued", num)
+            else:
+                item["notified"] = True
+                log("promoted grouped pending", num)
         else:
             item["notified"] = False
     for num, it in st["items"].items():
@@ -832,14 +910,20 @@ def consume_decisions(gw, st):
                 new_off = next_off
                 continue
             try:
-                # weixin 与 wecom 为过渡渠道，当配置为 core 模式时由核心通道接管，legacy 决断消费按规范停用；
-                # feishu 为现代全功能渠道，Core 模式下由网关将决断登记至中转队列并由 relay 统一权威提交至 Muse 平台。
-                expected_mode = "legacy" if channel in ("weixin", "wecom") else None
-                lease = lease_from_env(channel, expected_mode)
+                # Decisions in decisions.jsonl are the single submission
+                # path for legacy and core gateways alike: the lease is
+                # taken without an expected mode (it still guards the
+                # cutover while a submission is in flight) and the row
+                # is consumed whatever the channel mode is.
+                lease = lease_from_env(channel)
                 with lease if lease is not None else nullcontext():
                     _consume_decision_row(gw, st, row)
             except ModeError:
-                log("legacy approval decision disabled for core channel", channel)
+                # The modes document is unreadable: keep this row at the
+                # offset head so the next cycle retries it instead of
+                # silently dropping the user's decision.
+                log("channel mode unreadable; decision retained for retry", channel)
+                break
             except KeyError:
                 _consume_decision_row(gw, st, row)
             new_off = next_off

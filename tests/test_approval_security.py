@@ -97,18 +97,35 @@ class ApprovalSecurityTests(unittest.TestCase):
         return path
 
     def test_core_mode_disables_legacy_approval_submission_and_notifications(self):
-        """A switched channel cannot be written by the old approval relay."""
+        """Core-channel decisions use decisions.jsonl; notices use approval_notices.
+
+        旧行为（core 模式下 relay 拒收决定、通知抛错）已改为单一路
+        径：core 决定与 legacy 决定同写 decisions.jsonl 由 relay 消费，
+        core 通知写 core 库 approval_notices 表，不再走死信 outbox。
+        方法名沿用旧名，待后续改名。
+        """
         self.write()
         mode_path = self.mode_file('core')
         gateway = Mock()
+        # core 库须存在，relay 才能往里写通知行。
+        Path(self.base / 'core.sqlite3').touch()
         with patch.dict(os.environ, {'MUSE_CHANNEL_MODES': str(mode_path)}):
             self.relay.consume_decisions(gateway, self.state)
+            gateway.call_json.assert_called_once()
+            self.assertEqual(
+                (self.base / 'decisions.offset').read_text(),
+                str(len(json.dumps(self.row) + '\n')))
             relay = load_relay()
             relay.BASE, relay.TEST = str(self.base), True
-            with self.assertRaises(OSError):
-                relay.notify('private', 'notice', channels=['wecom'])
-        gateway.call_json.assert_not_called()
+            relay.notify('private', 'notice', channels=['wecom'])
         self.assertFalse((self.base / 'shadow/wecom-outbox.jsonl').exists())
+        import sqlite3
+        with sqlite3.connect(self.base / 'core.sqlite3') as conn:
+            rows = conn.execute(
+                "SELECT channel, chat_id, text, state FROM approval_notices"
+            ).fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0], ('wecom', '', 'private', 'pending'))
 
     def test_mode_lease_is_held_through_external_submission(self):
         """A cutover cannot race an approval already leaving the process."""

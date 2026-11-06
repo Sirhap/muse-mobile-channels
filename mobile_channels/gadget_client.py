@@ -266,9 +266,15 @@ class GadgetClient:
     def stop_turn(self, proc: subprocess.Popen | int, *, wait_seconds: float = 5.0) -> bool:
         """SIGTERM the worker's process group, then SIGKILL. True when it is gone.
 
-        The worker writes a cancelled result on SIGTERM when it can; a
-        SIGKILL leaves no file, which the executor reads as a cancelled turn
-        through its own binding, not as a failure.
+        Local kill only. The reference client exposes no server-side
+        cancel (no /chat/cancel endpoint; NoiseConnection.open only
+        aborts the local request), so stopping the worker cannot stop
+        the server turn: the server may keep generating and its reply
+        will simply never be collected here. Callers must report the
+        cancel as local-only (see GadgetExecutor.cancel), never as a
+        stopped turn. The worker writes a cancelled result on SIGTERM
+        when it can; a SIGKILL leaves no file, which the executor reads
+        as a cancelled turn through its own binding, not as a failure.
         """
         pid = proc.pid if isinstance(proc, subprocess.Popen) else int(proc)
         try:

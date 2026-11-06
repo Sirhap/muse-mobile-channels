@@ -367,7 +367,7 @@ class TestGadgetExecutor(unittest.TestCase):
 
         c = self.executor.cancel(context, "worker:1001")
         self.assertEqual(c.state, "cancelled")
-        self.assertEqual(c.evidence, "worker_terminated")
+        self.assertEqual(c.evidence, "local_worker_terminated_server_turn_may_continue")
         self.assertEqual(self.fake_client.stopped, [1001])
 
     def test_session_reused_within_generation_and_split_by_new_generation(self):
@@ -411,7 +411,7 @@ class TestGadgetExecutor(unittest.TestCase):
         self.fake_client.alive.discard(1001)
         q = self.executor.query(context, "worker:1001")
         self.assertEqual(q.state, "unknown")
-        self.assertEqual(q.evidence, "worker_exited_without_result")
+        self.assertEqual(q.evidence, "worker_exited_without_result polls=1")
 
     def test_query_unrecognized_result_state_is_unknown(self):
         """A result file with an unrecognized state is unknown, not running."""
@@ -420,7 +420,7 @@ class TestGadgetExecutor(unittest.TestCase):
         self.fake_client.results[context.claim.attempt_id] = {"state": "alien_unrecognized_status"}
         q = self.executor.query(context, "worker:1001")
         self.assertEqual(q.state, "unknown")
-        self.assertEqual(q.evidence, "unrecognized_result_state_alien_unrecognized_status")
+        self.assertEqual(q.evidence, "unrecognized_result_state_alien_unrecognized_status polls=1")
 
     def test_query_failed_result_maps_evidence(self):
         """A worker-reported failure surfaces its evidence, not a generic error."""

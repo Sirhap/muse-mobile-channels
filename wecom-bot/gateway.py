@@ -37,6 +37,7 @@ import base64
 import fcntl
 import hashlib
 import json
+import mimetypes
 import os
 import subprocess
 import sys
@@ -542,6 +543,45 @@ def _gateway_process_alive(status: dict, state_dir: Path) -> bool:
 
 def log(msg: str) -> None:
     print(f"[wecom-gateway {time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
+
+
+# Core-mode inbound replies that bypass the task queue: the message never
+# becomes a task, so the user is told directly on the callback instead.
+VOICE_NO_TRANSCRIPTION_TEXT = "没听清，语音转写失败，请再发一次文字。"
+MEDIA_DOWNLOAD_FAILED_TEXT = "附件下载失败，请再发一次。"
+
+
+def _core_media_item(media: dict) -> dict:
+    """Normalize one downloaded inbound media item for core.receive.
+
+    Same shape as the outbound media the executors produce: kind, local
+    path, filename, mime. Only items with a local_path reach core; the
+    caller handles the rest as an explicit download failure.
+    """
+    path = str(media.get("local_path") or "")
+    filename = Path(path).name if path else str(media.get("filename") or "")
+    mime = mimetypes.guess_type(path)[0] if path else ""
+    return {"kind": str(media.get("kind") or "file"), "path": path,
+            "filename": filename, "mime": mime or ""}
+
+
+def _has_substantive_text(text: str) -> bool:
+    """True when text has content beyond inbound media labels.
+
+    An image-only message arrives as "[图片]"; if its download failed
+    there is no real content left, so the failure notice is the whole
+    reply and no empty task is created.
+    """
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped in ("[图片]", "[文件]", "[视频]"):
+            continue
+        if stripped.startswith("[文件") and stripped.endswith("]"):
+            continue
+        return True
+    return False
 
 
 def jsonl_text_lines(text: str) -> list[str]:
@@ -3097,11 +3137,65 @@ class Gateway:
         chatid = body.get("chatid") or from_userid
         if not self._sender_allowed(str(from_userid or ""), "message"):
             return
+        if msgtype == "voice":
+            # No transcription: ingress would raise IngressValidationError
+            # and the message would vanish silently. Answer on the
+            # callback instead, in both core and legacy mode; never send
+            # a placeholder to Muse and never create a task for it.
+            voice_text = _as_dict(body.get("voice")).get("content")
+            if not (isinstance(voice_text, str) and voice_text.strip()):
+                if req_id:
+                    try:
+                        await self.respond(req_id, {"msgtype": "markdown",
+                            "markdown": {"content": VOICE_NO_TRANSCRIPTION_TEXT}})
+                    except Exception as exc:
+                        log(f"voice no-transcription reply failed: {exc}")
+                else:
+                    log("voice without transcription and no req_id; dropping with log")
+                if not core_enabled:
+                    # A7 invariant: every inbound frame is persisted and
+                    # marked seen, even one answered inline without a task.
+                    self.append_jsonl(INBOX, {
+                        "msgid": msgid,
+                        "ts": int(time.time()),
+                        "chattype": chattype,
+                        "chatid": chatid,
+                        "from_userid": from_userid,
+                        "msgtype": msgtype,
+                        "text": text,
+                        "media": media,
+                        "auto_handled": True,
+                        "raw": body,
+                    })
+                    self._commit_inbound_seen(msgid)
+                self.msgs_received += 1
+                self.write_status()
+                return
         core = getattr(self, "_core_binding", None)
         if core is not None and core.enabled:
+            # Download BEFORE core.receive: the task's media must already
+            # be on local disk, with its full kind/path/mime/filename.
+            # A failed download is told to the user, never silently
+            # dropped; when nothing usable remains, no task is created.
+            full_media: list[dict] = []
+            if media:
+                await self._download_media(media, msgid)
+                failed = [m for m in media if not m.get("local_path")]
+                full_media = [_core_media_item(m) for m in media if m.get("local_path")]
+                if failed:
+                    if req_id:
+                        try:
+                            await self.respond(req_id, {"msgtype": "markdown",
+                                "markdown": {"content": MEDIA_DOWNLOAD_FAILED_TEXT}})
+                        except Exception as exc:
+                            log(f"media download-failure reply failed: {exc}")
+                    if not full_media and not _has_substantive_text(text):
+                        self.msgs_received += 1
+                        self.write_status()
+                        return
             core.receive(message_id=str(msgid or ""), sender_id=str(from_userid or ""),
                          chat_id=str(chatid or ""), chat_type=chattype,
-                         text=text, media=[{"kind": item.get("kind")} for item in media])
+                         text=text, media=full_media)
             self.msgs_received += 1
             self.write_status()
             return
@@ -3241,7 +3335,32 @@ class Gateway:
     async def handle_event_callback(self, frame: dict) -> None:
         core = getattr(self, "_core_binding", None)
         if core is not None and core.enabled:
-            # Legacy card/session events cannot mutate a different authority.
+            # Approval card clicks are decisions, not legacy session
+            # events: route them to decisions.jsonl exactly like a
+            # typed /a /b /c so the relay can consume them. Every
+            # other legacy event still cannot mutate the core authority.
+            body = _as_dict(_as_dict(frame).get("body"))
+            event = _as_dict(body.get("event"))
+            if event.get("eventtype", "") == "template_card_event":
+                tc_event = event.get("template_card_event") or {}
+                event_key = tc_event.get("event_key", "") or event.get("event_key", "")
+                task_id = tc_event.get("task_id", "") or event.get("task_id", "")
+                if str(task_id or "").startswith("appr-") and event_key in APPROVAL_CARD_KEYS:
+                    from_userid = _as_dict(body.get("from")).get("userid", "")
+                    if not self._event_allowed(str(from_userid or "")):
+                        log("approval card click ignored: sender not allowed")
+                        return
+                    card = getattr(self, "cards", None) or {}
+                    card_row = card.get(task_id) or {}
+                    chat_id = str(body.get("chatid") or card_row.get("chatid")
+                                or from_userid or "")
+                    result = approval_card_decide(task_id, event_key,
+                                                  str(from_userid or ""),
+                                                  chat_id)
+                    if result is not None:
+                        log(f"core approval card decision: task_id={task_id} "
+                            f"key={event_key} ok={result[1]}")
+                    return
             log("legacy event ignored: channel is owned by the core")
             return
         body = _as_dict(_as_dict(frame).get("body"))

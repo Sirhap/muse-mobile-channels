@@ -139,8 +139,8 @@ class ApprovalNotifyResilienceTests(unittest.TestCase):
             "display_name": "test",
         }]}
         state = {"next_num": 1, "items": {}}
-        with self.assertRaises(OSError):
-            self.relay.poll_once(gateway, state, policy_engine=require_approval_engine(self.relay))
+        # 通知失败不再中断整轮 poll：本轮记下未通知，下一轮重试。
+        self.relay.poll_once(gateway, state, policy_engine=require_approval_engine(self.relay))
         self.assertFalse(state["items"]["1"]["notified"])
         (self.base / "wecom").mkdir()
         self.relay.poll_once(gateway, state, policy_engine=require_approval_engine(self.relay))
@@ -159,8 +159,8 @@ class ApprovalNotifyResilienceTests(unittest.TestCase):
             "2": {"approval_id": "child", "status": "pending", "notified": True,
                   "grouped_with": "1", "who": "test", "what": "命令：echo child"},
         }}
-        with self.assertRaises(OSError):
-            self.relay.poll_once(gateway, state, policy_engine=require_approval_engine(self.relay))
+        # 通知失败不再中断整轮 poll：本轮记下未通知，下一轮重试。
+        self.relay.poll_once(gateway, state, policy_engine=require_approval_engine(self.relay))
         self.assertFalse(state["items"]["2"]["notified"])
         (self.base / "wecom").mkdir()
         self.relay.poll_once(gateway, state, policy_engine=require_approval_engine(self.relay))

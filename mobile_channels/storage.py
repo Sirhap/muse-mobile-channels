@@ -7,6 +7,8 @@ queues automatically.
 """
 from __future__ import annotations
 
+import json
+import logging
 import os
 import sqlite3
 import time
@@ -17,9 +19,34 @@ from typing import Callable, Iterator
 
 from .models import Claim, InboundMessage, IngestResult, OwnershipError, StateError
 
+LOGGER = logging.getLogger(__name__)
+
 SCHEMA_VERSION = 1
 ACTIVE = ("claimed", "running", "reconciling")
 TERMINAL = ("succeeded", "failed", "cancelled")
+# Consecutive-unknown budget for one execution attempt: an executor that
+# keeps answering 'unknown' is not making progress. Ten polls is enough
+# to ride out transient stalls (a poll is normally seconds apart) while
+# bounding the hang to a small multiple of a normal turn; 900 seconds
+# matches the Gadget turn timeout, so a turn that never resolves within
+# one full timeout budget is declared failed instead of hanging forever.
+UNKNOWN_MAX_POLLS = 10
+UNKNOWN_MAX_SECONDS = 900.0
+# A reconciling task with no bound execution may only wait one full
+# Gadget timeout (900s) for reconciliation before it is failed; a bound
+# run stays reconciling so its result can still be recovered.
+RECONCILING_MAX_AGE_SECONDS = 900.0
+RECEIPT_KINDS = ("started", "wait", "failed", "cancelled", "fallback",
+                 "delivery_failed")
+FAILED_RECEIPT_TEXT = "处理失败，请再发一次。"
+CANCELLED_RECEIPT_TEXT = "已取消。"
+FALLBACK_RECEIPT_TEXT = "主通道失败，正在走备用通道，请稍等。"
+# Only explain a fallback when the primary burned real waiting time
+# first. A fast primary failure (auth/token, circuit open) falls back
+# within seconds and the backup answer lands almost as fast as a normal
+# turn, so the receipt would be pure noise.
+FALLBACK_RECEIPT_MIN_WAIT_SECS = 15.0
+DELIVERY_FAILED_RECEIPT_TEXT = "回复已生成但发送失败，请再发一次。"
 # Bound reply for a message folded into a running turn (official-client
 # steering, matching native-bridge MERGE_POINTER_TEXT): the merged
 # msgid gets this short pointer instead of its own full reply, so the
@@ -47,7 +74,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     state TEXT NOT NULL CHECK(state IN
         ('queued','claimed','running','reconciling','succeeded','failed','cancelled')),
     cancel_requested INTEGER NOT NULL DEFAULT 0, token INTEGER NOT NULL DEFAULT 0,
-    owner TEXT, lease_until REAL, attempt_id TEXT, result TEXT
+    owner TEXT, lease_until REAL, attempt_id TEXT, result TEXT,
+    media_json TEXT NOT NULL DEFAULT '[]'
 );
 CREATE INDEX IF NOT EXISTS task_queue ON tasks(state, sequence);
 CREATE INDEX IF NOT EXISTS task_conversation ON tasks(conversation_id, sequence);
@@ -66,8 +94,16 @@ CREATE TABLE IF NOT EXISTS outbound_messages (
     conversation_id TEXT NOT NULL REFERENCES conversations(id), generation INTEGER NOT NULL,
     text TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending'
         CHECK(state IN ('pending','sending','retry_wait','delivered','delivery_unknown','rejected','cancelled')),
+    created_at REAL NOT NULL, media_json TEXT NOT NULL DEFAULT '[]'
+);
+CREATE TABLE IF NOT EXISTS task_receipts (
+    id TEXT PRIMARY KEY, task_id TEXT NOT NULL, conversation_id TEXT NOT NULL,
+    kind TEXT NOT NULL, text TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'pending'
+        CHECK(state IN ('pending','delivered','failed')),
     created_at REAL NOT NULL
 );
+CREATE INDEX IF NOT EXISTS receipt_task_kind ON task_receipts(task_id, kind);
 """
 
 
@@ -104,6 +140,7 @@ class Store:
                 for statement in SCHEMA.split(";"):
                     if statement.strip():
                         self.connection.execute(statement)
+                self._migrate_columns()
                 self.connection.execute(
                     "INSERT OR IGNORE INTO schema_migrations VALUES (?,?)",
                     (SCHEMA_VERSION, self.clock()),
@@ -147,6 +184,142 @@ class Store:
         """Expose a short extension-table transaction; nested operations use savepoints."""
         with self._transaction():
             yield
+
+    def _migrate_columns(self) -> None:
+        """Add media_json to tables created before this column existed.
+
+        Runs inside the constructor transaction; CREATE TABLE IF NOT
+        EXISTS leaves an old table untouched, so the column is added
+        explicitly when a PRAGMA probe shows it missing.
+        """
+        for table in ("tasks", "outbound_messages"):
+            columns = {row["name"] for row in self.connection.execute(
+                f"PRAGMA table_info({table})")}
+            if "media_json" not in columns:
+                self.connection.execute(
+                    f"ALTER TABLE {table} ADD COLUMN media_json TEXT NOT NULL DEFAULT '[]'")
+
+    def _insert_receipt(self, task_id: str, conversation_id: str, kind: str,
+                        text: str) -> str:
+        """Insert one receipt row; the caller must hold the transaction."""
+        receipt_id = _identifier()
+        self.connection.execute(
+            "INSERT INTO task_receipts(id,task_id,conversation_id,kind,text,created_at) "
+            "VALUES (?,?,?,?,?,?)",
+            (receipt_id, task_id, conversation_id, kind, text, self.clock()),
+        )
+        return receipt_id
+
+    def add_receipt(self, task_id: str, conversation_id: str, kind: str,
+                    text: str) -> str:
+        """Write an instantaneous user notice, idempotently.
+
+        A second pending receipt for the same task_id+kind is a duplicate
+        and returns the existing id instead of inserting. 'wait' is the
+        exception: queue position changes over time, so repeated wait
+        receipts are allowed (callers still check before writing).
+        """
+        if kind not in RECEIPT_KINDS:
+            raise ValueError(f"unknown receipt kind: {kind}")
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("receipt text is required")
+        with self._transaction():
+            if kind != "wait":
+                existing = self.connection.execute(
+                    "SELECT id FROM task_receipts WHERE task_id=? AND kind=? "
+                    "AND state='pending' ORDER BY created_at LIMIT 1",
+                    (task_id, kind),
+                ).fetchone()
+                if existing is not None:
+                    return existing["id"]
+            return self._insert_receipt(task_id, conversation_id, kind, text)
+
+    def _merged_tasks(self, task_id: str) -> list[dict]:
+        """Tasks folded into ``task_id`` that only ever got a pointer reply.
+
+        Primary source is task_events ('merged_into' with the running task
+        as evidence). As a fallback, gateway_routes.merged_ids_json lists
+        the external ids coalesced into the running task; those resolve
+        back to tasks through inbound_messages in the same conversation.
+        """
+        merged: dict[str, dict] = {}
+        for row in self.connection.execute(
+                "SELECT task_id FROM task_events WHERE event='merged_into' AND evidence=?",
+                (task_id,)).fetchall():
+            merged[row["task_id"]] = {"task_id": row["task_id"]}
+        tables = {r[0] for r in self.connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        if "gateway_routes" in tables:
+            route = self.connection.execute(
+                "SELECT merged_ids_json FROM gateway_routes WHERE task_id=?",
+                (task_id,)).fetchone()
+            if route is not None:
+                try:
+                    external_ids = json.loads(route["merged_ids_json"] or "[]")
+                except (ValueError, TypeError):
+                    external_ids = []
+                conv = self.connection.execute(
+                    "SELECT conversation_id FROM tasks WHERE id=?", (task_id,)).fetchone()
+                if conv is not None and isinstance(external_ids, list):
+                    for external_id in external_ids:
+                        found = self.connection.execute(
+                            "SELECT t.id FROM tasks t JOIN inbound_messages m "
+                            "ON m.id=t.message_id WHERE m.conversation_id=? "
+                            "AND m.external_id=? AND t.id!=?",
+                            (conv["conversation_id"], str(external_id), task_id)).fetchone()
+                        if found is not None:
+                            merged[found["id"]] = {"task_id": found["id"]}
+        result = []
+        for merged_id in merged:
+            row = self.connection.execute(
+                "SELECT conversation_id FROM tasks WHERE id=?", (merged_id,)).fetchone()
+            if row is not None:
+                result.append({"task_id": merged_id,
+                               "conversation_id": row["conversation_id"]})
+        return result
+
+    def _notify_merged(self, task_id: str, kind: str, text: str) -> None:
+        """Give every task folded into ``task_id`` its own receipt.
+
+        The merged task's own id is the receipt's task_id, so its
+        delivery route is independent of the main task's outcome.
+        """
+        for merged in self._merged_tasks(task_id):
+            self._insert_receipt(merged["task_id"], merged["conversation_id"],
+                                 kind, text)
+
+    def _fail_task_in_transaction(self, task_id: str, conversation_id: str,
+                                  evidence: str, event: str = "confirmed_failed") -> None:
+        """Mark a task failed with its receipt; caller holds the transaction."""
+        self.connection.execute(
+            "UPDATE tasks SET state='failed',owner=NULL,lease_until=NULL WHERE id=?",
+            (task_id,),
+        )
+        self._event(task_id, event, evidence)
+        self._insert_receipt(task_id, conversation_id, "failed", FAILED_RECEIPT_TEXT)
+        self._notify_merged(task_id, "failed", FAILED_RECEIPT_TEXT)
+
+    def note_unknown(self, claim: Claim) -> bool:
+        """Record one 'unknown' poll for this attempt; True when the budget is spent.
+
+        Counts unknown polls per attempt (evidence carries the attempt id,
+        so a re-claim starts a fresh budget) and the wall-clock span since
+        the first unknown poll of this attempt. The budget is spent at
+        10 polls or 900 seconds, whichever comes first.
+        """
+        with self._transaction():
+            row = self._owned(claim)
+            self._event(claim.task_id, "unknown_polled", claim.attempt_id)
+            rows = self.connection.execute(
+                "SELECT created_at FROM task_events WHERE task_id=? AND event='unknown_polled' "
+                "AND evidence=? ORDER BY created_at",
+                (claim.task_id, claim.attempt_id),
+            ).fetchall()
+            if len(rows) >= UNKNOWN_MAX_POLLS:
+                return True
+            if rows and self.clock() - rows[0]["created_at"] >= UNKNOWN_MAX_SECONDS:
+                return True
+            return False
 
     def _event(self, task_id: str, event: str, evidence: str | None = None) -> None:
         """Record a metadata-only transition inside the current transaction."""
@@ -212,9 +385,18 @@ class Store:
             return updated[0]
 
     def _expire_leases(self) -> None:
-        """Requeue only attempts proven unsubmitted; reserve uncertain sessions."""
+        """Requeue only attempts proven unsubmitted; reserve uncertain sessions.
+
+        A reconciling task whose execution was never bound (no run id)
+        and whose attempt started over 900 seconds ago is failed instead
+        of being parked in reconciling forever: there is nothing to
+        reconcile against. A bound run stays reconciling so its result
+        can still be recovered. Ownerless reconciling tasks (lease
+        already cleared) get the same age check via the orphan sweep.
+        """
         rows = self.connection.execute(
-            "SELECT t.id,a.submission,t.cancel_requested FROM tasks t "
+            "SELECT t.id,a.submission,a.run_id,a.created_at,t.cancel_requested,"
+            "t.conversation_id FROM tasks t "
             "JOIN execution_attempts a ON a.id=t.attempt_id "
             "WHERE t.state IN ('claimed','running','reconciling') AND t.lease_until<=?",
             (self.clock(),),
@@ -222,13 +404,35 @@ class Store:
         for row in rows:
             if row["submission"] == "not_submitted":
                 state = "cancelled" if row["cancel_requested"] else "queued"
+                self.connection.execute(
+                    "UPDATE tasks SET state=?,owner=NULL,lease_until=NULL,token=token+1 WHERE id=?",
+                    (state, row["id"]),
+                )
+                self._event(row["id"], f"lease_expired:{state}")
+            elif (row["submission"] == "unknown" and row["run_id"] is None
+                    and self.clock() - row["created_at"] >= RECONCILING_MAX_AGE_SECONDS):
+                self._fail_task_in_transaction(
+                    row["id"], row["conversation_id"],
+                    "reconciling_expired_without_execution_binding",
+                    event="reconciling_expired_failed")
             else:
-                state = "reconciling"
-            self.connection.execute(
-                "UPDATE tasks SET state=?,owner=NULL,lease_until=NULL,token=token+1 WHERE id=?",
-                (state, row["id"]),
-            )
-            self._event(row["id"], f"lease_expired:{state}")
+                self.connection.execute(
+                    "UPDATE tasks SET state='reconciling',owner=NULL,lease_until=NULL,token=token+1 WHERE id=?",
+                    (row["id"],),
+                )
+                self._event(row["id"], "lease_expired:reconciling")
+        orphans = self.connection.execute(
+            "SELECT t.id,t.conversation_id,a.created_at FROM tasks t "
+            "JOIN execution_attempts a ON a.id=t.attempt_id "
+            "WHERE t.state='reconciling' AND t.owner IS NULL AND t.lease_until IS NULL "
+            "AND a.submission='unknown' AND a.run_id IS NULL",
+        ).fetchall()
+        for row in orphans:
+            if self.clock() - row["created_at"] >= RECONCILING_MAX_AGE_SECONDS:
+                self._fail_task_in_transaction(
+                    row["id"], row["conversation_id"],
+                    "reconciling_expired_without_execution_binding",
+                    event="reconciling_expired_failed")
 
     def claim(self, owner: str, concurrency: int = 4, lease_seconds: float = 60) -> Claim | None:
         """Claim the oldest eligible task while enforcing session and global limits."""
@@ -405,6 +609,28 @@ class Store:
                 (run_id, claim.attempt_id),
             )
             self._event(claim.task_id, "run_rebound")
+            # The fallback track is now live. Tell the user the primary
+            # failed and the backup is running instead of leaving them
+            # waiting in silence -- but only when the primary actually
+            # made them wait. A fast primary failure (auth/token error,
+            # circuit open) falls back within seconds and the backup
+            # answer lands almost as fast as a normal turn, so a
+            # "primary failed" receipt is pure noise; only explain the
+            # delay when the primary burned real waiting time first.
+            # Idempotent: one pending fallback receipt per task.
+            attempt = self.connection.execute(
+                "SELECT created_at FROM execution_attempts WHERE id=?",
+                (claim.attempt_id,),
+            ).fetchone()
+            elapsed = self.clock() - float(attempt["created_at"]) if attempt else 0.0
+            if elapsed < FALLBACK_RECEIPT_MIN_WAIT_SECS:
+                return
+            existing = self.connection.execute(
+                "SELECT id FROM task_receipts WHERE task_id=? AND kind='fallback' "
+                "AND state='pending' LIMIT 1", (claim.task_id,)).fetchone()
+            if existing is None:
+                self._insert_receipt(claim.task_id, row["conversation_id"],
+                                     "fallback", FALLBACK_RECEIPT_TEXT)
 
     def foldable(self, owner: str) -> dict | None:
         """Find a queued task that can fold into a running turn owned by ``owner``.
@@ -472,22 +698,39 @@ class Store:
             self._event(queued_task_id, "merged_into", running_task_id)
             return outbound_id
 
-    def _complete_result(self, row: sqlite3.Row, text: str, event: str) -> str:
-        """Save a result, bound outbox and audit within the caller's transaction."""
+    def _complete_result(self, row: sqlite3.Row, text: str, event: str,
+                         media: list | None = None) -> str:
+        """Save a result, bound outbox and audit within the caller's transaction.
+
+        Media is persisted verbatim (storage never parses it) on both the
+        task and its outbound message. If the text claims a link/file/
+        video/image was sent but carries neither a URL nor media, log a
+        warning with the task id instead of silently marking it
+        delivered: the claim may be false, but delivery is not blocked
+        on the suspicion alone.
+        """
+        media_json = json.dumps(media or [], ensure_ascii=False)
+        if (any(word in text for word in ("链接", "文件", "视频", "图片", "图像"))
+                and not any(marker in text for marker in ("http://", "https://", "www."))
+                and not (media or [])):
+            LOGGER.warning(
+                "result claims a link/file but has neither URL nor media: task_id=%s",
+                row["id"])
         outbound_id = _identifier()
         self.connection.execute(
-            "INSERT INTO outbound_messages(id,task_id,conversation_id,generation,text,created_at) "
-            "VALUES (?,?,?,?,?,?)",
-            (outbound_id, row["id"], row["conversation_id"], row["generation"], text, self.clock()),
+            "INSERT INTO outbound_messages(id,task_id,conversation_id,generation,text,created_at,media_json) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (outbound_id, row["id"], row["conversation_id"], row["generation"], text,
+             self.clock(), media_json),
         )
         self.connection.execute(
-            "UPDATE tasks SET state='succeeded',result=?,owner=NULL,lease_until=NULL WHERE id=?",
-            (text, row["id"]),
+            "UPDATE tasks SET state='succeeded',result=?,media_json=?,owner=NULL,lease_until=NULL WHERE id=?",
+            (text, media_json, row["id"]),
         )
         self._event(row["id"], event)
         return outbound_id
 
-    def complete(self, claim: Claim, text: str) -> str:
+    def complete(self, claim: Claim, text: str, media: list | None = None) -> str:
         """Commit execution result and bound outbox together, using fenced ownership."""
         if not isinstance(text, str):
             raise ValueError("result text must be a string")
@@ -495,7 +738,7 @@ class Store:
             row = self._owned(claim)
             if row["state"] not in ("running", "reconciling"):
                 raise StateError("cannot complete an unsubmitted task")
-            return self._complete_result(row, text, "succeeded")
+            return self._complete_result(row, text, "succeeded", media=media)
 
     def complete_command(self, task_id: str, text: str) -> str:
         """Complete an unclaimed local command atomically, without an executor.
@@ -526,11 +769,9 @@ class Store:
         if not isinstance(evidence, str) or not evidence.strip():
             raise ValueError("confirmed failure evidence is required")
         with self._transaction():
-            self._owned(claim)
-            self.connection.execute(
-                "UPDATE tasks SET state='failed',owner=NULL,lease_until=NULL WHERE id=?", (claim.task_id,)
-            )
-            self._event(claim.task_id, "confirmed_failed", evidence)
+            row = self._owned(claim)
+            self._fail_task_in_transaction(
+                claim.task_id, row["conversation_id"], evidence)
 
     def request_cancel(self, task_id: str, conversation_id: str) -> bool:
         """Request cancellation within an already-authorized conversation scope.
@@ -546,11 +787,17 @@ class Store:
                 raise KeyError(task_id)
             if row["state"] in TERMINAL:
                 return False
+            was_queued = row["state"] == "queued"
             self.connection.execute(
                 "UPDATE tasks SET cancel_requested=1,state=CASE WHEN state='queued' THEN 'cancelled' "
                 "ELSE state END WHERE id=?", (task_id,),
             )
             self._event(task_id, "cancel_requested")
+            if was_queued:
+                # Queued tasks cancel immediately with no executor round
+                # trip, so the receipt is written here, not at confirm.
+                self._insert_receipt(task_id, row["conversation_id"],
+                                     "cancelled", CANCELLED_RECEIPT_TEXT)
             return True
 
     def confirm_cancel(self, claim: Claim) -> None:
@@ -563,6 +810,9 @@ class Store:
                 "UPDATE tasks SET state='cancelled',owner=NULL,lease_until=NULL WHERE id=?", (claim.task_id,)
             )
             self._event(claim.task_id, "cancelled")
+            self._insert_receipt(claim.task_id, row["conversation_id"],
+                                 "cancelled", CANCELLED_RECEIPT_TEXT)
+            self._notify_merged(claim.task_id, "cancelled", CANCELLED_RECEIPT_TEXT)
 
     def confirm_platform_cancel(self, claim: Claim, evidence: str) -> None:
         """Save the original run's confirmed cancellation, including external UI stops.
@@ -581,6 +831,9 @@ class Store:
                 "UPDATE tasks SET state='cancelled',owner=NULL,lease_until=NULL WHERE id=?", (claim.task_id,)
             )
             self._event(claim.task_id, "platform_cancelled", evidence)
+            self._insert_receipt(claim.task_id, row["conversation_id"],
+                                 "cancelled", CANCELLED_RECEIPT_TEXT)
+            self._notify_merged(claim.task_id, "cancelled", CANCELLED_RECEIPT_TEXT)
 
     def task(self, task_id: str) -> dict:
         """Return a detached task snapshot for diagnostics and adapters."""

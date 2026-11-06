@@ -24,7 +24,7 @@ import { readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { MuseClient } from '../../reference/muse-client/src/client.js';
-import { loadCredentials } from '../../reference/muse-client/src/credentials.js';
+import { loadCredentials, saveCredentials } from '../../reference/muse-client/src/credentials.js';
 import { MuseTurn } from '../../reference/muse-client/src/turn.js';
 
 const TERMINAL_TASK = new Set(['completed', 'failed', 'errored', 'cancelled', 'canceled']);
@@ -74,16 +74,90 @@ function parseArgs(argv: string[]): Args {
 
 type ResultState = 'running' | 'succeeded' | 'failed' | 'cancelled' | 'unknown' | 'sent';
 
+interface MediaItem {
+  kind: 'image' | 'video' | 'file';
+  path: string;
+  filename: string;
+}
+
 interface TurnResult {
   state: ResultState;
   text?: string;
   message_id?: string;
   session_id?: string;
   evidence?: string;
+  // [[FILE:...]] references parsed out of the reply text (legacy bridge
+  // format). Text never retains a marker once it is parsed into media.
+  media?: MediaItem[];
   // True once any assistant message has been observed in this turn.
   // The executor reads it to decide whether a fold would still be
   // integrated (reply not started) or would arrive too late.
   reply_started?: boolean;
+}
+
+/** Split [[FILE:path]] markers out of reply text into media items. */
+export function extractFileMedia(text: string): { text: string; media: MediaItem[] } {
+  const media: MediaItem[] = [];
+  const seen = new Set<string>();
+  const collect = (raw: string): void => {
+    const path = String(raw).trim();
+    if (path.startsWith('/') && !seen.has(path)) {
+      seen.add(path);
+      const filename = path.split('/').at(-1) ?? path;
+      const ext = filename.includes('.') ? filename.split('.').at(-1)!.toLowerCase() : '';
+      const kind: MediaItem['kind'] = ['jpg', 'jpeg', 'png', 'gif', 'webp'].includes(ext)
+        ? 'image'
+        : ['mp4', 'mov', 'webm', 'mkv', 'avi'].includes(ext)
+          ? 'video'
+          : 'file';
+      media.push({ kind, path, filename });
+    }
+  };
+  const lines: string[] = [];
+  for (const line of text.split('\n')) {
+    const stripped = line.trim();
+    const onlyMarker = /^\[\[FILE:([^\]\n]+)\]\]$/.exec(stripped);
+    if (onlyMarker) {
+      // A marker-only line vanishes entirely (legacy bridge behaviour);
+      // inline markers are removed in place.
+      collect(onlyMarker[1]!);
+      continue;
+    }
+    lines.push(line.replace(/\[\[FILE:([^\]\n]+)\]\]/g, (_match, raw: string) => {
+      collect(raw);
+      return '';
+    }).trimEnd());
+  }
+  return { text: lines.join('\n').trim(), media };
+}
+
+/** Merge every bound reply of one turn into a single text + media list. */
+export function mergeBoundReplies(texts: string[]): { text: string; media: MediaItem[] } {
+  const parts: string[] = [];
+  const media: MediaItem[] = [];
+  const seen = new Set<string>();
+  for (const raw of texts) {
+    const { text, media: found } = extractFileMedia(raw);
+    if (text) parts.push(text);
+    for (const item of found) {
+      if (!seen.has(item.path)) {
+        seen.add(item.path);
+        media.push(item);
+      }
+    }
+  }
+  return { text: parts.join('\n'), media };
+}
+
+/** The ack's message id, or null when it is missing/empty.
+
+ * sendMessage is supposed to guarantee a message id (the reference
+ * client throws when it is absent), but an empty id must never be
+ * treated as "definitely not sent": the caller records unknown, not
+ * failed, so no other track re-sends a message that may have landed.
+ */
+export function validateAckMessageId(ack: { messageId?: unknown }): string | null {
+  return typeof ack.messageId === 'string' && ack.messageId.trim() ? ack.messageId.trim() : null;
 }
 
 function writeResult(out: string, result: TurnResult): void {
@@ -92,7 +166,7 @@ function writeResult(out: string, result: TurnResult): void {
   renameSync(tmp, out);
 }
 
-async function main(): Promise<number> {
+export async function main(): Promise<number> {
   const args = parseArgs(process.argv.slice(2));
   if (!Number.isSafeInteger(args.timeoutSeconds) || args.timeoutSeconds < 1) {
     console.error('timeout must be a positive integer number of seconds');
@@ -100,6 +174,14 @@ async function main(): Promise<number> {
   }
   const startedAt = Date.now();
   let settled: TurnResult | null = null;
+  // True once the send has been attempted. A failure before the send
+  // (connect / credentials) means nothing could have been delivered,
+  // so it is a determinable 'failed'. Once the send was attempted, the
+  // message may have reached the server even if the ack was lost, so
+  // the outcome is 'unknown', never 'failed': a 'failed' without a
+  // message id would make DualTrack re-send on the Native track and
+  // double-deliver.
+  let sendAttempted = false;
   const TERMINAL_RESULT = new Set(['succeeded', 'failed', 'cancelled', 'unknown']);
   const settle = (next: TurnResult): void => {
     // A terminal result is final. A 'running' placeholder may be overwritten
@@ -116,7 +198,10 @@ async function main(): Promise<number> {
   };
   const onSignal = (): void => {
     if (!settled || !TERMINAL_RESULT.has(settled.state)) {
-      settle({ state: 'cancelled', evidence: 'worker_terminated', session_id: args.session });
+      // Local kill only: there is no server-side cancel in the reference
+      // client, so the server turn may keep running after this worker
+      // dies. Say so in the evidence; never claim the turn stopped.
+      settle({ state: 'cancelled', evidence: 'worker_terminated_local_only_server_turn_may_continue', session_id: args.session });
     }
     process.exit(0);
   };
@@ -128,18 +213,49 @@ async function main(): Promise<number> {
   let client: MuseClient | null = null;
   try {
     const credentials = await loadCredentials(args.credentialsDir);
-    client = await MuseClient.connect({ credentials, vmId: args.vmId });
+    // Persist rotated tokens: the refresh token rotates on every
+    // refresh (the old one is invalidated server-side). Without this
+    // callback the new tokens live only in this worker's memory and
+    // die with the process, so the next worker reads the stale
+    // refresh token from pairing.json and gets HTTP 401 -- the
+    // pairing then looks dead after the first access token expires
+    // (a few hours), even though the device identity is permanent.
+    client = await MuseClient.connect({
+      credentials,
+      vmId: args.vmId,
+      onCredentials: (next) => saveCredentials(next, args.credentialsDir),
+    });
     console.error(`connected to ${client.vm.id}`);
 
-    const ack = await client.sendMessage(text, { sessionId: args.session });
-    console.error(`sent, message id ${ack.messageId}`);
+    const ack = await (async () => {
+      sendAttempted = true;
+      try {
+        return await client.sendMessage(text, { sessionId: args.session });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        settle({
+          state: 'unknown',
+          evidence: `send_unconfirmed: ${message}`.slice(0, 200),
+          session_id: args.session,
+        });
+        return null;
+      }
+    })();
+    if (ack === null) return 0;
+    const messageId = validateAckMessageId(ack);
+    if (messageId === null) {
+      // No usable ack id: delivery is unconfirmed, not disproven.
+      settle({ state: 'unknown', evidence: 'ack_missing_message_id', session_id: args.session });
+      return 0;
+    }
+    console.error(`sent, message id ${messageId}`);
     if (args.sendOnly) {
       // Fold send: the message is in the session; the running turn's
       // own worker keeps the subscription and will see the reply.
-      settle({ state: 'sent', message_id: ack.messageId, session_id: args.session });
+      settle({ state: 'sent', message_id: messageId, session_id: args.session });
       return 0;
     }
-    settle({ state: 'running', message_id: ack.messageId, session_id: args.session });
+    settle({ state: 'running', message_id: messageId, session_id: args.session });
 
     // A subscribe on a just-created side chat can stall server-side (seen
     // live 2026-11-06: the call hung past the turn deadline while the reply
@@ -165,7 +281,7 @@ async function main(): Promise<number> {
     }
     if (!sub) {
       const detail = subscribeError instanceof Error ? subscribeError.message : String(subscribeError ?? 'subscribe timed out');
-      settle({ state: 'unknown', evidence: `subscribe_timeout: ${detail}`.slice(0, 200), message_id: ack.messageId, session_id: args.session });
+      settle({ state: 'unknown', evidence: `subscribe_timeout: ${detail}`.slice(0, 200), message_id: messageId, session_id: args.session });
       return 0;
     }
     console.error('subscribed');
@@ -215,7 +331,7 @@ async function main(): Promise<number> {
         const started = [...turn.replies.values()].some((r) => r.text && r.text.trim());
         if (started) {
           replyStartedRecorded = true;
-          settle({ state: 'running', message_id: ack.messageId, session_id: args.session, reply_started: true });
+          settle({ state: 'running', message_id: messageId, session_id: args.session, reply_started: true });
         }
       }
       next = iterator.next();
@@ -225,34 +341,53 @@ async function main(): Promise<number> {
     sub.close();
 
     if (timedOut) {
-      settle({ state: 'unknown', evidence: 'turn_timeout', message_id: ack.messageId, session_id: args.session });
+      settle({ state: 'unknown', evidence: 'turn_timeout', message_id: messageId, session_id: args.session });
       return 0;
     }
     if (subEnded && !turn.complete()) {
-      settle({ state: 'failed', evidence: 'subscription_ended_before_reply_completed', message_id: ack.messageId, session_id: args.session });
+      settle({ state: 'failed', evidence: 'subscription_ended_before_reply_completed', message_id: messageId, session_id: args.session });
       return 0;
     }
     const bound = [...turn.replies.values()].filter((reply) => reply.bound && reply.done && reply.text.trim());
-    const reply = bound.at(-1);
-    if (reply) {
-      settle({ state: 'succeeded', text: reply.text, message_id: reply.messageId, session_id: args.session });
+    if (bound.length) {
+      // A turn may split its answer across several assistant messages
+      // (the video reference + link arrived in a later message live):
+      // merge them all into one text + media list instead of keeping
+      // only the last one.
+      const merged = mergeBoundReplies(bound.map((reply) => reply.text));
+      settle({
+        state: 'succeeded',
+        text: merged.text,
+        media: merged.media.length ? merged.media : undefined,
+        message_id: bound.at(-1)!.messageId,
+        session_id: args.session,
+      });
       return 0;
     }
     if (terminalTaskStatus === 'cancelled' || terminalTaskStatus === 'canceled') {
-      settle({ state: 'cancelled', evidence: 'platform_turn_cancelled', message_id: ack.messageId, session_id: args.session });
+      settle({ state: 'cancelled', evidence: 'platform_turn_cancelled', message_id: messageId, session_id: args.session });
       return 0;
     }
     if (terminalTaskStatus === 'failed' || terminalTaskStatus === 'errored') {
-      settle({ state: 'failed', evidence: `platform_turn_${terminalTaskStatus}`, message_id: ack.messageId, session_id: args.session });
+      settle({ state: 'failed', evidence: `platform_turn_${terminalTaskStatus}`, message_id: messageId, session_id: args.session });
       return 0;
     }
-    settle({ state: 'unknown', evidence: 'turn_completed_without_bound_reply', message_id: ack.messageId, session_id: args.session });
+    settle({ state: 'unknown', evidence: 'turn_completed_without_bound_reply', message_id: messageId, session_id: args.session });
     return 0;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.error(`turn failed: ${message}`);
     if (!settled) {
-      settle({ state: 'failed', evidence: message.slice(0, 200), session_id: args.session });
+      // Before the send was attempted, nothing could have been
+      // delivered: determinable 'failed', safe for a Native retry.
+      // Once the send was attempted, delivery is unconfirmed: 'unknown',
+      // never 'failed', so no other track re-sends a message that may
+      // have landed.
+      settle({
+        state: sendAttempted ? 'unknown' : 'failed',
+        evidence: sendAttempted ? `send_unconfirmed: ${message}`.slice(0, 200) : message.slice(0, 200),
+        session_id: args.session,
+      });
       return 0;
     }
     // A failure after the acknowledgement was recorded: the message was
@@ -267,7 +402,9 @@ async function main(): Promise<number> {
   }
 }
 
-main().then((code) => process.exit(code)).catch((error) => {
-  console.error(error instanceof Error ? error.message : String(error));
-  process.exit(1);
-});
+if (import.meta.main) {
+  main().then((code) => process.exit(code)).catch((error) => {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exit(1);
+  });
+}

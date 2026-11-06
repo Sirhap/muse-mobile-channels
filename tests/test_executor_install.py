@@ -85,7 +85,11 @@ class ExecutorOwnershipTests(unittest.TestCase):
         calls, task, state = self.run_scenario(expire)
         self.assertEqual(calls, [])
         self.assertEqual(task['state'], 'reconciling')
-        self.assertEqual(state, 'unknown')
+        # The slow session creation outlived the 60s lease, so the
+        # unknown poll cannot be recorded under the expired claim and
+        # the runner reports ownership loss (previously the unknown
+        # outcome was returned without touching the store, masking it).
+        self.assertEqual(state, 'ownership_lost')
 
     def test_cancellation_during_session_creation_does_not_submit(self):
         """A new cancel request wins before any user task is sent externally."""

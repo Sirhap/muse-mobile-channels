@@ -1,9 +1,11 @@
 """Small execution and delivery loops with explicit external outcome semantics."""
 from __future__ import annotations
 
+import json
 import logging
+import sqlite3
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 
 from .delivery import DeliveryClaim, DeliveryStore
@@ -25,6 +27,11 @@ class ExecutionContext:
     account_id: str
     chat_type: str
     chat_id: str
+    # Inbound media for this turn, same shape as ExecutionOutcome.media:
+    # {"kind": "image"|"video"|"file", "path": <absolute path under
+    # ~/workspace>, "filename": str}. Read from gateway_routes.media_json
+    # by CoreRunner._context; [] when the task has no route media.
+    media: list = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -41,6 +48,11 @@ class ExecutionOutcome:
     # no message id means the send never completed, so a native retry
     # cannot double-deliver.
     message_id: str | None = None
+    # Media the executor produced for this turn, passed through verbatim
+    # by storage and delivery (never parsed here): each item is
+    # {"kind": "image"|"video"|"file", "path": <absolute path under
+    # ~/workspace>, "filename": str}.
+    media: list = field(default_factory=list)
 
 
 class Executor(Protocol):
@@ -96,8 +108,23 @@ class CoreRunner:
             'FROM tasks t JOIN inbound_messages m ON m.id=t.message_id '
             'JOIN conversations c ON c.id=t.conversation_id WHERE t.id=?', (claim.task_id,)
         ).fetchone()
+        # Media lives on the gateway route, not the message row; a store
+        # created without a gateway binding has no such table, so a
+        # missing table means "no media", never a crash.
+        media: list = []
+        try:
+            route = self.store.connection.execute(
+                'SELECT media_json FROM gateway_routes WHERE task_id=?',
+                (claim.task_id,)).fetchone()
+            if route is not None:
+                media = json.loads(route['media_json'] or '[]')
+        except (ValueError, TypeError, sqlite3.OperationalError):
+            media = []
+        if not isinstance(media, list):
+            media = []
         return ExecutionContext(claim, row['text'], row['external_id'], row['sender_id'],
-                                row['channel'], row['account_id'], row['chat_type'], row['chat_id'])
+                                row['channel'], row['account_id'], row['chat_type'], row['chat_id'],
+                                media=media)
 
     def _active_claim(self) -> Claim | None:
         """Renew our original attempt or acquire query-only ownership after expiry."""
@@ -165,10 +192,54 @@ class CoreRunner:
             return None
         return 'folded'
 
+    def _emit_wait_receipts(self) -> None:
+        """Notify tasks queued over 180s of their live queue position.
+
+        Position counts tasks in the same conversation with a smaller
+        sequence that are still ahead of it (queued/claimed/running/
+        reconciling, per the claim ordering in Store.claim), plus one
+        for the task itself. A task gets at most one wait receipt: the
+        check below skips any task that already has one.
+        """
+        now = self.store.clock()
+        rows = self.store.connection.execute(
+            "SELECT t.id,t.conversation_id,t.sequence FROM tasks t "
+            "JOIN inbound_messages m ON m.id=t.message_id "
+            "WHERE t.state='queued' AND m.received_at IS NOT NULL AND m.received_at<=?",
+            (now - 180,),
+        ).fetchall()
+        for row in rows:
+            existing = self.store.connection.execute(
+                "SELECT 1 FROM task_receipts WHERE task_id=? AND kind='wait' LIMIT 1",
+                (row["id"],)).fetchone()
+            if existing is not None:
+                continue
+            ahead = self.store.connection.execute(
+                "SELECT COUNT(*) FROM tasks WHERE conversation_id=? AND sequence<? "
+                "AND state IN ('queued','claimed','running','reconciling')",
+                (row["conversation_id"], row["sequence"])).fetchone()[0]
+            position = ahead + 1
+            self.store.add_receipt(
+                row["id"], row["conversation_id"], "wait",
+                f"前面还有 {ahead} 个任务在排队，你排在第 {position} 位，请稍等。")
+
+    def _handle_unknown(self, claim: Claim) -> str:
+        """Count an unknown poll; fail the task once its budget is spent.
+
+        Returns 'failed' when the unknown budget (10 polls or 900s for
+        this attempt, see Store.note_unknown) is exhausted and the
+        failure was recorded, otherwise 'unknown'. Ownership errors
+        propagate so the caller can report 'ownership_lost'.
+        """
+        if self.store.note_unknown(claim):
+            self.store.fail(claim, "unknown_threshold_exceeded")
+            return "failed"
+        return "unknown"
+
     def _apply(self, claim: Claim, outcome: ExecutionOutcome) -> str:
         """Persist only outcomes backed by the adapter's explicit evidence."""
         if outcome.state == 'succeeded' and isinstance(outcome.text, str):
-            self.store.complete(claim, outcome.text)
+            self.store.complete(claim, outcome.text, media=outcome.media or [])
         elif outcome.state == 'accepted' and outcome.run_id:
             self.store.mark_submitted(claim, outcome.run_id)
         elif outcome.state == 'not_submitted' and outcome.evidence:
@@ -177,16 +248,25 @@ class CoreRunner:
             self.store.fail(claim, outcome.evidence)
         elif outcome.state == 'cancelled' and outcome.evidence:
             self.store.confirm_platform_cancel(claim, outcome.evidence)
-        elif outcome.state not in ('running', 'unknown'):
+        elif outcome.state == 'unknown':
+            return self._handle_unknown(claim)
+        elif outcome.state not in ('running',):
             raise ValueError('executor returned an outcome without required evidence')
         return outcome.state
 
     def tick(self) -> str:
         """Execute a new submission or poll one known attempt; never resubmit unknowns."""
+        self._emit_wait_receipts()
         folded = self._try_fold()
         if folded is not None:
             return folded
         claim = self.store.claim(self.owner, self.concurrency, self.lease_seconds)
+        if claim is not None:
+            # The task was truly claimed by this runner (not merely
+            # received, and never for a folded task, which is never
+            # claimed): the user gets one 'started' notice.
+            self.store.add_receipt(claim.task_id, claim.conversation_id,
+                                   "started", "正在处理…")
         if claim is None:
             claim = self._active_claim()
         if claim is None:
@@ -207,13 +287,19 @@ class CoreRunner:
             try:
                 outcome = self.executor.submit(context)
             except Exception:
-                return 'unknown'
+                try:
+                    return self._handle_unknown(claim)
+                except Exception:
+                    return 'unknown'
         else:
             try:
                 operation = self.executor.cancel if task['cancel_requested'] else self.executor.query
                 outcome = operation(context, attempt['run_id'])
             except Exception:
-                return 'unknown'
+                try:
+                    return self._handle_unknown(claim)
+                except Exception:
+                    return 'unknown'
         if not isinstance(outcome, ExecutionOutcome):
             return 'unknown'
         try:
@@ -250,15 +336,31 @@ class DeliveryRunner:
         self.delivery = DeliveryStore(store)
         self.chunk_limit, self.lease_seconds = chunk_limit, lease_seconds
 
+    def _delivery_failed_receipt(self, outbound_id: str) -> None:
+        """Write the user-facing notice for a terminally failed delivery."""
+        row = self.store.connection.execute(
+            "SELECT task_id,conversation_id FROM outbound_messages WHERE id=?",
+            (outbound_id,)).fetchone()
+        if row is not None:
+            self.store.add_receipt(row["task_id"], row["conversation_id"],
+                                   "delivery_failed",
+                                   "回复已生成但发送失败，请再发一次。")
+
     def prepare(self) -> None:
         """Persist deterministic segmentation for all new execution results."""
         for row in self.store.connection.execute(
-            "SELECT m.id,m.text FROM outbound_messages m WHERE m.state='pending' "
+            "SELECT m.id,m.text,m.media_json FROM outbound_messages m WHERE m.state='pending' "
             'AND NOT EXISTS (SELECT 1 FROM outbound_parts p WHERE p.outbound_id=m.id)'
         ).fetchall():
             chunks = [row['text'][start:start + self.chunk_limit]
                       for start in range(0, len(row['text']), self.chunk_limit)] or ['']
-            self.delivery.prepare(row['id'], chunks)
+            try:
+                media = json.loads(row["media_json"] or "[]")
+            except (ValueError, TypeError):
+                media = []
+            if not isinstance(media, list):
+                media = []
+            self.delivery.prepare(row['id'], chunks, media=media)
 
     def tick(self) -> str:
         """Persist sending before IO, and treat unexpected exceptions as unknown."""
@@ -281,6 +383,10 @@ class DeliveryRunner:
                 self.delivery.retry(claim, outcome.evidence, outcome.retry_after)
             elif outcome.state == 'rejected' and outcome.evidence:
                 self.delivery.reject(claim, outcome.evidence)
+                # Terminal delivery failure must reach the user, not
+                # just the log: DeliveryStore.reject writes the same
+                # receipt, and add_receipt dedups, so this is safe.
+                self._delivery_failed_receipt(claim.outbound_id)
             else:
                 self.delivery.unknown(claim)
                 return 'unknown'

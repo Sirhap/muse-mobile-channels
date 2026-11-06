@@ -222,7 +222,7 @@ class GatewayCoreBindingTests(unittest.IsolatedAsyncioTestCase):
         running = {conversations[row['conversation_id']]: row for row in self.rows('tasks') if row['state'] == 'running'}
         self.assertEqual(running['room-one']['cancel_requested'], 1)
         self.assertEqual(running['room-two']['cancel_requested'], 0)
-        self.assertIn('1 个活动任务', self.rows('outbound_messages')[0]['text'])
+        self.assertIn('正在跑', self.rows('outbound_messages')[0]['text'])
 
     async def run_delivery(self, channel, terminal, *, client=None, credentials=None, ticks=3):
         """Drive real thread-to-event-loop delivery, then cancel at a completed tick."""
@@ -340,7 +340,7 @@ class GatewayCoreBindingTests(unittest.IsolatedAsyncioTestCase):
         succeeded = [row for row in tasks.values() if row['state'] == 'succeeded']
         self.assertEqual(len(cancelled), 2)
         self.assertEqual(len(succeeded), 1)
-        self.assertIn('2 个活动任务', self.rows('outbound_messages')[0]['text'])
+        self.assertIn('已立即取消 2 个排队任务', self.rows('outbound_messages')[0]['text'])
 
     async def test_empty_text_without_media_is_rejected_not_queued_as_attachment(self):
         """Empty text without media raises IngressValidationError instead of queuing a bogus [附件] task."""
@@ -365,7 +365,11 @@ class GatewayCoreBindingTests(unittest.IsolatedAsyncioTestCase):
             media=[{'type': 'file', 'name': 'doc.pdf'}],
         )
         self.assertTrue(item.created)
-        self.assertIn('附件信息已保存', self.rows('outbound_messages')[0]['text'])
+        # Wave-2 media gate: a file with no local path is explicitly
+        # refused (not "saved"), naming the unsupported type.
+        reply = self.rows('outbound_messages')[0]['text']
+        self.assertIn('文件', reply)
+        self.assertIn('未执行', reply)
 
 
 if __name__ == '__main__':

@@ -15,8 +15,10 @@ unknown, and its history is never trusted.
 """
 from __future__ import annotations
 
+import base64
 import importlib.util
 import os
+import re
 import threading
 import time
 import uuid
@@ -32,6 +34,141 @@ from .storage import Store
 # the reply-start event out of the latest 100; 500 gives headroom. The
 # history API has no after_seq cursor, so this is a plain limit.
 HISTORY_LIMIT = 500
+
+# How many extra history fetch rounds MuseExecutor.query waits through
+# after the first completed assistant message, one poll_interval apart,
+# while new completed messages keep arriving. A turn can legitimately
+# split its answer across several assistant messages (proven live
+# 2026-11-06: the video reference + link arrived 1.44s after the first
+# message, after the executor had already settled). The loop stops early
+# the moment a round adds no new completed message, so a single-message
+# turn costs exactly one extra poll cycle.
+QUERY_SETTLE_ROUNDS = 3
+
+# [[FILE:/absolute/path]] markers, legacy bridge format
+# (native_bridge.py _deliver_reply_raw / _deliver_idle). Executors parse
+# them out of reply text into ExecutionOutcome.media; text never retains
+# a marker once parsed.
+FILE_MARKER_RE = re.compile(r"\[\[FILE:([^\]\n]+)\]\]")
+
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".webm", ".mkv", ".avi"}
+IMAGE_MIME_TYPES = {
+    ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+    ".gif": "image/gif", ".webp": "image/webp",
+}
+# Same per-image cap as reference/muse-client/src/message.ts.
+MAX_IMAGE_BYTES = 2 * 1024 * 1024
+
+# Evidence text for a Gadget cancel. There is no server-side cancel in
+# the reference client (no /chat/cancel endpoint; NoiseConnection.open
+# only aborts the local request), so killing the worker stops local
+# delivery only -- the server turn may keep running. Callers must relay
+# this honestly instead of claiming the turn stopped.
+GADGET_CANCEL_LOCAL_ONLY = "local_worker_terminated_server_turn_may_continue"
+
+
+def media_kind_for_path(path: str) -> str:
+    """Classify a media path by extension: image, video, or generic file."""
+    suffix = Path(path).suffix.lower()
+    if suffix in IMAGE_EXTENSIONS:
+        return "image"
+    if suffix in VIDEO_EXTENSIONS:
+        return "video"
+    return "file"
+
+
+def extract_file_media(text: str) -> tuple[str, list[dict]]:
+    """Split [[FILE:path]] markers out of reply text into media items.
+
+    Returns (clean_text, media) where each media item is
+    {"kind", "path", "filename"}. Markers with a relative path are
+    dropped from the text but produce no media item (only absolute
+    paths are deliverable). Duplicates collapse to one item per path.
+    """
+    if not isinstance(text, str) or not text:
+        return "", []
+    media: list[dict] = []
+    seen: set[str] = set()
+
+    def _replace(match: re.Match) -> str:
+        path = match.group(1).strip()
+        if path.startswith("/") and path not in seen:
+            seen.add(path)
+            media.append({"kind": media_kind_for_path(path), "path": path,
+                          "filename": Path(path).name})
+        return ""
+
+    lines: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        marker = FILE_MARKER_RE.fullmatch(stripped)
+        if marker is not None:
+            # A marker-only line vanishes entirely (legacy bridge
+            # behaviour); inline markers are removed in place.
+            _replace(marker)
+            continue
+        lines.append(FILE_MARKER_RE.sub(_replace, line).rstrip())
+    clean = "\n".join(lines).strip()
+    return clean, media
+
+
+def merge_media(*lists: list[dict] | None) -> list[dict]:
+    """Merge media lists, deduplicated by path, first occurrence wins."""
+    merged: list[dict] = []
+    seen: set[str] = set()
+    for items in lists:
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            path = item.get("path")
+            if not isinstance(path, str) or not path or path in seen:
+                continue
+            seen.add(path)
+            merged.append({"kind": item.get("kind") or media_kind_for_path(path),
+                           "path": path,
+                           "filename": item.get("filename") or Path(path).name})
+    return merged
+
+
+def build_stream_items(text: str, media: list[dict] | None) -> list[dict]:
+    """Build chat.stream items for the Native track from text + inbound media.
+
+    Image schema is copied from reference/muse-client/src/message.ts
+    chatRequest (the only documented image shape for /chat/stream);
+    muse-cli's chat.py itself only ever sends text items, and the Native
+    gateway's _open passes the body JSON through verbatim, so these items
+    ride the same path. Raises ValueError with a machine-readable
+    evidence string for anything that must not be silently dropped:
+    non-image media (no video/file item type exists for this endpoint),
+    unknown image mime, missing file, or oversize image. Callers fail
+    the submit before opening any stream.
+    """
+    items: list[dict] = []
+    if isinstance(text, str) and text.strip():
+        items.append({"type": "text", "text": text})
+    for entry in media or []:
+        if not isinstance(entry, dict):
+            raise ValueError("native_media_invalid_entry")
+        path = entry.get("path")
+        filename = entry.get("filename") or (Path(path).name if isinstance(path, str) else "")
+        kind = entry.get("kind") or (media_kind_for_path(path) if isinstance(path, str) else "file")
+        if kind != "image":
+            raise ValueError(f"native_media_unsupported:{kind}:{filename}")
+        mime = IMAGE_MIME_TYPES.get(Path(path).suffix.lower()) if isinstance(path, str) else None
+        if mime is None:
+            raise ValueError(f"native_media_unsupported_mime:{filename}")
+        try:
+            data = Path(path).read_bytes()
+        except OSError:
+            raise ValueError(f"native_media_missing:{path}") from None
+        if len(data) > MAX_IMAGE_BYTES:
+            raise ValueError(f"native_media_too_large:{filename}")
+        items.append({"type": "image", "mime_type": mime, "filename": filename,
+                      "data_base64": base64.b64encode(data).decode("ascii")})
+    if not items:
+        raise ValueError("native_media_empty_message")
+    return items
 
 SCHEMA = '''
 CREATE TABLE IF NOT EXISTS executor_sessions (
@@ -129,22 +266,26 @@ class MuseExecutor:
         events = response.get('chat_events', []) if isinstance(response, dict) else []
         return max((event.get('seq', 0) for event in events), default=0)
 
-    def _confirm_recorded(self, client, session_id: str, baseline: int) -> bool:
+    def _confirm_recorded(self, client, session_id: str, baseline: int) -> tuple[bool, int]:
         """Poll history on the same connection until a new event appears.
 
         ``_open`` is fire-and-forget: the frame alone does not prove the
         message landed. Only a history event after the baseline proves it.
+        Returns (confirmed, polls) so an unconfirmed submission can carry
+        a countable unknown instead of a bare one.
         """
         deadline = time.time() + self.confirm_timeout
+        polls = 0
         while True:
+            polls += 1
             response = client.call_json('chat.history', body={
                 'limit': 10, 'session_id': session_id,
             }, timeout=15)
             events = response.get('chat_events', []) if isinstance(response, dict) else []
             if any(event.get('seq', 0) > baseline for event in events):
-                return True
+                return True, polls
             if time.time() >= deadline:
-                return False
+                return False, polls
             time.sleep(self.poll_interval)
 
     def _session(self, client, context: ExecutionContext) -> str:
@@ -207,6 +348,14 @@ class MuseExecutor:
                 baseline = self._baseline(client, sid)
             except Exception:
                 return ExecutionOutcome('unknown', evidence='baseline_unavailable')
+            try:
+                items = build_stream_items(
+                    context.text, getattr(context, 'media', None))
+            except ValueError as exc:
+                # Unsupported / missing / oversize media: fail before any
+                # stream opens, so nothing is half-sent and nothing is
+                # silently dropped.
+                return ExecutionOutcome('failed', evidence=str(exc))
             with self.store.transaction():
                 task = self.store._owned(context.claim)
                 if task['cancel_requested']:
@@ -221,7 +370,7 @@ class MuseExecutor:
                 )
             self._validate_owner(context, submitting=True)
             stream = client._open('chat.stream', body={
-                'items': [{'type': 'text', 'text': context.text}], 'node_id': self.node_id,
+                'items': items, 'node_id': self.node_id,
                 'capabilities': {}, 'session_id': sid,
             })
             if isinstance(stream, dict) and isinstance(stream.get('run_id'), str) and stream['run_id']:
@@ -230,16 +379,20 @@ class MuseExecutor:
                 run_id = f'stream:{stream}'
             else:
                 return ExecutionOutcome('unknown', evidence='platform_run_identity_unavailable')
-            if not self._confirm_recorded(client, sid, baseline):
-                return ExecutionOutcome('unknown', evidence='submission_not_recorded')
+            confirmed, polls = self._confirm_recorded(client, sid, baseline)
+            if not confirmed:
+                return ExecutionOutcome(
+                    'unknown', evidence=f'submission_not_recorded polls={polls}')
             with self.store.transaction():
                 self.store.connection.execute(
                     "UPDATE executor_runs SET platform_run_id=?,baseline_seq=?,status='accepted' WHERE attempt_id=?",
                     (run_id, baseline, context.claim.attempt_id),
                 )
             return ExecutionOutcome('accepted', run_id=run_id)
-        except Exception:
-            return ExecutionOutcome('unknown')
+        except Exception as exc:
+            # A bare unknown is uncountable upstream: carry what failed.
+            return ExecutionOutcome(
+                'unknown', evidence=f"submit_failed:{type(exc).__name__}:{exc}"[:200])
         finally:
             if client is not None:
                 try:
@@ -259,13 +412,23 @@ class MuseExecutor:
         return row
 
     def query(self, context: ExecutionContext, run_id: str | None) -> ExecutionOutcome:
-        """Read only replies correlated with the confirmed submission.
+        """Read all replies correlated with the confirmed submission.
 
-        The binding guarantees the sent message was recorded; the reply is
-        the first completed assistant event after the recorded baseline, in
-        this attempt's dedicated session, with an empty reply-to (genuine
-        replies, not proactive pushes). Events at or before the baseline --
-        including any earlier attempt's output in this session -- are ignored.
+        The binding guarantees the sent message was recorded; the reply
+        is every completed assistant event after the recorded baseline,
+        in this attempt's dedicated session. A turn may legitimately
+        split its answer across several assistant messages (the video
+        reference + link arrived 1.44s after the first message live),
+        so the first completed message does NOT settle the turn: after
+        it appears, up to QUERY_SETTLE_ROUNDS extra history fetches run
+        one poll_interval apart, stopping early when a round adds no new
+        completed message, and all collected texts + [[FILE:]] media are
+        merged before the outcome is returned. No reply_to exclusion: a
+        genuine turn answer gets stamped with reply_to_message_id
+        whenever the turn was resumed by an internal handoff, and the
+        legacy bridge counts it (native_bridge.is_turn_reply, 2026-10-07
+        20:47 live loss). Events at or before the baseline -- including
+        any earlier attempt's output in this session -- are ignored.
         """
         self._validate_owner(context)
         binding = self._binding(context, run_id)
@@ -274,33 +437,58 @@ class MuseExecutor:
         client = self.client_factory()
         try:
             self._validate_owner(context)
-            response = client.call_json('chat.history', body={
-                'limit': HISTORY_LIMIT, 'session_id': binding['session_id'],
-            }, timeout=15)
-            events = response.get('chat_events', [])
             baseline = binding['baseline_seq'] or 0
-            for event in sorted(events, key=lambda value: value.get('seq', 0)):
-                if event.get('seq', 0) <= baseline:
-                    continue
-                if event.get('event_name') != 'message.assistant':
-                    continue
-                payload = event.get('payload') or {}
-                # No reply_to exclusion: a genuine turn answer gets stamped
-                # with reply_to_message_id whenever the turn was resumed by
-                # an internal handoff, and the legacy bridge counts it
-                # (native_bridge.is_turn_reply, 2026-10-07 20:47 live loss:
-                # seq 5222, status completed, never delivered). Session
-                # turns are serialized server-side, so the first completed
-                # assistant message after baseline is this turn's answer.
-                if payload.get('status') in ('cancelled', 'canceled'):
-                    return ExecutionOutcome('cancelled', evidence='platform_run_cancelled')
-                if payload.get('status') in ('failed', 'error'):
-                    return ExecutionOutcome('failed', evidence='platform_run_failed')
-                if payload.get('status') in ('completed', 'complete', 'succeeded'):
+            texts: list[str] = []
+            media: list[dict] = []
+            seen_seqs: set[int] = set()
+            terminal: str | None = None
+            for round_no in range(QUERY_SETTLE_ROUNDS):
+                new_found = False
+                response = client.call_json('chat.history', body={
+                    'limit': HISTORY_LIMIT, 'session_id': binding['session_id'],
+                }, timeout=15)
+                events = response.get('chat_events', []) if isinstance(response, dict) else []
+                for event in sorted(events, key=lambda value: value.get('seq', 0)):
+                    if event.get('seq', 0) <= baseline:
+                        continue
+                    if event.get('event_name') != 'message.assistant':
+                        continue
+                    payload = event.get('payload') or {}
+                    if payload.get('status') in ('cancelled', 'canceled'):
+                        terminal = terminal or 'cancelled'
+                        continue
+                    if payload.get('status') in ('failed', 'error'):
+                        terminal = terminal or 'failed'
+                        continue
+                    if payload.get('status') not in ('completed', 'complete', 'succeeded'):
+                        continue
+                    seq = event.get('seq', 0)
+                    if seq in seen_seqs:
+                        continue
+                    seen_seqs.add(seq)
+                    new_found = True
                     text = payload.get('display_text')
-                    if isinstance(text, str):
-                        return ExecutionOutcome('succeeded', text=text)
-            return ExecutionOutcome('running')
+                    if isinstance(text, str) and text:
+                        clean, found = extract_file_media(text)
+                        if clean:
+                            texts.append(clean)
+                        media = merge_media(media, found)
+                if not texts and terminal is None:
+                    return ExecutionOutcome('running')
+                if not new_found:
+                    break
+                if round_no < QUERY_SETTLE_ROUNDS - 1:
+                    # A new message arrived this round; wait one poll
+                    # cycle for a possible follow-up before settling.
+                    time.sleep(self.poll_interval)
+            if texts:
+                return ExecutionOutcome('succeeded', text="\n".join(texts), media=media)
+            if terminal == 'cancelled':
+                return ExecutionOutcome('cancelled', evidence='platform_run_cancelled')
+            return ExecutionOutcome('failed', evidence='platform_run_failed')
+        except Exception as exc:
+            return ExecutionOutcome(
+                'unknown', evidence=f"query_failed:{type(exc).__name__}:{exc}"[:200])
         finally:
             client.close()
 
@@ -370,11 +558,14 @@ class MuseExecutor:
                 'items': [{'type': 'text', 'text': text}], 'node_id': self.node_id,
                 'capabilities': {}, 'session_id': sid,
             })
-            if not self._confirm_recorded(client, sid, pre):
-                return ExecutionOutcome('unknown', evidence='fold_not_recorded')
+            confirmed, polls = self._confirm_recorded(client, sid, pre)
+            if not confirmed:
+                return ExecutionOutcome(
+                    'unknown', evidence=f'fold_not_recorded polls={polls}')
             return ExecutionOutcome('accepted', run_id=run_id)
-        except Exception:
-            return ExecutionOutcome('unknown')
+        except Exception as exc:
+            return ExecutionOutcome(
+                'unknown', evidence=f"fold_failed:{type(exc).__name__}:{exc}"[:200])
         finally:
             client.close()
 
@@ -469,6 +660,9 @@ class GadgetExecutor:
         self.store = store
         self._client = client
         self.client_factory = client_factory
+        # Per-attempt query poll counts, so an unknown outcome can carry
+        # countable evidence (polls=N) instead of a bare unknown.
+        self._query_counts: dict[str, int] = {}
         ensure_executor_schema(store)
 
     @property
@@ -548,6 +742,13 @@ class GadgetExecutor:
         """Spawn the Gadget worker for this attempt and record track='gadget'."""
         if not self.is_configured():
             return ExecutionOutcome('not_submitted', evidence='gadget_credentials_missing')
+        if getattr(context, 'media', None):
+            # The Gadget worker's sendMessage is text-only; a media task
+            # must never be silently text-stripped here. DualTrack routes
+            # media tasks to the Native track before reaching this point;
+            # a direct Gadget submit fails explicitly instead.
+            return ExecutionOutcome(
+                'failed', evidence='gadget_media_not_supported: gadget worker sends text only')
 
         try:
             existing = self.store.connection.execute(
@@ -596,39 +797,90 @@ class GadgetExecutor:
             return ExecutionOutcome('unknown', evidence=str(exc))
 
     def query(self, context: ExecutionContext, run_id: str | None) -> ExecutionOutcome:
-        """Read the worker's result file; a live worker with no file yet is running."""
+        """Read the worker's result file; a live worker with no file yet is running.
+
+        The worker merges every bound reply of the turn into one result
+        (text + media); [[FILE:]] markers are parsed into outcome.media
+        here as well, so a stale worker build can never leak a marker
+        into delivered text. A dead worker whose result file still says
+        'running' is a determinable terminal failure (no reply will ever
+        be collected on this track), not 'running' forever; its
+        message_id is preserved so DualTrack never re-sends a message
+        that already landed. A dead worker with no result file at all is
+        genuinely unknown -- but its evidence carries the poll count.
+        """
         self._validate_owner(context)
         binding = self._binding(context, run_id)
         if binding is None:
             return ExecutionOutcome('unknown', evidence='platform_run_identity_unavailable')
+        attempt_id = context.claim.attempt_id
+        self._query_counts[attempt_id] = self._query_counts.get(attempt_id, 0) + 1
+        polls = self._query_counts[attempt_id]
 
         try:
-            result = self.client.read_result(context.claim.attempt_id)
+            result = self.client.read_result(attempt_id)
         except Exception as exc:
-            return ExecutionOutcome('unknown', evidence=str(exc))
+            return ExecutionOutcome(
+                'unknown', evidence=f"read_result_failed:{type(exc).__name__}:{exc}"[:200])
         if result is None:
             pid = self._worker_pid(binding['platform_run_id'])
-            if pid is not None and self.client.worker_alive(pid):
+            if pid is not None and self._worker_alive(pid):
                 return ExecutionOutcome('running')
-            return ExecutionOutcome('unknown', evidence='worker_exited_without_result')
+            return ExecutionOutcome(
+                'unknown', evidence=f'worker_exited_without_result polls={polls}')
 
         state = result.get('state')
         mid = result.get('message_id')
         message_id = mid if isinstance(mid, str) and mid else None
         if state == 'running':
+            pid = self._worker_pid(binding['platform_run_id'])
+            if pid is not None and not self._worker_alive(pid):
+                # The driver is dead mid-turn: the reply will never be
+                # collected. Terminal failure, with the message id kept
+                # so the fallback path cannot double-deliver.
+                return ExecutionOutcome(
+                    'failed', evidence=f'worker_died_mid_turn polls={polls}',
+                    message_id=message_id)
             return ExecutionOutcome('running', message_id=message_id)
         if state == 'succeeded':
             text = result.get('text')
             if not isinstance(text, str) or not text:
-                return ExecutionOutcome('unknown', evidence='worker_succeeded_without_text', message_id=message_id)
-            return ExecutionOutcome('succeeded', text=text, message_id=message_id)
+                return ExecutionOutcome(
+                    'unknown', evidence=f'worker_succeeded_without_text polls={polls}',
+                    message_id=message_id)
+            clean_text, marker_media = extract_file_media(text)
+            media = merge_media(result.get('media'), marker_media)
+            return ExecutionOutcome(
+                'succeeded', text=clean_text, message_id=message_id, media=media)
         if state == 'failed':
             return ExecutionOutcome('failed', evidence=str(result.get('evidence') or 'platform_turn_failed'), message_id=message_id)
         if state == 'cancelled':
             return ExecutionOutcome('cancelled', evidence=str(result.get('evidence') or 'platform_turn_cancelled'), message_id=message_id)
         if state == 'unknown':
-            return ExecutionOutcome('unknown', evidence=str(result.get('evidence') or 'worker_unknown'), message_id=message_id)
-        return ExecutionOutcome('unknown', evidence=f'unrecognized_result_state_{state}', message_id=message_id)
+            return ExecutionOutcome(
+                'unknown',
+                evidence=f"{result.get('evidence') or 'worker_unknown'} polls={polls}",
+                message_id=message_id)
+        return ExecutionOutcome(
+            'unknown', evidence=f'unrecognized_result_state_{state} polls={polls}',
+            message_id=message_id)
+
+    def _worker_alive(self, pid: int) -> bool:
+        """True when the worker is alive; an unreadable state fails safe to alive.
+
+        Uses the bound client's own liveness check (the real GadgetClient
+        reads /proc; test fakes keep an in-memory set).
+        """
+        alive = getattr(self.client, "worker_alive", None)
+        if callable(alive):
+            try:
+                return bool(alive(pid))
+            except Exception:
+                return True
+        try:
+            return GadgetClient.worker_alive(pid)
+        except Exception:
+            return True
 
     def reply_started(self, context: ExecutionContext, run_id: str | None) -> bool:
         """True when the live turn's reply has started generating.
@@ -697,7 +949,17 @@ class GadgetExecutor:
         return ExecutionOutcome('unknown', evidence='fold_send_unconfirmed')
 
     def cancel(self, context: ExecutionContext, run_id: str | None) -> ExecutionOutcome:
-        """Kill the worker and report the turn cancelled."""
+        """Kill the local worker and report the cancel honestly.
+
+        There is no server-side cancel in the reference client (checked
+        reference/muse-client/src/client.ts + connection.ts: the only
+        cancellation is a local AbortSignal on the Noise request, and no
+        /chat/cancel endpoint exists), so killing the worker stops local
+        delivery only -- the server turn may keep running and its reply
+        will simply never be collected here. The outcome is therefore
+        'cancelled' with evidence that says exactly that, never a bare
+        claim that the turn stopped.
+        """
         self._validate_owner(context)
         binding = self._binding(context, run_id)
         if binding is None:
@@ -710,8 +972,11 @@ class GadgetExecutor:
                 return ExecutionOutcome('unknown', evidence=str(exc))
         result = self.client.read_result(context.claim.attempt_id)
         if isinstance(result, dict) and result.get('state') == 'cancelled':
-            return ExecutionOutcome('cancelled', evidence=str(result.get('evidence') or 'platform_turn_cancelled'))
-        return ExecutionOutcome('cancelled', evidence='worker_terminated')
+            evidence = str(result.get('evidence') or 'platform_turn_cancelled')
+            if 'server_turn_may_continue' not in evidence:
+                evidence = f"{evidence}; server_turn_may_continue"
+            return ExecutionOutcome('cancelled', evidence=evidence)
+        return ExecutionOutcome('cancelled', evidence=GADGET_CANCEL_LOCAL_ONLY)
 
     def close(self) -> None:
         """Close the underlying client; live workers keep running so their results survive."""
@@ -763,7 +1028,16 @@ class DualTrackExecutor:
         return self.circuit.status
 
     def submit(self, context: ExecutionContext) -> ExecutionOutcome:
-        """提交任务：优先主轨，故障/熔断时平滑降级至备轨。"""
+        """提交任务：优先主轨，故障/熔断时平滑降级至备轨。
+
+        带媒体的任务不走 Gadget 轨：Gadget worker 只发纯文本，直接送
+        过去会把媒体静默丢掉，所以媒体任务直走 Native 备轨（它按
+        reference/muse-client message.ts 的图片 schema 发图）。
+        """
+        # Media tasks never touch the Gadget track: its worker sends
+        # text only, so routing them there would silently drop the media.
+        if getattr(context, 'media', None):
+            return self.fallback.submit(context)
         # 1. 检查主轨凭证与熔断状态
         if not self.primary.is_configured() or not self.circuit.can_execute():
             return self.fallback.submit(context)
@@ -813,7 +1087,14 @@ class DualTrackExecutor:
                         "UPDATE executor_runs SET status='failed_superseded' WHERE attempt_id=?",
                         (context.claim.attempt_id,),
                     )
-                fallback_outcome = self.fallback.submit(context)
+                try:
+                    fallback_outcome = self.fallback.submit(context)
+                except Exception as exc:
+                    # The fallback never bound a run: fail explicitly with
+                    # evidence instead of bubbling into an unknown wedge.
+                    return ExecutionOutcome(
+                        'failed',
+                        evidence=f"fallback_submit_failed:{type(exc).__name__}:{exc}"[:200])
                 if fallback_outcome.state == 'accepted' and fallback_outcome.run_id:
                     # The fallback bound a new run for this attempt. The
                     # CoreRunner state machine binds one run per attempt at
@@ -822,7 +1103,17 @@ class DualTrackExecutor:
                     # requires the 'reconciling' state), so rebind the
                     # attempt to the native run and report 'running': the
                     # runner keeps polling the live run on the next tick.
-                    self.store.rebind_run(context.claim, fallback_outcome.run_id)
+                    try:
+                        self.store.rebind_run(context.claim, fallback_outcome.run_id)
+                    except Exception as exc:
+                        # The native run is live but the runner can no
+                        # longer poll it (the attempt still points at the
+                        # dead gadget run). Fail explicitly with evidence
+                        # instead of letting the exception wedge the task
+                        # in unknown forever.
+                        return ExecutionOutcome(
+                            'failed',
+                            evidence=f"fallback_rebind_failed:{type(exc).__name__}:{exc}"[:200])
                     return ExecutionOutcome('running')
                 return fallback_outcome
             return outcome

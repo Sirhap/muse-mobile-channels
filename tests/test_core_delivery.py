@@ -67,10 +67,16 @@ class DeliveryTests(unittest.TestCase):
             self.assertEqual((row["part_id"], row["outcome"]), (claim.part_id, "sending"))
 
     def test_timeout_never_retries_without_explicit_resolution(self):
-        """Unknown platform acceptance blocks this part and all later message parts."""
+        """Unknown platform acceptance blocks this part and all later message parts.
+
+        Within the 10-minute auto-reject window the part stays
+        delivery_unknown until an explicit resolution; past the window
+        the sweep rejects it (and unblocks the conversation) instead of
+        leaving it stuck forever.
+        """
         claim = self.delivery.claim("sender")
         self.delivery.unknown(claim)
-        self.now += 1000
+        self.now += 100
         self.assertIsNone(self.delivery.claim("other"))
         self.assertEqual(self.message_state(), "delivery_unknown")
         with self.assertRaises(ValueError):
@@ -81,6 +87,16 @@ class DeliveryTests(unittest.TestCase):
         self.assertGreater(new.token, claim.token)
         with self.assertRaises(OwnershipError):
             self.delivery.delivered(claim, "late")
+        # The retried send goes unknown again; past 10 minutes the
+        # sweep auto-rejects it and writes a delivery_failed receipt.
+        self.delivery.unknown(new)
+        self.now += 1000
+        self.assertIsNone(self.delivery.claim("other"))
+        self.assertEqual(self.message_state(), "rejected")
+        receipts = self.store.connection.execute(
+            "SELECT * FROM task_receipts WHERE task_id=? AND kind='delivery_failed'",
+            (self.item.task_id,)).fetchall()
+        self.assertEqual(len(receipts), 1)
 
     def test_crashed_sender_is_unknown_on_restart_not_retried(self):
         """Lease loss after a possible send never authorizes another network request."""

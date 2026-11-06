@@ -19,6 +19,7 @@ import base64
 import fcntl
 import hashlib
 import json
+import mimetypes
 import os
 import random
 import re
@@ -232,6 +233,53 @@ RECONNECT_MAX_ATTEMPTS = 3
 
 def log(msg: str) -> None:
     print(f"[weixin-gateway {time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
+
+
+# Core-mode inbound replies that bypass the task queue: the message never
+# becomes a task, so the user is told directly instead.
+VOICE_NO_TRANSCRIPTION_TEXT = "没听清，语音转写失败，请再发一次文字。"
+MEDIA_DOWNLOAD_FAILED_TEXT = "附件下载失败，请再发一次。"
+
+
+def _core_media_item(media: dict) -> dict:
+    """Normalize one downloaded inbound media item for core.receive.
+
+    Same shape as the outbound media the executors produce: kind, local
+    path, filename, mime. Only items with a local_path reach core; the
+    caller handles the rest as an explicit download failure.
+    """
+    path = str(media.get("local_path") or "")
+    filename = ""
+    item = media.get("item")
+    if isinstance(item, dict):
+        for key in ("file_name", "fileName", "name"):
+            if isinstance(item.get(key), str) and item[key]:
+                filename = item[key]
+                break
+    if not filename:
+        filename = Path(path).name if path else str(media.get("filename") or "")
+    mime = mimetypes.guess_type(path)[0] if path else ""
+    return {"kind": str(media.get("kind") or "file"), "path": path,
+            "filename": filename, "mime": mime or ""}
+
+
+def _has_substantive_text(text: str) -> bool:
+    """True when text has content beyond inbound media labels.
+
+    An image-only message arrives as "[图片]"; if its download failed
+    there is no real content left, so the failure notice is the whole
+    reply and no empty task is created.
+    """
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped in ("[图片]", "[文件]", "[视频]"):
+            continue
+        if stripped.startswith("[文件") and stripped.endswith("]"):
+            continue
+        return True
+    return False
 
 
 def jsonl_text_lines(text: str) -> list[str]:
@@ -2292,8 +2340,10 @@ class Gateway:
                 t = v.get("text", "")
                 if isinstance(t, str) and t:
                     parts.append(t)
-                else:
-                    parts.append("[语音]")
+                # No transcription: contribute nothing. The old "[语音]"
+                # placeholder used to be sent to Muse as a fake question;
+                # handle_inbound now answers the user directly instead
+                # ("没听清…请再发一次文字") and never creates a task.
                 # Voice audio is NOT received/downloaded (user request
                 # 2026-10-04): only WeChat's own transcription in
                 # `text` is used. The original .silk is never fetched
@@ -3081,6 +3131,40 @@ class Gateway:
             resolved = self._resolve_quote(self._find_ref_qid(msg))
             if resolved:
                 text = text.replace("（引用：[消息]）", resolved)
+        # Voice without transcription: never a "[语音]" placeholder task
+        # and never a silent drop. Answer directly in both core and
+        # legacy mode; a voice-only message ends here.
+        voice_items = [item for item in (msg.get("item_list") or [])
+                       if isinstance(item, dict) and item.get("type") == 3]
+        voice_transcribed = any(
+            isinstance((item.get("voice_item") or {}).get("text"), str)
+            and (item.get("voice_item") or {}).get("text", "").strip()
+            for item in voice_items)
+        if voice_items and not voice_transcribed:
+            try:
+                await self.send_text(client, creds, from_user,
+                                     VOICE_NO_TRANSCRIPTION_TEXT,
+                                     context_token=msg.get("context_token", ""))
+            except Exception as e:
+                log(f"voice no-transcription reply failed: {e}")
+            if not text.strip() and not media:
+                self.msgs_received += 1
+                self.write_status()
+                if not core_enabled:
+                    # Same invariant as WeCom A7: persist the frame even
+                    # when it is answered inline without a task.
+                    self.append_jsonl(INBOX, {
+                        "msgid": msgid,
+                        "ts": int(time.time()),
+                        "from_user_id": from_user,
+                        "group_id": msg.get("group_id", ""),
+                        "text": text,
+                        "media": media,
+                        "context_token": msg.get("context_token", ""),
+                        "raw": self._sanitize_raw(msg),
+                    })
+                    self._commit_inbound_seen(msgid)
+                return
         core = getattr(self, "_core_binding", None)
         if core is not None and core.enabled:
             # The authenticated route is saved before accepting a core task.
@@ -3090,11 +3174,31 @@ class Gateway:
                     "context_token": msg.get("context_token", ""),
                     "client_id": f"muse-{uuid.uuid4().hex}"}
                 self._save_context()
+            # Download BEFORE core.receive: the task's media must already
+            # be on local disk, with its full kind/path/mime/filename.
+            # A failed download is told to the user, never silently
+            # dropped; when nothing usable remains, no task is created.
+            full_media: list[dict] = []
+            if media:
+                await self._download_media(client, media, msgid)
+                failed = [m for m in media if not m.get("local_path")]
+                full_media = [_core_media_item(m) for m in media if m.get("local_path")]
+                if failed:
+                    try:
+                        await self.send_text(client, creds, from_user,
+                                             MEDIA_DOWNLOAD_FAILED_TEXT,
+                                             context_token=msg.get("context_token", ""))
+                    except Exception as e:
+                        log(f"media download-failure reply failed: {e}")
+                    if not full_media and not _has_substantive_text(text):
+                        self.msgs_received += 1
+                        self.write_status()
+                        return
             core.receive(message_id=msgid, sender_id=from_user,
                          chat_id=msg.get("group_id") or from_user,
                          chat_type="group" if msg.get("group_id") else "single",
                          text=text, context_token=msg.get("context_token", ""),
-                         media=[{"kind": item.get("kind")} for item in media])
+                         media=full_media)
             self.msgs_received += 1
             self.write_status()
             return
