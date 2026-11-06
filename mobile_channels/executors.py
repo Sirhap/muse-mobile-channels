@@ -192,7 +192,7 @@ class MuseExecutor:
             existing = self.store.connection.execute(
                 'SELECT * FROM executor_runs WHERE attempt_id=?', (context.claim.attempt_id,)
             ).fetchone()
-            if existing:
+            if existing and existing['status'] != 'failed_superseded':
                 return ExecutionOutcome('unknown', evidence='attempt_already_has_external_binding')
             self._validate_owner(context, submitting=True)
             sid = self._session(client, context)
@@ -206,7 +206,10 @@ class MuseExecutor:
                     return ExecutionOutcome('not_submitted', evidence='cancelled_before_stream')
                 self.store.connection.execute(
                     "INSERT INTO executor_runs (attempt_id, session_id, platform_run_id, status, created_at, track) "
-                    "VALUES (?,?,?,?,?,'native')",
+                    "VALUES (?,?,?,?,?,'native') "
+                    "ON CONFLICT(attempt_id) DO UPDATE SET session_id=excluded.session_id, "
+                    "platform_run_id=excluded.platform_run_id, status=excluded.status, "
+                    "created_at=excluded.created_at, track=excluded.track",
                     (context.claim.attempt_id, sid, None, 'submission_unknown', self.store.clock()),
                 )
             self._validate_owner(context, submitting=True)
@@ -464,7 +467,7 @@ class GadgetExecutor:
             existing = self.store.connection.execute(
                 'SELECT * FROM executor_runs WHERE attempt_id=?', (context.claim.attempt_id,)
             ).fetchone()
-            if existing:
+            if existing and existing['status'] != 'failed_superseded':
                 return ExecutionOutcome('unknown', evidence='attempt_already_has_external_binding')
 
             self._validate_owner(context, submitting=True)
@@ -476,7 +479,10 @@ class GadgetExecutor:
                     return ExecutionOutcome('not_submitted', evidence='cancelled_before_submission')
                 self.store.connection.execute(
                     "INSERT INTO executor_runs (attempt_id, session_id, platform_run_id, status, created_at, track) "
-                    "VALUES (?,?,?,?,?,'gadget')",
+                    "VALUES (?,?,?,?,?,'gadget') "
+                    "ON CONFLICT(attempt_id) DO UPDATE SET session_id=excluded.session_id, "
+                    "platform_run_id=excluded.platform_run_id, status=excluded.status, "
+                    "created_at=excluded.created_at, track=excluded.track",
                     (context.claim.attempt_id, session_id, None, 'submission_unknown', self.store.clock()),
                 )
 
@@ -521,20 +527,22 @@ class GadgetExecutor:
             return ExecutionOutcome('unknown', evidence='worker_exited_without_result')
 
         state = result.get('state')
+        mid = result.get('message_id')
+        message_id = mid if isinstance(mid, str) and mid else None
         if state == 'running':
-            return ExecutionOutcome('running')
+            return ExecutionOutcome('running', message_id=message_id)
         if state == 'succeeded':
             text = result.get('text')
             if not isinstance(text, str) or not text:
-                return ExecutionOutcome('unknown', evidence='worker_succeeded_without_text')
-            return ExecutionOutcome('succeeded', text=text)
+                return ExecutionOutcome('unknown', evidence='worker_succeeded_without_text', message_id=message_id)
+            return ExecutionOutcome('succeeded', text=text, message_id=message_id)
         if state == 'failed':
-            return ExecutionOutcome('failed', evidence=str(result.get('evidence') or 'platform_turn_failed'))
+            return ExecutionOutcome('failed', evidence=str(result.get('evidence') or 'platform_turn_failed'), message_id=message_id)
         if state == 'cancelled':
-            return ExecutionOutcome('cancelled', evidence=str(result.get('evidence') or 'platform_turn_cancelled'))
+            return ExecutionOutcome('cancelled', evidence=str(result.get('evidence') or 'platform_turn_cancelled'), message_id=message_id)
         if state == 'unknown':
-            return ExecutionOutcome('unknown', evidence=str(result.get('evidence') or 'worker_unknown'))
-        return ExecutionOutcome('unknown', evidence=f'unrecognized_result_state_{state}')
+            return ExecutionOutcome('unknown', evidence=str(result.get('evidence') or 'worker_unknown'), message_id=message_id)
+        return ExecutionOutcome('unknown', evidence=f'unrecognized_result_state_{state}', message_id=message_id)
 
     def cancel(self, context: ExecutionContext, run_id: str | None) -> ExecutionOutcome:
         """Kill the worker and report the turn cancelled."""
@@ -638,9 +646,23 @@ class DualTrackExecutor:
         track = self.current_track(context.claim.attempt_id)
         if track == 'gadget':
             try:
-                return self.primary.query(context, run_id)
+                outcome = self.primary.query(context, run_id)
             except Exception as exc:
                 return ExecutionOutcome('unknown', evidence=str(exc))
+            if outcome.state == 'failed' and not outcome.message_id:
+                # Primary died before its message reached the session (the
+                # worker result carries no message_id), so a native retry
+                # cannot double-deliver: supersede the gadget binding and
+                # fall back. A failed result WITH a message_id means the
+                # message was sent and a reply may exist -- never re-send.
+                self.circuit.record_failure()
+                with self.store.transaction():
+                    self.store.connection.execute(
+                        "UPDATE executor_runs SET status='failed_superseded' WHERE attempt_id=?",
+                        (context.claim.attempt_id,),
+                    )
+                return self.fallback.submit(context)
+            return outcome
         elif track == 'native':
             try:
                 return self.fallback.query(context, run_id)

@@ -674,6 +674,123 @@ class TestDualTrackExecutor(unittest.TestCase):
         self.assertEqual(c.evidence, "no_track_binding")
 
 
+    def test_query_time_fallback_when_gadget_fails_before_send(self):
+        """A Gadget turn that fails before its message reaches the session
+        falls back to Native instead of failing the task.
+
+        Proves the live WeCom trial failure (task 1: the worker died at
+        15s in the token refresh, result carries no message_id) would now
+        get a Native reply.
+        """
+        context = self._create_context("m_fallback_before_send")
+        fake = FakeWorkerClient(configured=True)
+        primary = GadgetExecutor(self.store, client=fake)
+        fallback = Mock(spec=MuseExecutor)
+        fallback.submit.return_value = ExecutionOutcome("accepted", run_id="native_run_1")
+        dual_executor = DualTrackExecutor(
+            store=self.store, primary=primary, fallback=fallback,
+        )
+        submitted = dual_executor.submit(context)
+        self.assertEqual(submitted.state, "accepted")
+        fake.results[context.claim.attempt_id] = {
+            "state": "failed",
+            "evidence": "The operation timed out.",
+            "session_id": "s1",
+        }
+        outcome = dual_executor.query(context, submitted.run_id)
+        self.assertEqual(outcome.state, "accepted")
+        self.assertEqual(outcome.run_id, "native_run_1")
+        fallback.submit.assert_called_once_with(context)
+        row = self.store.connection.execute(
+            "SELECT status, track FROM executor_runs WHERE attempt_id=?",
+            (context.claim.attempt_id,),
+        ).fetchone()
+        self.assertEqual(row["status"], "failed_superseded")
+
+    def test_no_fallback_when_gadget_failed_after_send(self):
+        """A Gadget turn that failed AFTER its message reached the session
+        must not fall back: the reply may exist and a Native retry would
+        double-deliver."""
+        context = self._create_context("m_no_fallback_after_send")
+        fake = FakeWorkerClient(configured=True)
+        primary = GadgetExecutor(self.store, client=fake)
+        fallback = Mock(spec=MuseExecutor)
+        dual_executor = DualTrackExecutor(
+            store=self.store, primary=primary, fallback=fallback,
+        )
+        submitted = dual_executor.submit(context)
+        self.assertEqual(submitted.state, "accepted")
+        fake.results[context.claim.attempt_id] = {
+            "state": "failed",
+            "evidence": "subscription_ended_before_reply_completed",
+            "message_id": "msg-123",
+            "session_id": "s1",
+        }
+        outcome = dual_executor.query(context, submitted.run_id)
+        self.assertEqual(outcome.state, "failed")
+        fallback.submit.assert_not_called()
+        row = self.store.connection.execute(
+            "SELECT status, track FROM executor_runs WHERE attempt_id=?",
+            (context.claim.attempt_id,),
+        ).fetchone()
+        self.assertEqual((row["status"], row["track"]), ("accepted", "gadget"))
+
+    def _scripted_bridge_client(self):
+        """Fake native bridge: session.start hands out one id, _open records
+        the sent message in history, chat.history returns the event list."""
+        state = {"events": [], "seq": 0}
+        client = Mock()
+
+        def call_json(method, body=None, **kwargs):
+            if method == "session.start":
+                return {"session_id": "native-session"}
+            return {"chat_events": [dict(e) for e in state["events"]]}
+
+        def _open(*args, **kwargs):
+            body = kwargs.get("body", {}) or {}
+            items = body.get("items") or []
+            state["seq"] += 1
+            state["events"].append({
+                "event_name": "message.user", "seq": state["seq"],
+                "payload": {"content": items[0].get("text", "") if items else ""},
+            })
+            return 7
+
+        client.call_json.side_effect = call_json
+        client._open.side_effect = _open
+        client.close.return_value = None
+        return client
+
+    def test_native_submit_rebinds_superseded_gadget_row(self):
+        """MuseExecutor.submit accepts a failed_superseded gadget row and
+        rebinds it to the Native track; a live gadget row still refuses a
+        second binding."""
+        context = self._create_context("m_rebind")
+        with self.store.transaction():
+            self.store.connection.execute(
+                "INSERT INTO executor_runs (attempt_id, session_id, platform_run_id, status, created_at, track) VALUES (?,?,?,?,?,?)",
+                (context.claim.attempt_id, "gadget-session", "worker:1001", "failed_superseded", self.now, "gadget"),
+            )
+        adapter = MuseExecutor(self.store, client_factory=lambda: self._scripted_bridge_client())
+        outcome = adapter.submit(context)
+        self.assertEqual(outcome.state, "accepted")
+        row = self.store.connection.execute(
+            "SELECT session_id, track, status FROM executor_runs WHERE attempt_id=?",
+            (context.claim.attempt_id,),
+        ).fetchone()
+        self.assertEqual((row["session_id"], row["track"], row["status"]),
+                         ("native-session", "native", "accepted"))
+
+        live = self._create_context("m_rebind_live")
+        with self.store.transaction():
+            self.store.connection.execute(
+                "INSERT INTO executor_runs (attempt_id, session_id, platform_run_id, status, created_at, track) VALUES (?,?,?,?,?,?)",
+                (live.claim.attempt_id, "gadget-session", "worker:1002", "accepted", self.now, "gadget"),
+            )
+        refused = adapter.submit(live)
+        self.assertEqual(refused.state, "unknown")
+        self.assertEqual(refused.evidence, "attempt_already_has_external_binding")
+
 class TestEdgeCasesAndHttpErrors(unittest.TestCase):
     """Boundary cases: client_factory, run-id binding, worker start failures."""
 

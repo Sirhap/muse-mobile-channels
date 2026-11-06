@@ -32,6 +32,12 @@ class ExecutionOutcome:
     run_id: str | None = None
     text: str | None = None
     evidence: str | None = None
+    # Platform message id when the attempt's message provably reached a
+    # session (set by GadgetExecutor from the worker result). DualTrack
+    # uses it to decide whether a failed primary may safely fall back:
+    # no message id means the send never completed, so a native retry
+    # cannot double-deliver.
+    message_id: str | None = None
 
 
 class Executor(Protocol):

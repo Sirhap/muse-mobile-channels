@@ -3,12 +3,11 @@
 
 覆盖范围：
 1. 目标 Host/IP、HTTP 方法及命令提取与匹配逻辑；
-2. Level 0（低危免密自动放行 Auto Allow-Once）：白名单基础设施/包管理器 GET/HEAD 请求；
-3. Level 2（高危手机强审 Require Mobile Approval）：内网私有 IP、公网裸 IP、提权与破坏性系统命令；
-4. Level 3（自动拦截 Auto Deny）：命中已配置黑名单的请求；
-5. Level 1（常规人工审批 Normal Approval）：未命中白名单的普通域名外部请求；
-6. 卡片与文本高危标识展示：🚨 [高危审批] 在微信文本与企微卡片上的渲染；
-7. 与 approval_relay 轮询流程的端到端集成模拟测试（含事务一致性与防双重决策保护）。
+2. 全量自动审批（2026-11-06 用户明示一律自动审批）：除黑名单外一律自动放行，
+   旧 Level 0/1/2 的输入现均期望 AUTO_ALLOW；检测函数本身仍单测；
+3. Level 3（自动拦截 Auto Deny）：命中已配置黑名单的请求；
+4. 卡片与文本高危标识展示：🚨 [高危审批] 在微信文本与企微卡片上的渲染；
+5. 与 approval_relay 轮询流程的端到端集成模拟测试（含事务一致性与防双重决策保护）。
 """
 import ipaddress
 import json
@@ -294,7 +293,6 @@ class TestLevel0AutoAllow(unittest.TestCase):
         self.assertEqual(dec.action, policy.PolicyAction.AUTO_ALLOW)
         self.assertEqual(dec.risk_level, policy.RiskLevel.LOW)
         self.assertFalse(dec.is_high_risk)
-        self.assertIn("pypi.org", dec.reason)
 
     def test_pythonhosted_head_auto_allow(self):
         """测试 files.pythonhosted.org 的 HEAD 请求自动放行。"""
@@ -329,8 +327,8 @@ class TestLevel0AutoAllow(unittest.TestCase):
         self.assertEqual(dec.action, policy.PolicyAction.AUTO_ALLOW)
         self.assertEqual(dec.risk_level, policy.RiskLevel.LOW)
 
-    def test_github_raw_and_gist_downgraded_to_require_approval(self):
-        """用例 1：raw.githubusercontent.com / gist.githubusercontent.com GET 请求不再 auto_allow，而是降级为 require_approval。"""
+    def test_github_raw_and_gist_auto_allowed_under_allow_all(self):
+        """用例 1：raw.githubusercontent.com / gist.githubusercontent.com GET 请求在全量自动审批下自动放行。"""
         untrusted_hosts = [
             "raw.githubusercontent.com",
             "gist.githubusercontent.com",
@@ -346,43 +344,46 @@ class TestLevel0AutoAllow(unittest.TestCase):
                     "registered_command": f"curl -O https://{host}/user/repo/main/file.txt",
                 }
                 dec = self.engine.evaluate(rec)
-                self.assertEqual(dec.action, policy.PolicyAction.REQUIRE_APPROVAL)
-                self.assertEqual(dec.risk_level, policy.RiskLevel.NORMAL)
+                self.assertEqual(dec.action, policy.PolicyAction.AUTO_ALLOW)
+                self.assertEqual(dec.risk_level, policy.RiskLevel.LOW)
                 self.assertFalse(dec.is_high_risk)
-                self.assertEqual(dec.rule_name, "normal_approval")
+                self.assertEqual(dec.rule_name, "auto_allow_all")
 
-    def test_whitelist_with_post_method_requires_approval(self):
-        """测试白名单域名但请求方法为 POST 时不免密放行，需人工审批。"""
+    def test_whitelist_with_post_method_auto_allowed_under_allow_all(self):
+        """测试白名单域名但请求方法为 POST 时在全量自动审批下自动放行。"""
         rec = {
             "method": "POST",
             "host": "pypi.org",
             "registered_command": "twine upload dist/*",
         }
         dec = self.engine.evaluate(rec)
-        self.assertEqual(dec.action, policy.PolicyAction.REQUIRE_APPROVAL)
-        self.assertNotEqual(dec.action, policy.PolicyAction.AUTO_ALLOW)
+        self.assertEqual(dec.action, policy.PolicyAction.AUTO_ALLOW)
 
-    def test_whitelist_with_git_push_requires_approval(self):
-        """测试发往白名单域名但命令包含代码推送 (git push) 时必须人工审批。"""
+    def test_whitelist_with_git_push_auto_allowed_under_allow_all(self):
+        """测试发往白名单域名但命令包含代码推送 (git push) 时在全量自动审批下自动放行。"""
         rec = {
             "method": "GET",
             "host": "github.com",
             "registered_command": "git push origin main",
         }
         dec = self.engine.evaluate(rec)
-        self.assertEqual(dec.action, policy.PolicyAction.REQUIRE_APPROVAL)
-        self.assertEqual(dec.rule_name, "write_intent")
+        self.assertEqual(dec.action, policy.PolicyAction.AUTO_ALLOW)
+        self.assertEqual(dec.rule_name, "auto_allow_all")
         self.assertFalse(dec.is_high_risk)
 
 
-class TestLevel2HighRiskApproval(unittest.TestCase):
-    """测试 Level 2 高危强审 (Require Mobile Approval 🚨)。"""
+class TestAutoAllowAll(unittest.TestCase):
+    """全量自动审批 (2026-11-06 用户明示一律自动审批)。
+
+    下面这些输入按旧分级曾是 Level 1/2（需人工审批/高危强审），现一律自动
+    放行；底层检测函数（危险命令、私网 IP 判定）仍在
+    TestPolicyExtractionAndMatching 中单测，黑名单拦截仍在 TestLevel3AutoDeny。"""
 
     def setUp(self):
         self.engine = policy.SecurityPolicyEngine()
 
-    def test_private_ip_networks_flagged_high_risk(self):
-        """测试局域网/内网私有网段 IP 外联被识别为高危强审。"""
+    def test_private_ip_networks_auto_allowed_under_allow_all(self):
+        """测试局域网/内网私有网段 IP 外联在全量自动审批下自动放行。"""
         private_ips = [
             "10.0.0.1",
             "10.254.1.1",
@@ -401,25 +402,25 @@ class TestLevel2HighRiskApproval(unittest.TestCase):
             with self.subTest(ip=ip_addr):
                 rec = {"method": "GET", "host": ip_addr}
                 dec = self.engine.evaluate(rec)
-                self.assertEqual(dec.action, policy.PolicyAction.REQUIRE_APPROVAL)
-                self.assertEqual(dec.risk_level, policy.RiskLevel.HIGH)
-                self.assertTrue(dec.is_high_risk)
-                self.assertEqual(dec.rule_name, "private_ip")
+                self.assertEqual(dec.action, policy.PolicyAction.AUTO_ALLOW)
+                self.assertEqual(dec.risk_level, policy.RiskLevel.LOW)
+                self.assertFalse(dec.is_high_risk)
+                self.assertEqual(dec.rule_name, "auto_allow_all")
 
-    def test_bare_public_ip_flagged_high_risk(self):
-        """测试外网裸 IP 直连被识别为高危强审。"""
+    def test_bare_public_ip_auto_allowed_under_allow_all(self):
+        """测试外网裸 IP 直连在全量自动审批下自动放行。"""
         public_ips = ["8.8.8.8", "1.1.1.1", "114.114.114.114", "104.244.42.1"]
         for ip_addr in public_ips:
             with self.subTest(ip=ip_addr):
                 rec = {"method": "GET", "host": ip_addr}
                 dec = self.engine.evaluate(rec)
-                self.assertEqual(dec.action, policy.PolicyAction.REQUIRE_APPROVAL)
-                self.assertEqual(dec.risk_level, policy.RiskLevel.HIGH)
-                self.assertTrue(dec.is_high_risk)
-                self.assertEqual(dec.rule_name, "bare_ip")
+                self.assertEqual(dec.action, policy.PolicyAction.AUTO_ALLOW)
+                self.assertEqual(dec.risk_level, policy.RiskLevel.LOW)
+                self.assertFalse(dec.is_high_risk)
+                self.assertEqual(dec.rule_name, "auto_allow_all")
 
-    def test_dangerous_commands_flagged_high_risk(self):
-        """测试包含提权或高危系统操作的命令被判定为高危强审。"""
+    def test_dangerous_commands_auto_allowed_under_allow_all(self):
+        """测试包含提权或高危系统操作的命令在全量自动审批下自动放行。"""
         dangerous_cmds = [
             ("sudo pip install torch", "pypi.org"),
             ("chmod 777 /tmp/eval.sh", "github.com"),
@@ -435,13 +436,13 @@ class TestLevel2HighRiskApproval(unittest.TestCase):
             with self.subTest(cmd=cmd, host=host):
                 rec = {"method": "GET", "host": host, "registered_command": cmd}
                 dec = self.engine.evaluate(rec)
-                self.assertEqual(dec.action, policy.PolicyAction.REQUIRE_APPROVAL)
-                self.assertEqual(dec.risk_level, policy.RiskLevel.HIGH)
-                self.assertTrue(dec.is_high_risk)
-                self.assertEqual(dec.rule_name, "dangerous_command")
+                self.assertEqual(dec.action, policy.PolicyAction.AUTO_ALLOW)
+                self.assertEqual(dec.risk_level, policy.RiskLevel.LOW)
+                self.assertFalse(dec.is_high_risk)
+                self.assertEqual(dec.rule_name, "auto_allow_all")
 
-    def test_wrapped_commands_shell_and_env_identified_high_risk(self):
-        """用例 2：bash -c '...' 与 env -i 等包装器执行提权/高危命令，准确判定为 Level 2 高危并标 🚨。"""
+    def test_wrapped_commands_shell_and_env_auto_allowed_under_allow_all(self):
+        """用例 2：bash -c '...' 与 env -i 等包装器执行提权/高危命令，在全量自动审批下自动放行。"""
         wrapped_cmds = [
             'bash -c "chmod 777 /etc/passwd"',
             'bash -c "FOO=\\"bar\\" chmod 777 /etc"',
@@ -469,17 +470,13 @@ class TestLevel2HighRiskApproval(unittest.TestCase):
                     "registered_command": cmd,
                 }
                 dec = self.engine.evaluate(rec)
-                self.assertEqual(dec.action, policy.PolicyAction.REQUIRE_APPROVAL)
-                self.assertEqual(dec.risk_level, policy.RiskLevel.HIGH)
-                self.assertTrue(dec.is_high_risk)
-                self.assertEqual(dec.rule_name, "dangerous_command")
-                self.assertTrue(
-                    "高危系统或提权操作" in dec.reason or "命中危险命令特征" in dec.reason,
-                    f"原因不符合预期: {dec.reason}",
-                )
+                self.assertEqual(dec.action, policy.PolicyAction.AUTO_ALLOW)
+                self.assertEqual(dec.risk_level, policy.RiskLevel.LOW)
+                self.assertFalse(dec.is_high_risk)
+                self.assertEqual(dec.rule_name, "auto_allow_all")
 
-    def test_url_credentials_confusion_and_wildcard_dns_flagged_high_risk(self):
-        """用例 3：raw.githubusercontent.com:evil@169.254.169.254 准确识别为高危私网 IP，泛解析 DNS 同样识别为高危。"""
+    def test_url_credentials_confusion_and_wildcard_dns_auto_allowed_under_allow_all(self):
+        """用例 3：raw.githubusercontent.com:evil@169.254.169.254 在全量自动审批下自动放行。"""
         # 1. 凭据混淆绕过尝试 (目标应为 169.254.169.254，识别为链路本地保留 IP)
         confusion_hosts = [
             "raw.githubusercontent.com:evil@169.254.169.254",
@@ -494,11 +491,10 @@ class TestLevel2HighRiskApproval(unittest.TestCase):
                     "registered_command": f"curl http://{ch}/latest/meta-data/",
                 }
                 dec = self.engine.evaluate(rec_confusion)
-                self.assertEqual(dec.action, policy.PolicyAction.REQUIRE_APPROVAL)
-                self.assertEqual(dec.risk_level, policy.RiskLevel.HIGH)
-                self.assertTrue(dec.is_high_risk)
-                self.assertEqual(dec.rule_name, "private_ip")
-                self.assertIn("169.254.169.254", dec.reason)
+                self.assertEqual(dec.action, policy.PolicyAction.AUTO_ALLOW)
+                self.assertEqual(dec.risk_level, policy.RiskLevel.LOW)
+                self.assertFalse(dec.is_high_risk)
+                self.assertEqual(dec.rule_name, "auto_allow_all")
 
         # 2. 泛解析 DNS 域名指向私网/回环 (支持点分、短横线、十六进制及 IPv6)
         wildcard_hosts = [
@@ -516,13 +512,13 @@ class TestLevel2HighRiskApproval(unittest.TestCase):
             with self.subTest(host=wh):
                 rec_wc = {"method": "GET", "host": wh}
                 dec_wc = self.engine.evaluate(rec_wc)
-                self.assertEqual(dec_wc.action, policy.PolicyAction.REQUIRE_APPROVAL)
-                self.assertEqual(dec_wc.risk_level, policy.RiskLevel.HIGH)
-                self.assertTrue(dec_wc.is_high_risk)
-                self.assertEqual(dec_wc.rule_name, "private_ip")
+                self.assertEqual(dec_wc.action, policy.PolicyAction.AUTO_ALLOW)
+                self.assertEqual(dec_wc.risk_level, policy.RiskLevel.LOW)
+                self.assertFalse(dec_wc.is_high_risk)
+                self.assertEqual(dec_wc.rule_name, "auto_allow_all")
 
-    def test_localhost_and_internal_domains(self):
-        """测试 localhost 及内部网络保留域名被精准判定为高危强审。"""
+    def test_localhost_and_internal_domains_auto_allowed_under_allow_all(self):
+        """测试 localhost 及内部网络保留域名在全量自动审批下自动放行。"""
         internal_hosts = [
             "localhost",
             "ip6-localhost",
@@ -540,13 +536,13 @@ class TestLevel2HighRiskApproval(unittest.TestCase):
             with self.subTest(host=h):
                 rec = {"method": "GET", "host": h}
                 dec = self.engine.evaluate(rec)
-                self.assertEqual(dec.action, policy.PolicyAction.REQUIRE_APPROVAL)
-                self.assertEqual(dec.risk_level, policy.RiskLevel.HIGH)
-                self.assertTrue(dec.is_high_risk)
-                self.assertEqual(dec.rule_name, "private_ip")
+                self.assertEqual(dec.action, policy.PolicyAction.AUTO_ALLOW)
+                self.assertEqual(dec.risk_level, policy.RiskLevel.LOW)
+                self.assertFalse(dec.is_high_risk)
+                self.assertEqual(dec.rule_name, "auto_allow_all")
 
-    def test_nonstandard_ip_representation_flagged_high_risk(self):
-        """测试使用整数、八进制或十六进制等变形 IP 访问回环被判定为高危强审。"""
+    def test_nonstandard_ip_representation_auto_allowed_under_allow_all(self):
+        """测试使用整数、八进制或十六进制等变形 IP 访问回环在全量自动审批下自动放行。"""
         nonstandard_ips = [
             "2130706433",   # 127.0.0.1 整数表示
             "0177.0.0.1",   # 127.0.0.1 八进制表示
@@ -556,13 +552,13 @@ class TestLevel2HighRiskApproval(unittest.TestCase):
             with self.subTest(ip=ip_repr):
                 rec = {"method": "GET", "host": ip_repr}
                 dec = self.engine.evaluate(rec)
-                self.assertEqual(dec.action, policy.PolicyAction.REQUIRE_APPROVAL)
-                self.assertEqual(dec.risk_level, policy.RiskLevel.HIGH)
-                self.assertTrue(dec.is_high_risk)
-                self.assertEqual(dec.rule_name, "private_ip")
+                self.assertEqual(dec.action, policy.PolicyAction.AUTO_ALLOW)
+                self.assertEqual(dec.risk_level, policy.RiskLevel.LOW)
+                self.assertFalse(dec.is_high_risk)
+                self.assertEqual(dec.rule_name, "auto_allow_all")
 
-    def test_ipv4_mapped_private_ip_flagged_high_risk(self):
-        """测试 IPv4 映射的 IPv6 私网与 CGNAT 地址被正确识别为高危强审。"""
+    def test_ipv4_mapped_private_ip_auto_allowed_under_allow_all(self):
+        """测试 IPv4 映射的 IPv6 私网与 CGNAT 地址在全量自动审批下自动放行。"""
         mapped_ips = [
             "::ffff:100.64.0.1",
             "::ffff:127.0.0.1",
@@ -573,24 +569,24 @@ class TestLevel2HighRiskApproval(unittest.TestCase):
             with self.subTest(ip=m_ip):
                 rec = {"method": "GET", "host": m_ip}
                 dec = self.engine.evaluate(rec)
-                self.assertEqual(dec.action, policy.PolicyAction.REQUIRE_APPROVAL)
-                self.assertEqual(dec.risk_level, policy.RiskLevel.HIGH)
-                self.assertTrue(dec.is_high_risk)
-                self.assertEqual(dec.rule_name, "private_ip")
+                self.assertEqual(dec.action, policy.PolicyAction.AUTO_ALLOW)
+                self.assertEqual(dec.risk_level, policy.RiskLevel.LOW)
+                self.assertFalse(dec.is_high_risk)
+                self.assertEqual(dec.rule_name, "auto_allow_all")
 
-    def test_ipv6_loopback_and_unspecified(self):
-        """测试 IPv6 未指定地址及回环地址均被识别为高危私网。"""
+    def test_ipv6_loopback_and_unspecified_auto_allowed_under_allow_all(self):
+        """测试 IPv6 未指定地址及回环地址在全量自动审批下自动放行。"""
         for ip_addr in ("::1", "::"):
             with self.subTest(ip=ip_addr):
                 rec = {"method": "GET", "host": ip_addr}
                 dec = self.engine.evaluate(rec)
-                self.assertEqual(dec.action, policy.PolicyAction.REQUIRE_APPROVAL)
-                self.assertEqual(dec.risk_level, policy.RiskLevel.HIGH)
-                self.assertTrue(dec.is_high_risk)
-                self.assertEqual(dec.rule_name, "private_ip")
+                self.assertEqual(dec.action, policy.PolicyAction.AUTO_ALLOW)
+                self.assertEqual(dec.risk_level, policy.RiskLevel.LOW)
+                self.assertFalse(dec.is_high_risk)
+                self.assertEqual(dec.rule_name, "auto_allow_all")
 
-    def test_what_ipv6_evaluated_high_risk(self):
-        """测试仅从 what 文本中解析出的 IPv6 目标亦被正确判定为高危强审。"""
+    def test_what_ipv6_auto_allowed_under_allow_all(self):
+        """测试仅从 what 文本中解析出的 IPv6 目标在全量自动审批下自动放行。"""
         what_cases = [
             "目标：tcp CONNECT [::1]:443\n命令：curl https://[::1]:443",
             "目标：tcp [::1]\n命令：curl http://[::1]",
@@ -599,10 +595,10 @@ class TestLevel2HighRiskApproval(unittest.TestCase):
         for what_text in what_cases:
             with self.subTest(what=what_text):
                 dec = self.engine.evaluate({}, what=what_text)
-                self.assertEqual(dec.action, policy.PolicyAction.REQUIRE_APPROVAL)
-                self.assertEqual(dec.risk_level, policy.RiskLevel.HIGH)
-                self.assertTrue(dec.is_high_risk)
-                self.assertEqual(dec.rule_name, "private_ip")
+                self.assertEqual(dec.action, policy.PolicyAction.AUTO_ALLOW)
+                self.assertEqual(dec.risk_level, policy.RiskLevel.LOW)
+                self.assertFalse(dec.is_high_risk)
+                self.assertEqual(dec.rule_name, "auto_allow_all")
 
 
 class TestLevel3AutoDeny(unittest.TestCase):
@@ -640,22 +636,22 @@ class TestLevel3AutoDeny(unittest.TestCase):
         self.assertEqual(dec.rule_name, "blacklist_command")
 
 
-class TestLevel1NormalApproval(unittest.TestCase):
-    """测试 Level 1 常规人工审批 (Normal Approval)。"""
+class TestAutoAllowAllNormal(unittest.TestCase):
+    """全量自动审批：常规外部请求亦自动放行（旧 Level 1）。"""
 
     def setUp(self):
         self.engine = policy.SecurityPolicyEngine()
 
-    def test_unknown_domain_requires_normal_approval(self):
-        """测试未在白名单但非高危的常规外部域名请求需普通人工审批。"""
+    def test_unknown_domain_auto_allowed_under_allow_all(self):
+        """测试未在白名单但非高危的常规外部域名请求在全量自动审批下自动放行。"""
         rec = {
             "method": "GET",
             "host": "api.openai.com",
             "registered_command": "curl https://api.openai.com/v1/models",
         }
         dec = self.engine.evaluate(rec)
-        self.assertEqual(dec.action, policy.PolicyAction.REQUIRE_APPROVAL)
-        self.assertEqual(dec.risk_level, policy.RiskLevel.NORMAL)
+        self.assertEqual(dec.action, policy.PolicyAction.AUTO_ALLOW)
+        self.assertEqual(dec.risk_level, policy.RiskLevel.LOW)
         self.assertFalse(dec.is_high_risk)
 
 
@@ -763,14 +759,14 @@ class TestRelayPolicyIntegration(unittest.TestCase):
         item = self.state["items"]["1"]
         self.assertEqual(item["status"], "auto_approved")
         self.assertTrue(item["notified"])
-        self.assertIn("pypi.org", item.get("decision_reason", ""))
+        self.assertEqual(item.get("policy_rule"), "auto_allow_all")
 
         # 3. 验证静默处理，未向微信或企信箱写入待审批通知
         self.assertEqual(self.shadow_rows("weixin"), [])
         self.assertEqual(self.shadow_rows("wecom"), [])
 
-    def test_high_risk_request_notifies_with_alert_badge(self):
-        """集成测试：包含 sudo 提权命令的高危审批正常推送手机并带有 🚨 标识。"""
+    def test_high_risk_request_auto_approved_silently_under_allow_all(self):
+        """集成测试：全量自动审批下，含 sudo 提权命令的高危审批亦自动放行且不推送通知。"""
         pending_record = {
             "approval_id": "aid-sudo",
             "display_name": "Shell command",
@@ -786,24 +782,18 @@ class TestRelayPolicyIntegration(unittest.TestCase):
 
         relay.poll_once(gw, self.state)
 
-        # 1. 绝不能自动核销
-        self.assertEqual(len(gw.decide_calls), 0)
+        # 1. 自动核销为 allow_once
+        self.assertEqual(len(gw.decide_calls), 1)
+        self.assertEqual(gw.decide_calls[0], ("aid-sudo", "allow_once"))
 
-        # 2. 状态保持 pending，标记为高危
+        # 2. 状态记录为 auto_approved
         item = self.state["items"]["1"]
-        self.assertEqual(item["status"], "pending")
-        self.assertTrue(item["is_high_risk"])
+        self.assertEqual(item["status"], "auto_approved")
+        self.assertTrue(item["notified"])
 
-        # 3. 微信端接收到带高危标识的通知文本
-        wx_rows = self.shadow_rows("weixin")
-        self.assertEqual(len(wx_rows), 1)
-        self.assertIn("🚨 [高危审批]", wx_rows[0]["content"])
-
-        # 4. 企微端接收到带高危标识的交互卡片
-        wc_rows = self.shadow_rows("wecom")
-        self.assertEqual(len(wc_rows), 1)
-        self.assertEqual(wc_rows[0]["mode"], "send_card")
-        self.assertIn("🚨 [高危审批]", wc_rows[0]["card"]["main_title"]["title"])
+        # 3. 静默处理，未向微信或企信箱写入待审批通知
+        self.assertEqual(self.shadow_rows("weixin"), [])
+        self.assertEqual(self.shadow_rows("wecom"), [])
 
     def test_auto_deny_silently_intercepts_blacklisted_target(self):
         """集成测试：命中黑名单的目标请求被自动拒绝拦截，记录状态且不打扰用户。"""
@@ -937,14 +927,14 @@ class TestRelayPolicyIntegration(unittest.TestCase):
         self.assertEqual(len(gw.decide_calls), 0)
         self.assertEqual(clean_state["items"][item_id]["status"], "auto_approved")
 
-    def test_high_risk_does_not_group_under_normal_pending(self):
-        """集成测试：高危审批绝不折叠隐藏在普通审批项之下，必须独立推送 🚨 告警。"""
+    def test_high_risk_and_normal_both_auto_approved_no_grouping(self):
+        """集成测试：全量自动审批下，高危与普通审批均自动放行，无待审批项可折叠。"""
         rec1 = {
             "approval_id": "aid-normal",
             "display_name": "Shell command",
             "registered_command": "git clone https://github.com/a/b.git",
             "scheme": "https",
-            "method": "POST",  # POST 请求需人工审批
+            "method": "POST",
             "host": "github.com",
             "port": 443,
             "path": "github.com:443",
@@ -955,7 +945,7 @@ class TestRelayPolicyIntegration(unittest.TestCase):
         rec2 = {
             "approval_id": "aid-high",
             "display_name": "Shell command",
-            "registered_command": "sudo git clone https://github.com/a/b.git",  # 提权高危
+            "registered_command": "sudo git clone https://github.com/a/b.git",
             "scheme": "https",
             "method": "POST",
             "host": "github.com",
@@ -969,19 +959,12 @@ class TestRelayPolicyIntegration(unittest.TestCase):
 
         relay.poll_once(gw, self.state)
 
-        item1 = self.state["items"]["1"]
-        item2 = self.state["items"]["2"]
-
-        self.assertFalse(item1["is_high_risk"])
-        self.assertTrue(item2["is_high_risk"])
-        # 高危项绝不与普通项合并
-        self.assertIsNone(item2.get("grouped_with"))
-
-        # 两条通知均独立投递
-        wx_rows = self.shadow_rows("weixin")
-        self.assertEqual(len(wx_rows), 2)
-        self.assertNotIn("🚨 [高危审批]", wx_rows[0]["content"])
-        self.assertIn("🚨 [高危审批]", wx_rows[1]["content"])
+        # 两项均自动核销为 allow_once，无待审批、无通知、无折叠
+        self.assertEqual(len(gw.decide_calls), 2)
+        self.assertEqual(self.state["items"]["1"]["status"], "auto_approved")
+        self.assertEqual(self.state["items"]["2"]["status"], "auto_approved")
+        self.assertEqual(self.shadow_rows("weixin"), [])
+        self.assertEqual(self.shadow_rows("wecom"), [])
 
 
 if __name__ == "__main__":

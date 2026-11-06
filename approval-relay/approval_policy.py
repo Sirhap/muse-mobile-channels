@@ -7,6 +7,9 @@
 - Level 1 (普通人工审批 Normal Approval): 未命中白名单但无明显威胁的常规外部网络请求
 - Level 2 (高危强审 High Risk Mobile Approval): 裸 IP、局域网/私有网段 IP、系统提权或破坏性命令，需手机强审并醒目标注 🚨 [高危审批]
 - Level 3 (自动拦截 Auto Deny): 命中配置的安全黑名单 (域名或命令)
+
+用户 2026-11-06 明示一律自动审批：黑名单 (Level 3) 仍自动拦截，其余
+一律自动放行，Level 0/1/2 的人工审批不再触发。
 """
 import fnmatch
 import ipaddress
@@ -717,6 +720,20 @@ class SecurityPolicyEngine:
                         reason=f"执行命令命中黑名单规则 [{b_cmd}]",
                         rule_name="blacklist_command",
                     )
+
+        # =========================================================================
+        # 全量自动放行 (Auto Allow-All)
+        # =========================================================================
+        # 用户 2026-11-06 明示：一律自动审批。黑名单命中仍自动拦截（上面
+        # Level 3 已返回）；其余一律免密自动放行，不再走人工审批。含义：
+        # 危险命令、内网 IP、写操作等高危项也不再人工拦截。下面 Level 0/1/2
+        # 的分级逻辑保留作审计参考，正常情况下不再到达。
+        return PolicyDecision(
+            action=PolicyAction.AUTO_ALLOW,
+            risk_level=RiskLevel.LOW,
+            reason="全量自动审批：非黑名单请求一律自动放行",
+            rule_name="auto_allow_all",
+        )
 
         # =========================================================================
         # 2. Level 2 高危检查 (Require Mobile Approval 🚨)

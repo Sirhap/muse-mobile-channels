@@ -9,12 +9,32 @@ import json
 import os
 import sys
 import tempfile
+import types
 import time
 import unittest
 
 os.environ["APPROVAL_RELAY_TEST"] = "1"
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import approval_relay as relay  # noqa: E402
+
+def require_approval_engine():
+    """Stub policy engine returning REQUIRE_APPROVAL for every item.
+
+    The default engine auto-approves everything since the 2026-11-06
+    all-allow policy, so notification/grouping tests inject this stub to
+    exercise the notify path (the old behaviour for these records).
+    """
+    class _RequireApproval:
+        def evaluate(self, record, what=""):
+            return types.SimpleNamespace(
+                action=relay.PolicyAction.REQUIRE_APPROVAL,
+                risk_level=relay.RiskLevel.NORMAL,
+                is_high_risk=False,
+                rule_name="normal_approval",
+                reason="test stub: manual approval required",
+            )
+    return _RequireApproval()
+
 
 
 def rec(aid, method="CONNECT", scheme="tcp", host="github.com",
@@ -110,7 +130,7 @@ class SparseGroupingTests(CardGroupTestCase):
                    "request_expires_at_ms": 9999999999999}]
         details = {"aid-a": rec("aid-a", method="CONNECT", scheme="tcp"),
                    "aid-b": rec("aid-b", method="GET", scheme="https")}
-        relay.poll_once(SparseDetailGateway(sparse, details), self.state)
+        relay.poll_once(SparseDetailGateway(sparse, details), self.state, policy_engine=require_approval_engine())
         self.assertNotEqual(self.state["items"]["1"].get("group_key"), "")
         self.assertEqual(self.state["items"]["1"].get("group_key"),
                          self.state["items"]["2"].get("group_key"))
@@ -120,7 +140,7 @@ class SparseGroupingTests(CardGroupTestCase):
 
 class CardFormTests(CardGroupTestCase):
     def test_wecom_gets_card_weixin_gets_text(self):
-        relay.poll_once(StubGateway([rec("aid-1")]), self.state)
+        relay.poll_once(StubGateway([rec("aid-1")]), self.state, policy_engine=require_approval_engine())
         cards = self.cards()
         self.assertEqual(len(cards), 1)
         card = cards[0]["card"]
@@ -149,7 +169,7 @@ class GroupingTests(CardGroupTestCase):
     def test_unbound_similar_requests_remain_independent(self):
         gw = StubGateway([rec("aid-a", method="CONNECT", scheme="tcp"),
                           rec("aid-b", method="GET", scheme="https")])
-        relay.poll_once(gw, self.state)
+        relay.poll_once(gw, self.state, policy_engine=require_approval_engine())
         self.assertEqual(len(self.cards()), 2)
         self.assertEqual(len(self.rows("weixin")), 2)
         item2 = self.state["items"]["2"]
@@ -159,14 +179,14 @@ class GroupingTests(CardGroupTestCase):
     def test_different_target_not_grouped(self):
         gw = StubGateway([rec("aid-a"),
                           rec("aid-c", host="example.com")])
-        relay.poll_once(gw, self.state)
+        relay.poll_once(gw, self.state, policy_engine=require_approval_engine())
         self.assertEqual(len(self.cards()), 2)
         self.assertNotIn("grouped_with", self.state["items"]["2"])
 
     def test_decision_does_not_authorize_other_approval_ids(self):
         gw = StubGateway([rec("aid-a", method="CONNECT", scheme="tcp"),
                           rec("aid-b", method="GET", scheme="https")])
-        relay.poll_once(gw, self.state)
+        relay.poll_once(gw, self.state, policy_engine=require_approval_engine())
         with open(relay.DECISIONS_F, "w", encoding="utf-8") as fh:
             fh.write(json.dumps({"num": "1", "decision": "allow_once",
                                  "channel": "wecom-card", "chat_id": "room", "operator_id": "alice"}) + "\n")
@@ -184,13 +204,13 @@ class GroupingTests(CardGroupTestCase):
     def test_grouped_item_promoted_when_primary_leaves(self):
         gw = StubGateway([rec("aid-a", method="CONNECT", scheme="tcp"),
                           rec("aid-b", method="GET", scheme="https")])
-        relay.poll_once(gw, self.state)
+        relay.poll_once(gw, self.state, policy_engine=require_approval_engine())
         self.assertEqual(len(self.cards()), 2)
         # Primary decided elsewhere (e.g. in the Muse app) before
         # the relay consumed any channel decision for the group.
         self.state["items"]["1"]["status"] = "gone"
         relay.poll_once(StubGateway([rec("aid-b", method="GET",
-                                         scheme="https")]), self.state)
+                                         scheme="https")]), self.state, policy_engine=require_approval_engine())
         self.assertEqual(len(self.cards()), 2)
         item2 = self.state["items"]["2"]
         self.assertNotIn("grouped_with", item2)
@@ -206,7 +226,7 @@ class IdempotencyTests(CardGroupTestCase):
 
     def test_duplicate_decision_is_silent(self):
         gw = StubGateway([rec("aid-a")])
-        relay.poll_once(gw, self.state)
+        relay.poll_once(gw, self.state, policy_engine=require_approval_engine())
         self._decide(gw, "1", "allow_always")
         self._decide(gw, "1", "allow_always")
         self.assertEqual(gw.decide_calls, [("aid-a", "allow_always")])
@@ -228,18 +248,18 @@ class IdempotencyTests(CardGroupTestCase):
             "first_seen": 1791540000, "notified": True, "group_key": ""}
         self.state["next_num"] = 2
         gw = StubGateway([rec("aid-b", method="GET", scheme="https")])
-        relay.poll_once(gw, self.state)
+        relay.poll_once(gw, self.state, policy_engine=require_approval_engine())
         self.assertNotIn("grouped_with", self.state["items"]["2"])
         self.assertEqual(len(self.cards()), 1)
         self.assertEqual(len(self.rows("weixin")), 1)
 
     def test_sequential_always_requires_explicit_new_decision(self):
         gw = StubGateway([rec("aid-a", method="CONNECT", scheme="tcp")])
-        relay.poll_once(gw, self.state)
+        relay.poll_once(gw, self.state, policy_engine=require_approval_engine())
         self.assertEqual(len(self.cards()), 1)
         self._decide(gw, "1", "allow_always")
         gw2 = StubGateway([rec("aid-b", method="GET", scheme="https")])
-        relay.poll_once(gw2, self.state)
+        relay.poll_once(gw2, self.state, policy_engine=require_approval_engine())
         item2 = self.state["items"]["2"]
         self.assertEqual(item2["status"], "pending")
         self.assertNotIn("auto_decided_from", item2)
@@ -249,12 +269,12 @@ class IdempotencyTests(CardGroupTestCase):
 
     def test_sequential_always_outside_window_notifies(self):
         gw = StubGateway([rec("aid-a", method="CONNECT", scheme="tcp")])
-        relay.poll_once(gw, self.state)
+        relay.poll_once(gw, self.state, policy_engine=require_approval_engine())
         self._decide(gw, "1", "allow_always")
         self.state["items"]["1"]["decided_at"] -= (
             relay.RECENT_ALWAYS_WINDOW_SECS + 3600)
         gw2 = StubGateway([rec("aid-b", method="GET", scheme="https")])
-        relay.poll_once(gw2, self.state)
+        relay.poll_once(gw2, self.state, policy_engine=require_approval_engine())
         self.assertEqual(self.state["items"]["2"]["status"], "pending")
         self.assertEqual(gw2.decide_calls, [])
         self.assertEqual(len(self.cards()), 2)
