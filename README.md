@@ -46,6 +46,10 @@ iLink, WeCom via the official smart-robot long connection.
 
 ## 快速开始
 
+前置要求：Linux + systemd 的机器、Python 3.12+、一个能正常登录的
+Muse 账号；接个人微信需要一个能当 iLink 机器人的微信号，接企业微信
+需要在企微管理后台有建智能机器人的权限。
+
 1. 把本仓库克隆到家目录的 `workspace` 下（仓库根目录即 workspace 本层）。
 2. 按要接的渠道装依赖，只装选中的一边即可：
 
@@ -54,12 +58,45 @@ iLink, WeCom via the official smart-robot long connection.
    cd ../wecom-bot && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
    ```
 
-3. 拿凭证：个人微信运行 `weixin-bot/login.py` 出二维码、用要当机器人
-   的微信扫码登录；企业微信在管理后台创建智能机器人（API 长连接
-   模式），把 Bot ID 和 Secret 填进 `~/.config/wecom-bot/credentials.env`。
-4. 安装并启用各目录自带的 systemd 单元（两个网关、原生桥、
-   `channel-restore` 定时器）。
-5. 验证：在微信 / 企微里发 `/ping` 应回 `pong`，再发一条普通消息能
+3. 拿渠道凭证：
+   - 个人微信：运行 `weixin-bot/.venv/bin/python weixin-bot/login.py`，
+     出二维码后用要当机器人的微信扫码登录；登录成功后 `login.py` 会
+     自动把凭证写进 `~/.config/weixin-bot/credentials.env`
+     （`ILINK_BOT_TOKEN`／`ILINK_BOT_ID`／`ILINK_USER_ID`，文件权限
+     0600），不用手工填。
+   - 企业微信：在管理后台创建智能机器人（API 长连接模式），把 Bot ID
+     和 Secret 填进 `~/.config/wecom-bot/credentials.env`，格式如下
+     （文件权限 0600；`WECOM_ALLOW_USERS` 是允许用机器人的企微用户
+     ID，逗号分隔，留空则谁都用不了）：
+
+     ```sh
+     WECOM_BOT_ID=你的机器人ID
+     WECOM_BOT_SECRET=你的机器人Secret
+     WECOM_ALLOW_USERS=你的企微用户ID
+     ```
+
+4. 拿 Muse 桥凭证：按 [凭证恢复说明](native-bridge/get-muse-token.md)
+   用浏览器扩展导出 `muse-credentials.zip`（内含 `cookies.txt`、
+   `vm_id.txt`、`token.json`），装到 `~/.config/native-bridge/`
+   （目录 0700、文件 0600）。没有这一步，网关能连上但桥发不出去消息。
+5. 安装 systemd 单元。**先把各 `.service` 文件里的 `/home/hatch`
+   全换成你自己的家目录**（`WorkingDirectory`、`ExecStart`、
+   `Environment=HOME`／`MUSE_HOME`、`Environment=*_CRED_FILE` 这几处
+   都是写死的），再拷到系统目录并启用：
+
+   ```sh
+   # 把 /home/hatch 换成你的 $HOME，例如：
+   # sed -i "s|/home/hatch|$HOME|g" weixin-bot/weixin-bot.service wecom-bot/wecom-bot.service native-bridge/native-bridge.service approval-relay/approval-relay.service channel-restore/channel-restore.service channel-restore/channel-restore.timer
+   sudo cp weixin-bot/weixin-bot.service wecom-bot/wecom-bot.service native-bridge/native-bridge.service approval-relay/approval-relay.service /etc/systemd/system/
+   sudo cp channel-restore/channel-restore.service channel-restore/channel-restore.timer /etc/systemd/system/
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now weixin-bot.service wecom-bot.service native-bridge.service approval-relay.service channel-restore.timer
+   ```
+
+   只装选中的一边时，只拷、只启用那一边的网关单元即可；原生桥、
+   审批中转、`channel-restore` 定时器是共用的。`channel-restore`
+   以 root 运行，以便重装包括它自己定时器在内的 systemd 单元。
+6. 验证：在微信 / 企微里发 `/ping` 应回 `pong`，再发一条普通消息能
    得到正式回复才算通——只看服务状态显示绿色不算数。
 
 各单元都把 `HOME`、`MUSE_HOME` 指向家目录，保证网关、聊天命令和
@@ -119,7 +156,8 @@ iLink, WeCom via the official smart-robot long connection.
 
 ### 已知缺口
 
-- 上述改动在本地分支 `fix/bridge-connect-import-order`（提交 84d2fc4、9149b34），未推 origin、未合 main。
+- 上述改动已合入 main（合并提交 056609e，之后还有 .gitignore 黑名单
+  化 7666066），生产跑的是合并后的代码。
 - core 折叠只在沙箱验过 live，真企微生产折叠还没发生过；老桥合并已在真微信验过。
 - core 已知缺口：只收文本、媒体回未启用、审批卡片未接通。审批已全量自动放行（黑名单默认空，命中才拦截）。
 - 侧会话共享上下文：并行验证会互相污染回复文本，验活以 `merged`／`run_rebound` 等机制证据为准。
@@ -142,12 +180,10 @@ gitignore 排除；探针结果转储（`native-probe/probe*_results.txt`、
 
 ## 运行补充
 
-安装命令见上面的「快速开始」。两个网关的 systemd 单元把 `HOME` 和
-`MUSE_HOME` 设为 `/home/hatch`，这样即使某个单元的进程家目录本会是
+两个网关的 systemd 单元把 `HOME` 和 `MUSE_HOME` 设为家目录（见快速
+开始第 5 步的路径替换说明），这样即使某个单元的进程家目录本会是
 `/root`，网关、聊天命令和收件钩子仍共用同一份状态目录
 （`channel_common.muse_home()` 用同样的口径解析安装家目录）。
-`channel-restore` 以 root 运行，以便重装包括它自己定时器在内的
-systemd 单元。
 
 ## 钩子（消息唤醒层）
 
@@ -163,7 +199,9 @@ systemd 单元。
 
 安装：把脚本复制到 `~/hooks/scripts/`，通过你的助手平台的 hooks API
 注册定义，并把定义里的绝对路径（家目录、bot 状态目录）改成你自己
-部署的路径。
+部署的路径。**注意：钩子本身只负责把消息攒批、唤醒助手，真正回
+消息的是你的助手平台**（本项目是为 Muse 这类带 hooks API 的助手
+平台写的）。没有能接 hooks 的助手平台，网关收到消息也不会有人回。
 
 **硬规则：`poll_interval_secs` 永远不要设到 5 以下。** 5 秒是平台
 下限；设得更低会让定义失效、两个钩子一起被挂起，并悄无声息地吞掉
