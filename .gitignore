@@ -17,6 +17,9 @@
 !/feishu-bot/*
 !/channel-restore/
 !/mobile_channels/
+# Extensions: self-contained add-ons (e.g. extensions/gadget-token/).
+# Whole directory is tracked; keep secrets out of it.
+!/extensions/
 !/pyproject.toml
 !/channel_common.py
 !/credential_health.py
