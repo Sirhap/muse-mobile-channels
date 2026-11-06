@@ -1,70 +1,54 @@
-# Workspace repo: only the channel code is tracked. Everything else in
-# ~/workspace (evidence files, research clones, backups, goals) stays out.
-/*
-!/.gitignore
-!/README.md
-!/HEARTBEAT.md
-!/CONTRIBUTING.md
-!/LICENSE
-!/.github/
-!/.github/workflows/
-!/.github/workflows/*.yml
-!/.github/ISSUE_TEMPLATE/
-!/.github/ISSUE_TEMPLATE/*.md
-!/weixin-bot/
-!/wecom-bot/
-!/feishu-bot/
-!/feishu-bot/*
-!/channel-restore/
-!/mobile_channels/
-# Extensions: self-contained add-ons (e.g. extensions/gadget-token/).
-# Whole directory is tracked; keep secrets out of it.
-!/extensions/
-!/pyproject.toml
-!/channel_common.py
-!/credential_health.py
-!/worker_supervision.py
-!/inbound_media.py
-!/death_watch_activity.py
-!/hooks/
-!/hooks/scripts/
-!/hooks/scripts/*.sh
-!/hooks/definitions/
-!/hooks/definitions/*.json
-!/tests/
-!/tests/*.py
-# Root `/*` ignores this directory. Both lines are required or
-# wecom_outbound_coalesce_v2.py never enters the index.
-!/acceptance-fix-2026-10-08/
-!/acceptance-fix-2026-10-08/*.py
-!/docs/
-!/docs/*.md
-!/ops/
-!/ops/cold_death_drill.py
-!/ops/cold_death_live_second_judgment.py
-!/native-probe/
-!/native-probe/gw2.py
-!/native-probe/README.md
-!/slash-commands-2026-10-04.md
-!/native-bridge/
-!/native-bridge/native_bridge.py
-!/native-bridge/native-bridge.service
+# Blacklist .gitignore — normal project style.
+# Everything is tracked by default; only the patterns below are ignored.
+# Converted from whitelist 2026-11-06 at user request.
+#
+# HARD RULE: private files must NEVER be uploaded. The "Private / sensitive"
+# section below is the safety net — it covers credentials, keys, tokens,
+# pairing material and runtime state at ANY depth. Do not remove entries
+# from that section. If a new sensitive file type appears, add it there
+# before anything else.
 
-!/cloudflare-tunnel-plugin/
-!/cloudflare-tunnel-plugin/*.md
-!/cloudflare-tunnel-plugin/*.sh
-!/cloudflare-tunnel-plugin/*.py
-!/cloudflare-tunnel-plugin/*.yml
-!/cloudflare-tunnel-plugin/plugin.example.conf
-!/cloudflare-tunnel-plugin/units/
-!/cloudflare-tunnel-plugin/units/*.service
-!/approval-relay/
-!/approval-relay/*.py
-!/approval-relay/*.service
-
-# Runtime / local-only — never commit
-native-bridge/config.json
-cloudflare-tunnel-plugin/plugin.conf
+# ---------------------------------------------------------------------------
+# Private / sensitive — NEVER commit, at any depth
+# ---------------------------------------------------------------------------
+# Gadget device credentials (pairing material, any directory)
+pairing.json
+identity.json
+sdk_token
+pair.lock
+# Private keys and certificates
+*.pem
+*.key
+*.p12
+*.pfx
+*.der
+id_rsa*
+id_ed25519*
+id_ecdsa*
+id_dsa*
+# Credential and secret files
+credentials.env
+.env
+*.env
+cookies.txt
+cookies.json
+token.json
+vm_id.txt
+*credentials*.json
+*secret*.json
+# SSH
+.ssh/
+# Runtime databases and state (may contain message content / tokens)
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.db
+decisions.jsonl
+decisions.lock
+decisions.offset
+state.json
+status.json
+# Approval / relay runtime
 approval-relay/decisions.jsonl
 approval-relay/decisions.lock
 approval-relay/decisions.offset
@@ -72,6 +56,32 @@ approval-relay/state.json
 approval-relay/status.json
 native-bridge/state.json
 native-bridge/status.json
+native-bridge/config.json
+cloudflare-tunnel-plugin/plugin.conf
+
+# ---------------------------------------------------------------------------
+# Build artifacts, caches, generated files
+# ---------------------------------------------------------------------------
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+*.egg-info/
+*.log
+*.bak
+*.bak-*
+*.tmp
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ---------------------------------------------------------------------------
+# Runtime state directories (live services write here)
+# ---------------------------------------------------------------------------
+state/
 native-bridge/spool/
 native-bridge/shadow/
 native-bridge/enabled-*
@@ -79,34 +89,119 @@ native-bridge/divert-*
 native-bridge/longtask-*
 native-bridge/queue_admin-*.jsonl
 native-bridge/probe_*.py
-# P3#11 result dumps and the channel-restore outbound draft.
-# These do not match gw2.py, README.md, or other native-probe *.py deps.
-# Hatch moves/deletes are done via Muse; this only keeps the dumps untracked.
 native-probe/probe*_results.txt
 native-probe/probe*_stdout.log
 native-probe/probe*_*.log
 channel-restore/outbound-probe-draft-*.md
-.venv/
-__pycache__/
-*.pyc
-state/
-*.bak-*
-*.bak
+channel-restore/muse-core-run.service
+channel-restore/outbound_probe_state.json
+native-bridge/.fallback-weixin
+hooks/state/
+hooks/*.pid
+*.pid
+*.lock
+
+# ---------------------------------------------------------------------------
+# Non-code top-level directories (working data, research, media, user data)
+# ---------------------------------------------------------------------------
+.content-migrations/
+.hatch-browser/
+agents/
+archive-20261004/
+asr-models/
+asr-venv/
+.asr-test/
+browser-alt/
+cf-muse-channel/
+cf-muse-channel-backup-20261104-0.1.0/
+cf-intro-site-2026-10-11/
+cron.d/
+custom-connectors/
+custom-skills/
+feed/
+feishu-integration-2026-10-11/
+gemini-audit-verify-2026-10-17/
+goals/
+gold-monitor/
+imagine_media/
+memory/
+muse-benefits-video-2026-10-10/
+muse-day-video-2026-10-10/
+muse-intro-video-2026-10-09/
+pelican_bike_code/
+pinggy-tunnel-keepalive/
+proactivity/
+qq-bot/
+qq-build-2026-10-29/
+reference/
+research_notes/
+scheduler/
+secure-drop/
+self_improvement/
+skills/
+space-versions/
+space_data/
+spaces/
+ssh-access/
+system/
+tmp/
+tools/
+tutorial-2min/
+user/
+video-longtest-2026-10-09/
+video-longtest-2026-10-09-2/
+video-longtest-2026-10-09-3/
+video-longtest-2026-10-09-4/
+video-longtest-2026-10-10-teach/
+video-muse-benefits-2026-10-10/
+videogen-ui-sample-2026-10-23/
+visual_grounding/
+voices/
+your_files/
+weixin-ilink-gateway/
+download-serve/
+objectives/
+cloudflared-relay/
+
+# ---------------------------------------------------------------------------
+# Dated working directories (past fix / investigation / deploy work)
+# Pattern catches any top-level dir carrying a YYYY-MM-DD or YYYYMMDD stamp,
+# so future working dirs are ignored by default too.
+# ---------------------------------------------------------------------------
+*-2026-10-*
+*-2026-11-*
+*-2026-12-*
+*-2027-*
+*-202610*
+*-202611*
+*-202612*
+*-2027*
+
+# ---------------------------------------------------------------------------
+# Loose top-level clutter (evidence, drafts, probes, one-off scripts)
+# Tracked top-level files (README.md, HEARTBEAT.md, etc.) are already in the
+# index, so these patterns do not untrack them — they only hide new clutter.
+# ---------------------------------------------------------------------------
+*-2026-*.md
+*-202610*.md
+*-202611*.md
+*draft*.md
+*probe*.py
+*probe*.log
+merge-live-test.sh
+ops_state_snapshot.py
+task-interruption-evidence.md
 reply-*.txt
 login-qr.png
-credentials.env
-.env
-# Gadget device credential filenames, at any depth (e.g. inside the
-# whitelisted extensions/ tree): never commit a pairing.
-pairing.json
-identity.json
-sdk_token
-pair.lock
+*.zip
+*.tar
+*.tar.gz
+*.mp4
+*.jpg
+*.jpeg
+*.png
+*.mp3
+*.wav
 
-# Upstream reference clones (not our code)
+# Upstream reference clone inside wecom-bot (not our code)
 wecom-bot/reference/
-
-# Local SQLite core databases and recovery sidecars.
-*.sqlite3
-*.sqlite3-wal
-*.sqlite3-shm
