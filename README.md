@@ -111,6 +111,8 @@ iLink, WeCom via the official smart-robot long connection.
 
 认证两条腿（备轨／老桥共用）：`connect()` 先试 cookies 再回退 token.json，各以 `sessions.list` 探活。cookie 死不等于桥死；token 自续要靠有效 cookie，cookie 死后 token 只能撑到它自己到期；两条腿同死时只有 Gadget（独立凭证）或人工换凭证能救。
 
+领 Gadget token 用扩展 `extensions/gadget-token/`（只保留了 wong2/muse-client 里能拿 token 的代码：刷新、凭证读写、SDK token 校验；不含聊天、Noise、蓝牙配对协议）。浏览器开 `https://gadgets.muse.ai/settings/sdk-tokens` 拿 SDK token，配对须在 Mac 上做一次（蓝牙），之后 `bun extensions/gadget-token/cli.ts refresh` 可在任何机器上轮换 token。用法见该扩展的 README。
+
 ### 验证：怎么算“过了”
 
 只看 `connected` 或单测通过不算。部署验证必须含一回合真实入站：msgid 非空＋spool／divert 记录＋正式回复 `ok=true`。当前结果：老桥合并单测 64/64、core 折叠单测 15/15、核心回归 43/43、模拟器 24/24、恢复集成 8/8；Gadget 折叠沙箱 live PASS（A 回“收到，第二条已收到”）；真微信合并 live PASS（“快点一张图片”并入“生成一张图片给我”，只回一张图）。跑测试／验活用 `~/muse-test-venv/bin/python`＋`PYTHONPATH=.`（系统 python3 缺 curl_cffi）。
