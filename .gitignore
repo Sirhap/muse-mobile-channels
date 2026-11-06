@@ -96,6 +96,12 @@ reply-*.txt
 login-qr.png
 credentials.env
 .env
+# Gadget device credential filenames, at any depth (e.g. inside the
+# whitelisted extensions/ tree): never commit a pairing.
+pairing.json
+identity.json
+sdk_token
+pair.lock
 
 # Upstream reference clones (not our code)
 wecom-bot/reference/
