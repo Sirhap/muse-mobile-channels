@@ -113,8 +113,13 @@ for line in source.read_text().splitlines():
             if database is not None:
                 arguments[arguments.index('--database') + 1] = database
             value = ' '.join(quote(argument) for argument in arguments)
-        elif key in ('Environment', 'EnvironmentFile', 'WorkingDirectory'):
+        elif key == 'Environment':
             value = quote(value.strip('"').replace('/home/hatch', home))
+        elif key in ('EnvironmentFile', 'WorkingDirectory'):
+            # systemd rejects quotes here: a quoted WorkingDirectory is
+            # not absolute (fatal, unit will not start) and a quoted
+            # EnvironmentFile is silently ignored, so keep them bare.
+            value = value.strip('"').replace('/home/hatch', home)
         else:
             value = value.replace('/home/hatch', home)
         line = key + '=' + value
