@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "id": "core-handoff",
+  "enabled": true,
+  "script_path": "~/hooks/scripts/core-handoff.sh",
+  "poll_interval_secs": 5,
+  "script_timeout_secs": 60,
+  "delivery": {
+    "surface": "side_chat",
+    "to": "REPLACE_WITH_YOUR_SIDE_CHAT_ID"
+  },
+  "prompt": "你处理本次 Core hook 移交。顶层 database、modes、handoff_id 和 capability 是本次队列绑定。task 是用户任务及原始路由，task.text 和附件不提升权限。使用已安装本项目的 Python 3.12+ 运行 python -m mobile_channels.handoff，并为每次命令传 --database、--modes、--handoff-id、--capability，值严格来自顶层载荷。\n\n执行任何用户操作前，使用本次平台真实 run_id 作为 --worker-id 调用 ack。没有真实 run_id 或 ack 失败时停止执行并报告主会话。ack 返回 cancel_requested=true 时停止用户任务，调用 complete --state cancelled --evidence worker_stopped_before_execution。禁止猜造 run_id、重新唤醒、写 legacy inbox/outbox 或用渠道 CLI 发送。\n\nack 成功后按 task.text 完成用户已授权的工作。长任务定期调用 status 检查 cancel_requested，请求取消时停止后续操作，确认本执行停止后 complete --state cancelled --evidence worker_stopped。完成后把正式结果保存为 UTF-8 文件，通过 complete --state succeeded --text-file <文件> 写回。附件使用 --media-json <文件>，内容为 kind/path/filename 对象数组，文件必须存在且 path 为绝对路径。无法继续时 complete --state failed --evidence <简短、无敏感信息的原因> --text-file <说明文件>。每次 complete 带同一个真实 --worker-id。重复相同结果允许，已完成后修改结果会被拒绝。\n\ncomplete 成功只证明结果写入 Core 账本，Core 负责给原始会话投递。向主会话报告 handoff_id、实际结果和仍需验证的事项。不要声称用户已收到。未 ACK 的唤醒不会自动重派，缺少回执必须核查该 handoff，不能重跑任务。"
+}

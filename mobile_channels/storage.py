@@ -671,6 +671,22 @@ class Store:
             "run_id": run_id["run_id"] if run_id else None,
         }
 
+    def record_folded_platform_message(self, claim: Claim, message_id: str) -> None:
+        """Retain a confirmed fold ACK for history ancestry across restarts."""
+        if not isinstance(message_id, str) or not message_id:
+            raise ValueError("fold message identity is required")
+        with self._transaction():
+            self._owned(claim)
+            self._event(claim.task_id, "platform_message_folded", message_id)
+
+    def folded_platform_messages(self, task_id: str) -> set[str]:
+        """Read confirmed follow-up message identities in this live turn."""
+        rows = self.connection.execute(
+            "SELECT evidence FROM task_events WHERE task_id=? AND event='platform_message_folded'",
+            (task_id,),
+        ).fetchall()
+        return {row["evidence"] for row in rows if row["evidence"]}
+
     def mark_merged(self, queued_task_id: str, running_task_id: str) -> str:
         """Complete a queued task as merged into a running turn.
 
@@ -831,9 +847,12 @@ class Store:
                 "UPDATE tasks SET state='cancelled',owner=NULL,lease_until=NULL WHERE id=?", (claim.task_id,)
             )
             self._event(claim.task_id, "platform_cancelled", evidence)
+            receipt = CANCELLED_RECEIPT_TEXT
+            if "server_turn_may_continue" in evidence:
+                receipt = "已停止本地回复等待。Muse 端可能继续执行。"
             self._insert_receipt(claim.task_id, row["conversation_id"],
-                                 "cancelled", CANCELLED_RECEIPT_TEXT)
-            self._notify_merged(claim.task_id, "cancelled", CANCELLED_RECEIPT_TEXT)
+                                 "cancelled", receipt)
+            self._notify_merged(claim.task_id, "cancelled", receipt)
 
     def task(self, task_id: str) -> dict:
         """Return a detached task snapshot for diagnostics and adapters."""

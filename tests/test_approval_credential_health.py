@@ -99,6 +99,26 @@ class RelayCredentialHealthTests(unittest.TestCase):
         self.assertEqual(self.notify.call_count, 1)
         self.assertTrue(self.health()['reconnect_exhausted'])
 
+    def test_failed_first_probe_after_credential_change_keeps_original_outage(self):
+        self.fail_auth()
+        for _ in range(3):
+            self.cycle()
+            self.now += 600
+        failed_id = self.notify.call_args.kwargs['event_id']
+
+        credentials = Path(self.relay.CONF)
+        credentials.mkdir()
+        (credentials / 'cookies.txt').write_text('replacement')
+        self.cycle()
+        self.now += 600
+        self.relay.connect.side_effect = None
+        self.cycle()
+
+        self.assertEqual(self.health()['state'], 'healthy')
+        self.assertEqual(self.notify.call_count, 2)
+        self.assertEqual(self.notify.call_args.kwargs['event_id'],
+                         failed_id.removesuffix('-failed') + '-recovered')
+
     def test_only_cookie_or_vm_change_revives_parked_relay(self):
         """Changing the unused static token must not trigger another cookie request.
 

@@ -26,12 +26,14 @@ import { join } from 'node:path';
 import { MuseClient } from '../../reference/muse-client/src/client.js';
 import { loadCredentials, saveCredentials } from '../../reference/muse-client/src/credentials.js';
 import { MuseTurn } from '../../reference/muse-client/src/turn.js';
+import { validateMessage } from '../../reference/muse-client/src/message.js';
 
 const TERMINAL_TASK = new Set(['completed', 'failed', 'errored', 'cancelled', 'canceled']);
 
 interface Args {
   session: string;
   messageFile: string;
+  imagesFile?: string;
   out: string;
   timeoutSeconds: number;
   credentialsDir: string;
@@ -64,6 +66,7 @@ function parseArgs(argv: string[]): Args {
   return {
     session,
     messageFile,
+    imagesFile: values.get('images-file'),
     out,
     timeoutSeconds: Number(values.get('timeout') ?? 900),
     credentialsDir: values.get('credentials') ?? join(homedir(), '.config', 'MuseGadgetPair'),
@@ -84,6 +87,8 @@ interface TurnResult {
   state: ResultState;
   text?: string;
   message_id?: string;
+  ack_message_id?: string;
+  reply_message_ids?: string[];
   session_id?: string;
   evidence?: string;
   // [[FILE:...]] references parsed out of the reply text (legacy bridge
@@ -182,12 +187,14 @@ export async function main(): Promise<number> {
   // message id would make DualTrack re-send on the Native track and
   // double-deliver.
   let sendAttempted = false;
+  let acknowledgedMessageId: string | undefined;
   const TERMINAL_RESULT = new Set(['succeeded', 'failed', 'cancelled', 'unknown']);
   const settle = (next: TurnResult): void => {
     // A terminal result is final. A 'running' placeholder may be overwritten
     // by the terminal outcome; without this the worker would exit leaving
     // the file saying 'running' forever (seen live 2026-11-06).
     if (settled && TERMINAL_RESULT.has(settled.state)) return;
+    next = { ...next, ack_message_id: acknowledgedMessageId };
     settled = next;
     try {
       writeResult(args.out, next);
@@ -212,6 +219,15 @@ export async function main(): Promise<number> {
   const deadline = Date.now() + args.timeoutSeconds * 1000;
   let client: MuseClient | null = null;
   try {
+    const entries: unknown = args.imagesFile ? JSON.parse(readFileSync(args.imagesFile, 'utf8')) : [];
+    if (!Array.isArray(entries)) throw new Error('images must be an array');
+    const images = entries.map((entry) => {
+      if (!entry || typeof entry.data_base64 !== 'string' || entry.type !== 'image') {
+        throw new Error('invalid image input');
+      }
+      return { data: Buffer.from(entry.data_base64, 'base64'), mimeType: entry.mime_type, filename: entry.filename };
+    });
+    validateMessage(text, images);
     const credentials = await loadCredentials(args.credentialsDir);
     // Persist rotated tokens: the refresh token rotates on every
     // refresh (the old one is invalidated server-side). Without this
@@ -230,7 +246,7 @@ export async function main(): Promise<number> {
     const ack = await (async () => {
       sendAttempted = true;
       try {
-        return await client.sendMessage(text, { sessionId: args.session });
+        return await client.sendMessage(text, { sessionId: args.session, images });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         settle({
@@ -249,6 +265,7 @@ export async function main(): Promise<number> {
       return 0;
     }
     console.error(`sent, message id ${messageId}`);
+    acknowledgedMessageId = messageId;
     if (args.sendOnly) {
       // Fold send: the message is in the session; the running turn's
       // own worker keeps the subscription and will see the reply.
@@ -378,6 +395,7 @@ export async function main(): Promise<number> {
         text: merged.text,
         media: merged.media.length ? merged.media : undefined,
         message_id: bound.at(-1)!.messageId,
+        reply_message_ids: bound.map((reply) => reply.messageId),
         session_id: args.session,
       });
       return 0;

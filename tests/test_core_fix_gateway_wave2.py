@@ -102,6 +102,26 @@ class TestInboundMediaGate(BindingCase):
         self.assertEqual(context.media[0]["path"], str(self.png))
         self.assertEqual(context.media[0]["kind"], "image")
 
+    def test_image_waiting_behind_a_live_turn_keeps_its_own_attachment(self):
+        from mobile_channels.runtime import CoreRunner, ExecutionOutcome
+
+        self.receive(text="first turn", message_id="first")
+        executor = Mock()
+        executor.submit.side_effect = [ExecutionOutcome("accepted", run_id="first-run"),
+                                      ExecutionOutcome("accepted", run_id="image-run")]
+        executor.fold.return_value = ExecutionOutcome("accepted")
+        executor.reply_started.return_value = False
+        executor.query.return_value = ExecutionOutcome("succeeded", text="first reply")
+        with Store(self.database) as store:
+            runner = CoreRunner(store, executor, "executor")
+            self.assertEqual(runner.tick(), "accepted")
+            image = self.receive(text="看看这张图", message_id="img1", media=self.image_media())
+            self.assertEqual(runner.tick(), "succeeded")
+            executor.fold.assert_not_called()
+            self.assertEqual(store.task(image.task_id)["state"], "queued")
+            self.assertEqual(runner.tick(), "accepted")
+            self.assertEqual(executor.submit.call_args.args[0].media, self.image_media())
+
     def test_video_media_rejected_with_explicit_reason(self):
         self.receive(text="看看视频", message_id="vid1", media=[
             {"kind": "video", "path": str(self.root / "clip.mp4"),
@@ -155,6 +175,22 @@ class TestReceiptAndNoticeDelivery(BindingCase):
         self.assertEqual(sent, ["正在处理…"])
         self.assertEqual(self.rows("task_receipts")[0]["state"], "delivered")
 
+    def test_receipts_are_delivered_only_by_the_owning_channel_and_account(self):
+        weixin = GatewayBinding("weixin")
+        self.addCleanup(weixin.close)
+        item = weixin.receive(message_id="wx1", sender_id="alice",
+                              chat_id="wechat-user", chat_type="single", text="job")
+        with Store(self.database) as store:
+            store.add_receipt(item.task_id, item.conversation_id, "started", "WeChat receipt")
+            sender = Mock(return_value=True)
+            self.binding.deliver_receipts(store, sender)
+            sender.assert_not_called()
+            with patch.object(weixin, "account_id", "different-account"):
+                weixin.deliver_receipts(store, sender)
+                sender.assert_not_called()
+            weixin.deliver_receipts(store, sender)
+            sender.assert_called_once_with("wechat-user", "single", "WeChat receipt", "")
+
     def test_started_receipt_skipped_when_task_terminal(self):
         task_id, conv_id = self._task_and_conv()
         with Store(self.database) as store:
@@ -204,18 +240,27 @@ class TestReceiptAndNoticeDelivery(BindingCase):
                 "INSERT INTO approval_notices VALUES (?,?,?,?,?,?)",
                 (row_id, channel, chat_id, text, state, 1.0))
 
-    def test_approval_notice_sent_once_and_duplicate_marked_delivered(self):
-        self._insert_notice("n0", "wecom", "alice", "待审批 #1", "delivered")
-        self._insert_notice("n1", "wecom", "alice", "待审批 #1", "pending")
-        self._insert_notice("n2", "wecom", "alice", "待审批 #2", "pending")
+    def test_distinct_approval_notice_events_can_have_identical_text(self):
+        self._insert_notice("down-1", "wecom", "alice", "审批连接断开", "delivered")
+        self._insert_notice("down-2", "wecom", "alice", "审批连接断开", "pending")
         sent = []
         with Store(self.database) as store:
-            self.binding.deliver_approval_notices(
-                store, lambda *a: sent.append(a[2]) or True)
-        self.assertEqual(sent, ["待审批 #2"])
+            for _ in range(2):
+                self.binding.deliver_approval_notices(
+                    store, lambda *a: sent.append(a[2]) or True)
+        self.assertEqual(sent, ["审批连接断开"])
         states = {r["id"]: r["state"] for r in self.rows("approval_notices")}
-        self.assertEqual(states, {"n0": "delivered", "n1": "delivered",
-                                  "n2": "delivered"})
+        self.assertEqual(states, {"down-1": "delivered", "down-2": "delivered"})
+
+    def test_old_random_notice_ids_still_deduplicate_replayed_text(self):
+        self._insert_notice("appr-new1-aabbccdd", "wecom", "alice", "待审批 #1", "delivered")
+        self._insert_notice("appr-new1-11223344", "wecom", "alice", "待审批 #1", "pending")
+        self._insert_notice("appr-core-new1-" + "a" * 32, "wecom", "alice", "待审批 #1", "pending")
+        sender = Mock(return_value=True)
+        with Store(self.database) as store:
+            counts = self.binding.deliver_approval_notices(store, sender)
+        sender.assert_called_once_with("alice", "single", "待审批 #1", "")
+        self.assertEqual(counts, {"sent": 1, "skipped": 1, "failed": 0})
 
 
 class TestCommands(BindingCase):
@@ -254,6 +299,23 @@ class TestCommands(BindingCase):
         self.assertEqual(tasks[by_text["job two"]]["state"], "cancelled")
         self.assertEqual(tasks[by_text["job one"]]["state"], "queued")
         self.assertEqual(tasks[by_text["job three"]]["state"], "queued")
+
+    def test_queue_drop_number_matches_list_when_a_task_is_running(self):
+        self.receive(text="running job", message_id="q-active")
+        with Store(self.database) as store:
+            claim = store.claim("executor")
+            store.begin_submission(claim)
+            store.mark_submitted(claim, "run-1")
+        first = self.receive(text="first queued", message_id="q-first")
+        second = self.receive(text="second queued", message_id="q-second")
+        self.receive(text="/queue", message_id="q-view")
+        queue_line = next(line for line in self.outbound_texts()[-1].splitlines()
+                          if line.endswith("second queued"))
+        shown_index = queue_line.split(".", 1)[0]
+        self.receive(text=f"/queue drop {shown_index}", message_id="q-drop")
+        with Store(self.database) as store:
+            self.assertEqual(store.task(first.task_id)["state"], "queued")
+            self.assertEqual(store.task(second.task_id)["state"], "cancelled")
 
     def test_queue_drop_with_extra_spaces_parsed(self):
         self.receive(text="job one", message_id="s1")
@@ -344,6 +406,9 @@ class AdapterCase(unittest.IsolatedAsyncioTestCase):
         self.modules = {ch: load_gateway(ch) for ch in ("weixin", "wecom")}
         self.gateways = {}
         for channel, module in self.modules.items():
+            home_patcher = patch.object(module, "muse_home", return_value=self.root)
+            home_patcher.start()
+            self.addCleanup(home_patcher.stop)
             state = self.root / channel
             state.mkdir(exist_ok=True)
             for key, filename in {
@@ -382,7 +447,7 @@ class AdapterCase(unittest.IsolatedAsyncioTestCase):
             connection.row_factory = sqlite3.Row
             return [dict(row) for row in connection.execute(f"SELECT * FROM {table}")]
 
-    async def run_delivery(self, channel, terminal, ticks=6):
+    async def run_delivery(self, channel, terminal, ticks=6, *, client=None, credentials=None):
         binding = self.gateways[channel]._core_binding
         original_sleep = asyncio.sleep
         ready = asyncio.Event()
@@ -399,7 +464,7 @@ class AdapterCase(unittest.IsolatedAsyncioTestCase):
         with patch("mobile_channels.gateway.asyncio.sleep",
                    side_effect=bounded_sleep):
             task = asyncio.create_task(
-                binding.delivery_loop(self.gateways[channel]))
+                binding.delivery_loop(self.gateways[channel], client, credentials))
             try:
                 await asyncio.wait_for(ready.wait(), timeout=5)
             finally:
@@ -593,6 +658,21 @@ class TestWecomOutboundMedia(AdapterCase):
             lambda: self.rows("outbound_parts")[0]["state"] == "retry_wait")
         gateway.send_frame.assert_not_called()
         self.assertEqual(self.rows("outbound_parts")[0]["state"], "retry_wait")
+
+    async def test_wecom_outbound_media_cannot_upload_a_link_to_credentials(self):
+        gateway = self.gateways["wecom"]
+        gateway.upload_media = AsyncMock(return_value="must-not-upload")
+        credentials = self.root / "private" / "credentials.env"
+        credentials.parent.mkdir()
+        credentials.write_text("FAKE_TEST_SECRET=private")
+        alias = self.root / "result.txt"
+        alias.symlink_to(credentials)
+        with patch.object(self.modules["wecom"], "CRED_FILE", credentials):
+            await self._complete_with_media([{"kind": "file", "path": str(alias)}])
+            await self.run_delivery("wecom", lambda: self.rows("outbound_messages")[0]["state"]
+                                    in ("delivered", "rejected"))
+        self.assertEqual(self.rows("outbound_messages")[0]["state"], "rejected")
+        gateway.upload_media.assert_not_called()
 
     async def test_wecom_missing_media_file_rejected_with_receipt(self):
         gateway = self.gateways["wecom"]

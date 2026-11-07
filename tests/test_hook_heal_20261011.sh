@@ -3,7 +3,8 @@
 # fake systemctl and a counting fake restore.sh. Production /etc and
 # the real services are never touched.
 set -uo pipefail
-HELPER="/home/hatch/workspace/channel-restore/hook-heal.sh"
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+HELPER="$PROJECT_ROOT/channel-restore/hook-heal.sh"
 ROOT="$(mktemp -d)"
 trap 'rm -rf "$ROOT"' EXIT
 PASS=0; FAIL=0
@@ -13,6 +14,26 @@ bad(){ FAIL=$((FAIL+1)); echo "FAIL: $1"; }
 WS="$ROOT/ws"; UNITS="$ROOT/etc"; STATE="$ROOT/state"; BIN="$ROOT/bin"
 mkdir -p "$WS"/{wecom-bot,weixin-bot,native-bridge,approval-relay,channel-restore} "$UNITS" "$STATE" "$BIN"
 mkdir -p "$WS/channel-restore/wecom-bot.service.d" "$WS/channel-restore/approval-relay.service.d" "$UNITS/wecom-bot.service.d" "$UNITS/approval-relay.service.d"
+mkdir -p "$WS/state"
+PYTHONPATH="$PROJECT_ROOT" python3 - "$WS" <<'PY'
+import json, sys
+from pathlib import Path
+from mobile_channels.storage import Store
+workspace = Path(sys.argv[1])
+database = workspace / 'state/core.sqlite3'
+with Store(database):
+    pass
+(workspace / 'state/channel-modes.json').write_text(json.dumps({
+    'channels': {'wecom': {'mode': 'core', 'account_id': 'test',
+                           'allowed_senders': ['test'], 'database': str(database)}},
+}))
+PY
+export PYTHONPATH="$PROJECT_ROOT"
+# macOS has no flock binary. These fixtures are sequential.
+if ! command -v flock >/dev/null 2>&1; then
+  flock() { return 0; }
+  export -f flock
+fi
 for rel in wecom-bot/wecom-bot.service weixin-bot/weixin-bot.service native-bridge/native-bridge.service approval-relay/approval-relay.service channel-restore/channel-restore.service channel-restore/channel-restore.timer; do
   echo "unit $rel" > "$WS/$rel"
   echo "unit $rel" > "$UNITS/$(basename "$rel")"
@@ -49,7 +70,7 @@ export FAKE_COUNT_FILE="$ROOT/count" FAKE_WS="$WS" FAKE_UNIT_DIR="$UNITS"
 : > "$FAKE_COUNT_FILE"
 run_heal(){ env HOOK_HEAL_WS="$WS" HOOK_HEAL_UNIT_DIR="$UNITS" HOOK_HEAL_STATE_DIR="$STATE" HOOK_HEAL_RESTORE="$BIN/restore" HOOK_HEAL_SYSTEMCTL="$BIN/systemctl" FAKE_DOWN="${FAKE_DOWN:-}" bash "$HELPER"; }
 calls(){ wc -l < "$FAKE_COUNT_FILE" | tr -d ' '; }
-backdate(){ touch -d "$1 seconds ago" "$2"; }
+backdate(){ python3 -c 'import os,sys,time; t=time.time()-int(sys.argv[1]); os.utime(sys.argv[2], (t,t))' "$1" "$2"; }
 
 # 1. Healthy files, deep-check stamp fresh -> no restore call.
 touch "$STATE/hook-heal.last-deepcheck"
@@ -89,6 +110,19 @@ run_heal; [[ "$(calls)" == "5" && -f "$UNITS/wecom-bot.service.d/core-mode.conf"
 echo tampered > "$UNITS/approval-relay.service.d/modes.conf"
 backdate 300 "$STATE/hook-heal.last-attempt"
 run_heal; [[ "$(calls)" == "6" ]] && grep -q '^dropin relay' "$UNITS/approval-relay.service.d/modes.conf" && ok "differing-dropin-healed" || bad "differing-dropin-healed calls=$(calls)"
+
+# 9. Legacy installs never acquire core drop-ins just because templates exist.
+mv "$WS/state/channel-modes.json" "$ROOT/saved-modes.json"
+rm "$UNITS/wecom-bot.service.d/core-mode.conf"
+backdate 300 "$STATE/hook-heal.last-attempt"
+touch "$STATE/hook-heal.last-deepcheck"
+run_heal; [[ "$(calls)" == "6" ]] && ok "legacy-no-core-dropins" || bad "legacy-no-core-dropins"
+
+# 10. A failed drop-in restart is pending even when file contents match.
+mv "$ROOT/saved-modes.json" "$WS/state/channel-modes.json"
+cp "$WS/channel-restore/wecom-bot.service.d/core-mode.conf" "$UNITS/wecom-bot.service.d/core-mode.conf"
+touch "$UNITS/wecom-bot.service.d/.muse-restart-pending"
+run_heal; [[ "$(calls)" == "7" ]] && ok "pending-restart-triggers-restore" || bad "pending-restart-triggers-restore"
 
 echo "test_hook_heal: PASS=$PASS FAIL=$FAIL"
 [[ "$FAIL" == "0" ]]

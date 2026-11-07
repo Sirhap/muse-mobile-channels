@@ -54,11 +54,27 @@ Muse 账号；接个人微信需要一个能当 iLink 机器人的微信号，�
 2. 按要接的渠道装依赖，只装选中的一边即可：
 
    ```sh
-   cd weixin-bot && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-   cd ../wecom-bot && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+   # 从仓库根目录执行，按需选一行。
+   (cd weixin-bot && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt)
+   (cd wecom-bot && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt)
    ```
 
-3. 拿渠道凭证：
+3. 安装桥与审批中转共用的 Python 环境及 Muse SDK。以下命令从仓库根目录
+   执行，SDK 源码放在被忽略的 `reference/` 中：
+
+   ```sh
+   python3 -m venv ~/muse-test-venv
+   mkdir -p reference
+   git clone https://github.com/nikships/muse-cli.git reference/muse-cli
+   git -C reference/muse-cli checkout 2e42aeccbef71437f4ccd4faa626414f2461be7b
+   ~/muse-test-venv/bin/pip install ./reference/muse-cli
+   ```
+
+   此处固定了 SDK 源码版本；实际账号的认证、协议兼容性仍按第 8 步验收。
+   自定义源码位置时，把 `MUSE_CLI_SRC` 设为包含 `muse_cli/` 的
+   `src/` 目录，并写入桥与审批服务的环境。
+
+4. 拿渠道凭证：
    - 个人微信：运行 `weixin-bot/.venv/bin/python weixin-bot/login.py`，
      出二维码后用要当机器人的微信扫码登录；登录成功后 `login.py` 会
      自动把凭证写进 `~/.config/weixin-bot/credentials.env`
@@ -75,11 +91,42 @@ Muse 账号；接个人微信需要一个能当 iLink 机器人的微信号，�
      WECOM_ALLOW_USERS=你的企微用户ID
      ```
 
-4. 拿 Muse 桥凭证：按 [凭证恢复说明](native-bridge/get-muse-token.md)
+5. 拿 Muse 桥凭证：按 [凭证恢复说明](native-bridge/get-muse-token.md)
    用浏览器扩展导出 `muse-credentials.zip`（内含 `cookies.txt`、
    `vm_id.txt`、`token.json`），装到 `~/.config/native-bridge/`
    （目录 0700、文件 0600）。没有这一步，网关能连上但桥发不出去消息。
-5. 安装 systemd 单元。**先把各 `.service` 文件里的 `/home/hatch`
+6. 配置 legacy 桥。创建仓库外的配置文件，例如
+   `~/.config/native-bridge/config.json`，其中只保留已安装的渠道，
+   下面的家目录和聊天身份须替换成实际值：
+
+   ```json
+   {
+     "channels": {
+       "wecom": {
+         "bot_state": "/home/你的用户名/workspace/wecom-bot/state",
+         "session_title": "Muse 企业微信",
+         "chatid": "实际聊天ID"
+       },
+       "weixin": {
+         "bot_state": "/home/你的用户名/workspace/weixin-bot/state",
+         "session_title": "Muse 微信",
+         "from_user_id": "实际微信用户ID"
+       }
+     }
+   }
+   ```
+
+   在 `native-bridge.service` 的 `[Service]` 中设置
+   `Environment=NATIVE_BRIDGE_CONFIG=/你的家目录/.config/native-bridge/config.json`
+   和 `Environment=NATIVE_BRIDGE_HOME=/你的家目录/workspace/native-bridge`。
+   在仓库的 `native-bridge/` 下为选中的渠道创建 `enabled-wecom` 或
+   `enabled-weixin` 空文件，桥才会把结果写入真实出站队列。配置文件设为
+   `0600`。审批通知的目标身份也需要在
+   `~/.config/approval-relay/notice.env` 配置，例如
+   `APPROVAL_RELAY_WECOM_CHATID=实际聊天ID`，微信使用
+   `APPROVAL_RELAY_WEIXIN_TO=实际微信用户ID`。
+
+7. 安装 systemd 单元。**先把各 `.service` 文件里的 `/home/hatch`
    全换成你自己的家目录**（`WorkingDirectory`、`ExecStart`、
    `Environment=HOME`／`MUSE_HOME`、`Environment=*_CRED_FILE` 这几处
    都是写死的），再拷到系统目录并启用：
@@ -96,7 +143,9 @@ Muse 账号；接个人微信需要一个能当 iLink 机器人的微信号，�
    只装选中的一边时，只拷、只启用那一边的网关单元即可；原生桥、
    审批中转、`channel-restore` 定时器是共用的。`channel-restore`
    以 root 运行，以便重装包括它自己定时器在内的 systemd 单元。
-6. 验证：在微信 / 企微里发 `/ping` 应回 `pong`，再发一条普通消息能
+   恢复脚本只管理已有单元或存在渠道凭证的网关。没有明确的企微
+   Core 配置时，它不会安装 Core drop-in 或启动 `muse-core-run`。
+8. 验证：在微信 / 企微里发 `/ping` 应回 `pong`，再发一条普通消息能
    得到正式回复才算通——只看服务状态显示绿色不算数。
 
 各单元都把 `HOME`、`MUSE_HOME` 指向家目录，保证网关、聊天命令和
@@ -105,7 +154,7 @@ Muse 账号；接个人微信需要一个能当 iLink 机器人的微信号，�
 
 ## 架构改造与本地工具
 
-新增 `mobile_channels/` 事务核心，提供会话隔离、任务所有权、结果与发件箱原子提交、投递核查及旧状态影子取证。默认仍由原网关、桥和钩子处理实际渠道；显式 core 模式可在沙箱接入实际文本回调与发送，尚未接管生产流量。
+新增 `mobile_channels/` 事务核心，提供会话隔离、任务所有权、结果与发件箱原子提交、投递核查及旧状态影子取证。新部署默认由原网关、桥和钩子处理渠道；Core 模式通过外部模式文件显式启用。仓库的单元测试和沙箱结果不能说明某个部署已完成切换。
 
 使用 Python 3.12+ 安装本地工具：`python -m pip install -e '.[dev]'`。
 运行 `python tests/run_core_regression.py` 验证沙箱回归，或执行
@@ -157,23 +206,62 @@ access token，不依赖浏览器登录态。所以 Cookie 死的时候 Gadget �
 
 认证两条腿（备轨／老桥共用）：`connect()` 先试 cookies 再回退 token.json，各以 `sessions.list` 探活（除非设了 `NATIVE_TOKEN_JSON`，此时只用 token）。cookie 死不等于桥死；token 自续要靠有效 cookie，cookie 死后 token 只能撑到它自己到期；两条腿同死时只有 Gadget（独立凭证）或人工换凭证能救。
 
+Gadget 收到发送 ACK、Worker 仍在等待订阅终态时，执行器会借用有效的
+Native 桥凭证读取同一 Gadget 侧会话的 `chat.history`。历史结果要晚于
+本轮 ACK，明确的父消息必须属于本轮、已确认的合并消息或其回复链。
+读到完成消息后最多做 3 次总查询，间隔 1 秒；仍有已知生成中的回复时
+继续等待。首段结案后保留 15 分钟的历史观察记录，默认每条记录每 10 秒检查一次，
+在独立线程查询历史。迟到文本和附件按消息 ID 去重后追加到原回复路由，
+重启后继续检查。出现下一条用户消息后，只补发有明确父消息关联的旧回合片段，
+无法归属的内容保留在 Muse 历史中。历史读取失败或没有匹配结果时保留原订阅，不重新发送已确认的
+消息。成功结果与发件箱提交后才清理本地 Worker。
+
+排查订阅延迟时查看
+`~/.config/muse-gadget-runs/gadget-<attempt_id>.log` 中的
+`event … seq=… elapsed_ms=…` 和 `result:`。历史兜底需要桥凭证，
+Gadget 本身的发送和订阅使用独立设备凭证。取消默认停止本地等待。
+可用 `MUSE_GADGET_SERVER_CANCEL=1` 启用 Native 辅助取消，只有读到关联终态才
+确认服务端停止，其他情况回执说明 Muse 可能继续执行。
+
 领 Gadget token 用扩展 `extensions/gadget-token/`（只保留了 wong2/muse-client 里能拿 token 的代码：刷新、凭证读写、SDK token 校验；不含聊天、Noise、蓝牙配对协议）。浏览器开 `https://gadgets.muse.ai/settings/sdk-tokens` 拿 SDK token，配对须在 Mac 上做一次（蓝牙），之后 `bun extensions/gadget-token/cli.ts refresh --credentials ~/.config/MuseGadgetPair` 可在任何机器上轮换 token。用法见该扩展的 README。
 
 ### 验证：怎么算“过了”
 
-只看 `connected` 或单测通过不算。部署验证必须含一回合真实入站：msgid 非空＋spool／divert 记录＋正式回复 `ok=true`。当前结果：老桥合并单测 73/73、core 折叠单测 17/17、核心回归 43/43 套、模拟器 24/24、恢复集成 8/8；Gadget 折叠沙箱 live PASS（A 回“收到，第二条已收到”）；真微信合并 live PASS（“快点一张图片”并入“生成一张图片给我”，只回一张图）。跑测试／验活用 `~/muse-test-venv/bin/python`＋`PYTHONPATH=.`（系统 python3 缺 curl_cffi）。
+部署验证必须含一回合真实入站，记录 msgid、当前模式下的入站任务或 spool／divert 记录，以及正式回复的投递 `ok=true`。
+历史验收记录包含 Gadget 折叠沙箱回合和微信合并回合，具体部署仍须核对运行版本并重新验活。
+本地检查使用下方“测试”章节的统一入口；平台验活使用已安装 Muse SDK 的
+`~/muse-test-venv/bin/python` 与 `PYTHONPATH=.`。
 
 ### 已知缺口
 
-- 上述改动已合入 main（合并提交 056609e，之后还有 .gitignore 黑名单
-  化 7666066），生产跑的是合并后的代码。
+- 上述改动已合入 main。部署时通过 `git rev-parse HEAD` 和服务启动命令核对实际运行版本。
 - core 折叠只在沙箱验过 live，真企微生产折叠还没发生过；老桥合并已在真微信验过。
-- core 已知缺口：只收文本、媒体回未启用、审批卡片未接通。审批已全量自动放行（黑名单默认空，命中才拦截）。
+- Core 接受文本与不超过 2 MiB 的 JPEG、PNG、GIF、WebP 图片，Gadget 可直接发送图片，
+  设备不可用时回退 Native。排队图片会保留独立回合；
+  微信与企微 Core 出站支持文本、图片、视频和文件，附件路径受网关文件策略限制。
+  微信沿用原网关的压缩与 CDN 上传，支持类型超过 2,000,000 字节时尝试既有压缩流程。
+  先完成附件上传再发送正文和媒体，部分发送结果未知时进入待核查，人工重试沿用稳定发送 ID。
+- Core 审批通知以文本发送，支持 `/a /b /c` 与已有企微卡片的决定回调。
+  legacy 审批通知支持模板卡。默认非黑名单请求自动放行；黑名单命中、
+  策略要求人工或自动放行 RPC 失败时转人工，通知失败只重试通知。
 - 侧会话共享上下文：并行验证会互相污染回复文本，验活以 `merged`／`run_rebound` 等机制证据为准。
+
+### Core 的 hooks 接手
+
+可为单个 Core 渠道显式设置 `"hook_handoff": true`，并注册独立的 Core
+hook。Gadget 与 Native 都有明确证据未提交任务时，任务进入持久化交接账本。
+hook 提供一次唤醒载荷，worker ACK 后才确认接收；结果仍由 Core 向原聊天投递。
+未知提交不转交，已提供但未收到回执的载荷等待核查，避免重复执行。
+安装、回执和取消命令见 [Core hook 交接](docs/core-hook-handoff.md)。
 
 ## 凭证（不进仓库）
 
 审批决策现要求显式会话/操作者授权；无来源范围时，需外部配置 `APPROVAL_ADMINS_JSON`，例如 `{"wecom":{"实际聊天ID":["管理员ID"]}}`。没有授权映射会拒绝决策，普通消息白名单不自动授予审批权。配置应保存在仓库外。
+
+无原始审批聊天范围的通知需要显式目标。企微在审批服务环境设置
+`APPROVAL_RELAY_WECOM_CHATID`，微信设置 `APPROVAL_RELAY_WEIXIN_TO`。
+缺少目标时通知保留待重试。健康通知连续 3 次查询失败后报告断线，
+恢复查询后发同一事件的恢复通知。`APPROVAL_RELAY_TEST=1` 始终写影子队列。
 
 本仓库不含任何凭证。凭证分三类，都只存本机配置目录：
 
@@ -242,6 +330,24 @@ worker 的每次 beat、hold、handoff 都应带本次 `--run-id`；同一 run �
 在演练方案里的授权行填写之前，不要拿这两样对生产实例运行。
 
 ## 测试
+
+本地安装诊断、服务计划生成与真实链路验收步骤见
+[安装检查与验收](docs/deployment-checks.md)。`doctor` 仅检查本地条件；
+`service-plan` 生成可审查的服务文件和安装脚本，执行脚本会启动 Linux 服务。
+
+安装开发依赖并按 [Gadget SDK 安装步骤](extensions/gadget-token/README.md#install-the-full-gadget-sdk)
+准备固定版本的 SDK 与 Bun 1.4.4 后，从仓库根目录运行：
+
+```sh
+python -m pip install -e '.[dev]'
+python tests/run_core_regression.py
+bash tests/test_hook_heal_20261011.sh
+bun test tests/gadget_turn.test.ts tests/gadget_turn_history_fallback.test.ts
+```
+
+统一回归入口包含执行器、媒体、审批和恢复脚本的新增回归。
+CI 在 Ubuntu 和 macOS 安装同一 SDK 提交与 Bun 版本后运行这些检查。
+上述 SDK 和依赖安装属于开发环境准备，测试本身使用临时状态和模拟传输。
 
 沙箱套件在 `tests/`，用真实的钩子脚本和网关模块对着打桩的状态、CLI
 和网络跑——不碰任何真实渠道：

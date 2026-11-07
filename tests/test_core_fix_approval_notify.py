@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 import sqlite3
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -38,6 +39,7 @@ class CoreNotifyTests(unittest.TestCase):
         self.base = Path(self.temp.name)
         self.relay = load_relay()
         self.relay.TEST = False
+        self.relay.BASE = str(self.base)
         self.relay.STATE_F = str(self.base / "state.json")
         self.relay.DECISIONS_F = str(self.base / "decisions.jsonl")
         self.relay.OFFSET_F = str(self.base / "decisions.offset")
@@ -112,6 +114,50 @@ class CoreNotifyTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["chat_id"], "sirhao")
 
+    def test_test_mode_uses_shadow_even_with_core_configuration(self):
+        self.write_modes("core")
+        self.env()
+        self.relay.TEST = True
+
+        self.relay.notify("测试通知", "test", channels=["wecom"])
+
+        self.assertEqual(self.notice_rows(), [])
+        shadow = self.base / "shadow" / "wecom-outbox.jsonl"
+        self.assertEqual(json.loads(shadow.read_text())["text"], "测试通知")
+
+    def test_core_health_notice_replays_by_event_id(self):
+        self.write_modes("core")
+        self.env()
+
+        for event_id in ("first-failed", "first-failed", "second-failed"):
+            self.relay.notify("审批监听连接异常", "credential", channels=["wecom"], event_id=event_id)
+
+        self.assertEqual({row["id"] for row in self.notice_rows()},
+                         {"appr-health-first-failed-wecom", "appr-health-second-failed-wecom"})
+
+    def test_pending_approval_replays_by_platform_id(self):
+        self.write_modes("core")
+        self.env()
+        item = {"approval_id": "platform-id-1", "who": "op", "what": "命令：echo hi",
+                "decision_scope": {"channel": "wecom", "chat_id": "room"}}
+
+        self.relay.send_approval_notice("1", item)
+        self.relay.send_approval_notice("1", item)
+        self.relay.send_approval_notice("1", dict(item, approval_id="platform-id-2"))
+
+        rows = self.notice_rows()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["text"], rows[1]["text"])
+
+    def test_core_notice_without_route_is_retained_for_retry(self):
+        self.write_modes("core")
+        self.env()
+        self.relay.CHANNELS["wecom"]["row"]["chatid"] = ""
+
+        with self.assertRaises(OSError):
+            self.relay.notify("审批通知", "new1", channels=["wecom"])
+        self.assertEqual(self.notice_rows(), [])
+
     def test_wecom_legacy_mode_still_uses_outbox(self):
         self.write_modes("legacy")
         self.env()
@@ -167,6 +213,22 @@ class CoreNotifyTests(unittest.TestCase):
         self.relay.notify("待审批 #1", "new1", channels=["wecom"])
         self.assertEqual(len(self.outbox_rows("wecom")), 1)
         self.assertEqual(self.notice_rows(), [])
+
+    def test_legacy_outboxes_follow_relocated_relay_module(self):
+        """A custom home can deploy the relay without retaining hatch paths."""
+        deployment = self.base / "custom-home" / "workspace"
+        relay_path = deployment / "approval-relay" / "approval_relay.py"
+        relay_path.parent.mkdir(parents=True)
+        relay_path.write_bytes((ROOT / "approval-relay" / "approval_relay.py").read_bytes())
+        spec = importlib.util.spec_from_file_location("relocated_approval_relay", relay_path)
+        relocated = importlib.util.module_from_spec(spec)
+
+        with mock.patch.object(sys, "path", list(sys.path)):
+            spec.loader.exec_module(relocated)
+
+        for channel in ("weixin", "wecom"):
+            self.assertEqual(Path(relocated.CHANNELS[channel]["outbox"]),
+                             deployment.resolve() / f"{channel}-bot" / "state" / "outbox.jsonl")
 
 
 if __name__ == "__main__":

@@ -213,6 +213,30 @@ class SafetyTests(unittest.TestCase):
                 secret.write_text("SECRET=<redacted>\n", encoding="utf-8")
                 self.assertFalse(outbound_file_allowed(secret, cred, [root]))
 
+    def test_gadget_and_approval_credentials_are_not_sendable_through_aliases(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cred = root / ".config" / "wecom-bot" / "credentials.env"
+            output_dir = root / "workspace" / "outputs"
+            output_dir.mkdir(parents=True)
+            for directory, filenames in (
+                    ("MuseGadgetPair", ("pairing.json", "identity.json", "sdk_token")),
+                    ("approval-relay", ("credentials.env", "config.json"))):
+                private_dir = root / ".config" / directory
+                private_dir.mkdir(parents=True)
+                for filename in filenames:
+                    with self.subTest(directory=directory, filename=filename):
+                        secret = private_dir / filename
+                        secret.write_text("FAKE_TEST_SECRET=private\n", encoding="utf-8")
+                        alias = output_dir / f"{directory}-{filename}.txt"
+                        alias.symlink_to(secret)
+                        self.assertFalse(outbound_file_allowed(secret, cred, [root]))
+                        self.assertFalse(outbound_file_allowed(alias, cred, [root]))
+            for filename in ("report.txt", "picture.png", "video.mp4"):
+                output = output_dir / filename
+                output.write_bytes(b"test output")
+                self.assertTrue(outbound_file_allowed(output, cred, [root]))
+
     def test_feedback_clear_accepts_json_or_bare_msgid(self) -> None:
         self.assertEqual(parse_feedback_clear_line("abc"), "abc")
         self.assertEqual(parse_feedback_clear_line('{"msgid": "m9"}'), "m9")

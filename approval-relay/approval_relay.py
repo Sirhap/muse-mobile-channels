@@ -11,6 +11,7 @@ APPROVAL_RELAY_TEST=1 redirects outbox writes to ./shadow/."""
 import fcntl
 import json, os, sys, time, uuid
 import sqlite3
+import hashlib
 from pathlib import Path
 from contextlib import nullcontext
 
@@ -52,9 +53,9 @@ SUPPORTED_DECISION_CHANNELS = ("weixin", "wecom", "feishu")
 TEST = os.environ.get("APPROVAL_RELAY_TEST") == "1"
 
 CHANNELS = {
-    "weixin": {"outbox": "/home/hatch/workspace/weixin-bot/state/outbox.jsonl",
+    "weixin": {"outbox": str(Path(_ROOT) / "weixin-bot" / "state" / "outbox.jsonl"),
                "row": {"to_user_id": os.environ.get("APPROVAL_RELAY_WEIXIN_TO", "")}},
-    "wecom": {"outbox": "/home/hatch/workspace/wecom-bot/state/outbox.jsonl",
+    "wecom": {"outbox": str(Path(_ROOT) / "wecom-bot" / "state" / "outbox.jsonl"),
               "row": {"chatid": os.environ.get("APPROVAL_RELAY_WECOM_CHATID", ""), "chat_type": 1}},
     "feishu": {"outbox": str(Path(_ROOT) / "feishu-bot" / "state" / "outbox.jsonl"),
                "row": {"chat_id": os.environ.get("APPROVAL_RELAY_FEISHU_CHAT_ID", ""), "msg_type": "text"}},
@@ -243,11 +244,13 @@ def _core_notice_chat_id(channel, item):
 
 
 def _write_core_approval_notice(db_path, notice_id, channel, chat_id, text):
-    """Append one pending approval notice to the core database.
+    """Append one pending approval notice, accepting replays of its stable ID.
 
     Raises OSError when the core database is missing or the write
     fails, so the caller keeps the item unnotified and retries.
     """
+    if not isinstance(chat_id, str) or not chat_id.strip():
+        raise OSError("core approval notice has no chat route")
     if not db_path or not os.path.exists(db_path):
         raise OSError(f"core database is missing: {db_path}")
     try:
@@ -260,7 +263,7 @@ def _write_core_approval_notice(db_path, notice_id, channel, chat_id, text):
         conn.execute(
             "INSERT INTO approval_notices "
             "(id, channel, chat_id, text, state, created_at) "
-            "VALUES (?, ?, ?, ?, 'pending', ?)",
+            "VALUES (?, ?, ?, ?, 'pending', ?) ON CONFLICT(id) DO NOTHING",
             (notice_id, channel, chat_id, text, time.time()))
         conn.commit()
     except sqlite3.Error as exc:
@@ -269,7 +272,7 @@ def _write_core_approval_notice(db_path, notice_id, channel, chat_id, text):
         conn.close()
 
 
-def notify(text, tag, approval=None, channels=None, item=None, event_id=None):
+def notify(text, tag, approval=None, channels=None, item=None, event_id=None, notice_key=None):
     """Push a notice to selected channels (prefer_source_else_both).
 
     ``channels`` if given is used as-is (after normalizing); otherwise
@@ -279,7 +282,7 @@ def notify(text, tag, approval=None, channels=None, item=None, event_id=None):
     The text is kept on the card row as fallback/audit content.
     Missing evidence still notifies both channels.
     ``event_id`` gives health retries a stable id per target; ordinary approval
-    notifications keep their existing randomly generated ids.
+    notifications use ``notice_key`` when their logical event can be retried.
 
     A core-mode channel has no legacy outbox loop, so its notice goes
     to the core database's approval_notices table (pending) for the
@@ -312,6 +315,10 @@ def notify(text, tag, approval=None, channels=None, item=None, event_id=None):
         cfg = CHANNELS[ch]
         row_id = (f"appr-health-{event_id}-{ch}" if event_id is not None
                   else f"appr-{tag}-{uuid.uuid4().hex[:8]}")
+        if event_id is None and notice_key is not None:
+            identity = json.dumps([notice_key, ch, _core_notice_chat_id(ch, item)], ensure_ascii=False)
+            digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32]
+            row_id = f"appr-core-{tag}-{digest}"
         row = {"id": row_id,
                "queued_at": int(time.time()), "content": text, "text": text}
         if ch == "wecom" and approval is not None:
@@ -327,7 +334,7 @@ def notify(text, tag, approval=None, channels=None, item=None, event_id=None):
                     approval_id=str(approval.get("num", "")),
                     operator_ids=[],
                     prompt=approval.get("what", ""),
-                    reason=approval.get("who", ""),
+                    reason=approval.get("policy_reason") or approval.get("who", ""),
                     is_high_risk=bool(approval.get("is_high_risk")),
                     expires_at=exp_s,
                 )
@@ -348,10 +355,14 @@ def notify(text, tag, approval=None, channels=None, item=None, event_id=None):
         path = cfg["outbox"]
         lease = None
         try:
-            try:
-                lease = lease_from_env(ch)
-            except KeyError:
-                lease = None
+            if TEST:
+                path = os.path.join(BASE, "shadow", f"{ch}-outbox.jsonl")
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+            else:
+                try:
+                    lease = lease_from_env(ch)
+                except KeyError:
+                    lease = None
             if lease is not None and lease.mode == "core":
                 # Core-owned channel: the legacy outbox loop never runs,
                 # so the notice goes to the core database for delivery_loop.
@@ -359,10 +370,7 @@ def notify(text, tag, approval=None, channels=None, item=None, event_id=None):
                     lease.settings.get("database"), row_id, ch,
                     _core_notice_chat_id(ch, item), text)
             else:
-                if TEST:
-                    path = os.path.join(BASE, "shadow", f"{ch}-outbox.jsonl")
-                    os.makedirs(os.path.dirname(path), exist_ok=True)
-                if event_id is not None:
+                if event_id is not None or notice_key is not None:
                     append_health_notice_once(path, row)
                 else:
                     with open(path, "a", encoding="utf-8") as output:
@@ -388,7 +396,7 @@ def _what_field(what, label):
     return ""
 
 
-def build_approval_card(num, who, what, expires_ms, is_high_risk=False):
+def build_approval_card(num, who, what, expires_ms, is_high_risk=False, policy_reason=""):
     """Template card for one pending approval (WeCom only).
 
     Card real estate is small (sub_title_text <= 112 chars, horizontal
@@ -400,6 +408,8 @@ def build_approval_card(num, who, what, expires_ms, is_high_risk=False):
     horiz = []
     if is_high_risk:
         horiz.append({"keyname": "风险", "value": "🚨 高危审批"})
+    if policy_reason:
+        horiz.append({"keyname": "策略", "value": str(policy_reason)[:60]})
     for label in ("目标", "说明", "原因"):
         value = _what_field(what, label)
         if value:
@@ -548,8 +558,26 @@ def send_approval_notice(num, item):
            approval={"num": num, "who": item.get("who", ""),
                      "what": item.get("what", ""),
                      "expires_ms": item.get("expires_ms"),
+                     "policy_reason": item.get("policy_reason") or item.get("decision_reason") or "",
                      "is_high_risk": is_high_risk},
-           item=item)
+           item=item, notice_key=f"pending:{item.get('approval_id') or num}")
+
+
+def queue_manual_approval(st, num, item):
+    """Group or notify a manual approval; leave it unnotified on enqueue failure."""
+    primary = find_group_primary(st, num, item)
+    if primary is not None:
+        item["grouped_with"] = primary
+        item["notified"] = True
+        log("grouped scoped pending", num, "->", primary)
+        return
+    try:
+        send_approval_notice(num, item)
+    except OSError:
+        log("approval notice could not be queued", num)
+    else:
+        item["notified"] = True
+        log("notified pending", num)
 
 
 def fmt_hm(ms):
@@ -721,6 +749,12 @@ def poll_once(gw, st, response=None, policy_engine=None):
             if key:
                 item["group_key"] = key
         if not item["notified"] and item.get("status") == "pending":
+            attempt = item.get("decision_attempt") or {}
+            if attempt.get("operator_id") == "policy_engine" and attempt.get("decision") == "allow_once":
+                # A pending item with an earlier auto-allow attempt has already
+                # moved to manual review. Retry notification, never the RPC.
+                queue_manual_approval(st, num, item)
+                continue
             who, what = summarize(record)
             source = record
             if not has_content(who, what):
@@ -768,11 +802,6 @@ def poll_once(gw, st, response=None, policy_engine=None):
                             "egress.approval.decide",
                             path_params={"approval_id": aid},
                             body={"decision": "allow_once"}, timeout=20)
-                        item["status"] = "auto_approved"
-                        item["decided_at"] = int(time.time())
-                        item["notified"] = True
-                        save_state(st)
-                        log("auto approved pending", num, aid[:12], decision.reason)
                     except Exception as exc:
                         # 自动放行提交失败：退到手动审批，不静默卡住。
                         # 状态回 pending（consume_decisions 只接受 pending
@@ -784,55 +813,17 @@ def poll_once(gw, st, response=None, policy_engine=None):
                             "自动放行提交失败，转人工审批"
                             f"（{type(exc).__name__}）"
                         )
-                        primary = find_group_primary(st, num, item)
-                        if primary is not None:
-                            item["grouped_with"] = primary
-                            item["notified"] = True
-                            log("grouped auto-allow-failed pending", num, "->", primary)
-                        else:
-                            try:
-                                send_approval_notice(num, item)
-                            except OSError:
-                                log("auto allow decide failed; approval notice could not be queued", num, aid[:12])
-                            else:
-                                item["notified"] = True
-                                log("auto allow decide failed, fell back to manual", num, aid[:12], type(exc).__name__, str(exc))
                         save_state(st)
-                elif decision.action == PolicyAction.AUTO_DENY:
-                    # 黑名单命中：不再静默自动拦截，改发手机人工审批通知，
-                    # 由用户 /a（仅这次）/ /b（永久）/ /c（拒绝）决定。
-                    # 能自动审批的（AUTO_ALLOW）仍静默自动放行，不变。
-                    # 状态保持 pending、不提交 deny，用户的手动决定走
-                    # consume_decisions 正常核销。
-                    primary = find_group_primary(st, num, item)
-                    if primary is not None:
-                        item["grouped_with"] = primary
-                        item["notified"] = True
-                        log("grouped blacklist pending", num, "->", primary)
+                        queue_manual_approval(st, num, item)
                     else:
-                        try:
-                            send_approval_notice(num, item)
-                        except OSError:
-                            log("blacklist held for manual decision; approval notice could not be queued", num, aid[:12])
-                        else:
-                            item["notified"] = True
-                            log("blacklist held for manual decision", num, aid[:12], decision.reason)
-                    save_state(st)
+                        item["status"] = "auto_approved"
+                        item["decided_at"] = int(time.time())
+                        item["notified"] = True
+                        save_state(st)
+                        log("auto approved pending", num, aid[:12], decision.reason)
                 else:
-                    # Level 1 / Level 2: 需要手机人工审批 (普通审批或高危强审)
-                    primary = find_group_primary(st, num, item)
-                    if primary is not None:
-                        item["grouped_with"] = primary
-                        item["notified"] = True
-                        log("grouped scoped pending", num, "->", primary)
-                    else:
-                        try:
-                            send_approval_notice(num, item)
-                        except OSError:
-                            log("approval notice could not be queued", num, aid[:12])
-                        else:
-                            item["notified"] = True
-                            log("notified pending", num, aid[:12], who)
+                    # 黑名单、普通和高危人工审批都留给用户决定。
+                    queue_manual_approval(st, num, item)
             else:
                 # Hold the notification: an empty one would ask the
                 # user to approve blind. The item stays pending and
@@ -882,6 +873,7 @@ def consume_decisions(gw, st):
             if (previous.get("status") in ("decision_unknown", "auto_approved", "auto_denied")
                     or str(previous.get("status", "")).startswith("decided:")):
                 st["items"][number] = previous
+        _flush_decision_notices(st)
         try:
             with open(OFFSET_F, encoding="utf-8") as source:
                 off = int(source.read().strip())
@@ -930,6 +922,7 @@ def consume_decisions(gw, st):
                 break
             except KeyError:
                 _consume_decision_row(gw, st, row)
+            _flush_decision_notices(st)
             new_off = next_off
         save_state(st)
         _atomic_text(OFFSET_F, str(new_off))
@@ -952,7 +945,8 @@ def _consume_decision_row(gw, st, row):
         log("approval decision rejected: unauthorized, expired, or invalid", num)
         try:
             notify(f"【审批 #{num}】未提交：来源、操作者或有效期无法验证，请在原会话或 Muse 应用里处理。",
-                   f"rejected{num}", channels=[str(row.get("channel", "")).removesuffix("-card")])
+                   f"rejected{num}", channels=[str(row.get("channel", "")).removesuffix("-card")],
+                   notice_key=f"rejected:{json.dumps(row, sort_keys=True, ensure_ascii=False)}")
         except OSError:
             log("approval rejection notification could not be queued", num)
         return
@@ -978,14 +972,30 @@ def _consume_decision_row(gw, st, row):
     else:
         item["status"] = "decided:" + decision
         item["decided_at"] = int(time.time())
-        save_state(st)
         message = f"【审批 #{num}】{DECISION_LABEL[decision]}，平台已确认决定；操作最终结果请以执行反馈为准。"
     # Each approval ID requires its own authorization/attempt. Grouped
     # siblings will be promoted to individual notices by poll_once.
-    try:
-        notify(message, f"decision{num}", channels=[str(row["channel"]).removesuffix("-card")], item=item)
-    except OSError:
-        log("decision status notification could not be queued", num)
+    item["pending_decision_notice"] = {
+        "text": message, "channel": str(row["channel"]).removesuffix("-card"),
+        "id": f"decision:{item['decision_attempt']['id']}",
+    }
+    save_state(st)
+
+
+def _flush_decision_notices(st):
+    """Retry confirmed or uncertain decision receipts without replaying decisions."""
+    for num, item in st["items"].items():
+        notice = item.get("pending_decision_notice")
+        if not isinstance(notice, dict):
+            continue
+        try:
+            notify(notice["text"], f"decision{num}", channels=[notice["channel"]],
+                   item=item, notice_key=notice["id"])
+        except OSError:
+            log("decision status notification could not be queued", num)
+        else:
+            item.pop("pending_decision_notice")
+            save_state(st)
 
 
 def cycle():
@@ -1002,14 +1012,16 @@ def _credential_health(st):
         raise ValueError("invalid approval credential health state")
     if health.get("fingerprint") != stamp:
         old_outage = bool(health.get("outage_active"))
+        incident_id = health.get("incident_id") if old_outage else None
+        failure_notice_created = old_outage and bool(health.get("failure_notice_created"))
         last_verified = health.get("last_verified_at")
         pending = health.get("pending_notices", [])
         health.clear()
         health.update(fingerprint=stamp, state="unknown", failures=0,
                       reconnect_exhausted=False, next_attempt_at=0,
                       last_verified_at=last_verified, outage_active=old_outage,
-                      pending_notices=pending, incident_id=uuid.uuid4().hex,
-                      failure_notice_created=False, failure_kind=None)
+                      pending_notices=pending, incident_id=incident_id or uuid.uuid4().hex,
+                      failure_notice_created=failure_notice_created, failure_kind=None)
         save_state(st)
     return health
 
@@ -1038,14 +1050,15 @@ def _connection_failed(st, health, exc, now):
     """
     kind = failure_kind(exc)
     count = int(health.get("failures", 0)) + 1
-    if count == 1:
+    outage_active = bool(health.get("outage_active"))
+    if count == 1 and not outage_active:
         health["incident_id"] = uuid.uuid4().hex
         health["failure_notice_created"] = False
     delay = AUTH_RETRY_SECS if kind in {"auth", "configuration"} else (5 if count == 1 else 10)
     declared = count >= MAX_CONNECT_FAILURES
     health.update(state="failed", failure_kind=kind, failures=count,
-                  reconnect_exhausted=count >= MAX_CONNECT_FAILURES,
-                  next_attempt_at=now + delay, outage_active=declared)
+                  reconnect_exhausted=declared,
+                  next_attempt_at=now + delay, outage_active=outage_active or declared)
     if declared and not health.get("failure_notice_created"):
         if kind == "auth":
             text = ("审批监听认证失败，当前无法读取或提交审批。请在已登录 Muse 的浏览器安装凭证扩展，"
@@ -1059,7 +1072,7 @@ def _connection_failed(st, health, exc, now):
                     "请让 Muse 检查网络、依赖和连接状态，排除问题后通过受控运维方式恢复。")
         _health_notice(health, text, "failed")
         health["failure_notice_created"] = True
-    elif not declared:
+    elif not outage_active and not declared:
         log("approval health below declare threshold", count)
     save_state(st)
 
@@ -1136,6 +1149,7 @@ def _cycle_locked():
                 gw.close()
             except Exception as exc:
                 log("gateway close failed", type(exc).__name__)
+    _flush_decision_notices(st)
     _flush_health_notices(st, health)
     if err:
         log("cycle error", err)

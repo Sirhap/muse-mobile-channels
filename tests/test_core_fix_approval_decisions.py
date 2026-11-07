@@ -10,6 +10,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
 
@@ -94,6 +95,25 @@ class CoreSlashDecisionTests(unittest.TestCase):
         self.assertEqual(rows[0]["operator_id"], "alice")
         self.assertEqual(rows[0]["chat_id"], "alice")
         self.assertIn("已提交", self.reply_text())
+
+    def test_typed_decision_waits_for_relay_before_taking_sqlite_writer_lock(self):
+        from mobile_channels import gateway
+        original_lock = gateway._decisions_lock
+
+        @contextmanager
+        def relay_finishes_before_gateway_takes_decision_lock():
+            # The relay may be writing an approval notice while holding
+            # decisions.lock. Its SQLite writer must still be able to enter.
+            with sqlite3.connect(self.database, timeout=0) as relay_database:
+                relay_database.execute("BEGIN IMMEDIATE")
+            with original_lock():
+                yield
+
+        with mock.patch.object(gateway, "_decisions_lock", relay_finishes_before_gateway_takes_decision_lock):
+            self.binding.receive(message_id="m-ordered", sender_id="alice",
+                                 chat_id="alice", chat_type="single", text="/a 1")
+
+        self.assertEqual([row["decision"] for row in self.decisions()], ["allow_once"])
 
     def test_b_writes_allow_always_row(self):
         self.binding.receive(message_id="m-b2", sender_id="alice",

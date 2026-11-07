@@ -112,6 +112,7 @@ class DeliveryStore:
             existing = self.connection.execute(
                 "SELECT id,text FROM outbound_parts WHERE outbound_id=? ORDER BY part_index", (outbound_id,)
             ).fetchall()
+            existing = [row for row in existing if not row['id'].startswith(f'{outbound_id}:late:')]
             if existing:
                 if [row["text"] for row in existing] != chunks:
                     raise StateError("prepared segmentation is immutable")
@@ -234,7 +235,10 @@ class DeliveryStore:
                 # Preserve payloads already attempted by earlier versions. New
                 # parts acquire their source label once, immediately before IO.
                 text = row["text"]
-                if (row["token"] == 0 and row["part_index"] == 0
+                first_segment_part = (row['part_index'] == 0 or
+                                      (row['id'].startswith(f"{row['outbound_id']}:late:")
+                                       and row['id'].endswith(':0')))
+                if (row["token"] == 0 and first_segment_part
                         and row["generation"] < row["current_generation"]):
                     text = "补充此前对话的结果：\n" + text
                 self.connection.execute("INSERT INTO outbound_rendered_payloads VALUES (?,?)",
@@ -251,11 +255,12 @@ class DeliveryStore:
                 (row["id"], token, owner, self.store.clock(), "sending"),
             )
             self._aggregate(row["outbound_id"])
+            late_part = row['id'].startswith(f"{row['outbound_id']}:late:")
             try:
-                media = json.loads(row["message_media_json"] or "[]")
+                media = json.loads(row['media_json' if late_part else 'message_media_json'] or "[]")
             except (ValueError, TypeError, KeyError, IndexError):
                 media = []
-            if not isinstance(media, list) or row["part_index"] != 0:
+            if not isinstance(media, list) or (row["part_index"] != 0 and not late_part):
                 media = []
             return DeliveryClaim(row["id"], row["outbound_id"], owner, token, text,
                                  row["channel"], row["account_id"], row["chat_type"], row["chat_id"],

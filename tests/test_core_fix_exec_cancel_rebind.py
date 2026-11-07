@@ -20,7 +20,7 @@ from unittest.mock import Mock
 from mobile_channels.executors import DualTrackExecutor, GadgetExecutor, MuseExecutor
 from mobile_channels.ingress import CoreIngress
 from mobile_channels.models import StateError
-from mobile_channels.runtime import ExecutionContext
+from mobile_channels.runtime import CoreRunner, ExecutionContext
 from mobile_channels.storage import Store
 
 
@@ -140,6 +140,26 @@ class TestGadgetCancelHonesty(unittest.TestCase):
         self.assertEqual(out.state, "cancelled")
         self.assertIn("server_turn_may_continue", out.evidence or "")
 
+    def test_cancel_does_not_confirm_when_worker_is_still_alive(self):
+        fake = FakeWorkerClient()
+        fake.stop_turn = Mock(return_value=False)
+        ex = GadgetExecutor(self.store, client=fake)
+        ctx = make_context(self.store)
+        submitted = ex.submit(ctx)
+        self.assertEqual(ex.cancel(ctx, submitted.run_id).state, "unknown")
+
+    def test_local_only_cancel_receipt_explains_server_may_continue(self):
+        fake = FakeWorkerClient()
+        ex = GadgetExecutor(self.store, client=fake)
+        ctx = make_context(self.store)
+        submitted = ex.submit(ctx)
+        self.store.mark_submitted(ctx.claim, submitted.run_id)
+        self.store.request_cancel(ctx.claim.task_id, ctx.claim.conversation_id)
+        runner = CoreRunner(self.store, ex, "worker_1")
+        self.assertEqual(runner.tick(), "cancelled")
+        receipt = self.store.connection.execute("SELECT text FROM task_receipts").fetchone()
+        self.assertIn("Muse 端可能继续执行", receipt["text"])
+
 
 class TestRebindFailure(unittest.TestCase):
     def setUp(self):
@@ -165,10 +185,10 @@ class TestRebindFailure(unittest.TestCase):
         fake.results[ctx.claim.attempt_id] = {"state": "failed", "evidence": "boom"}
         return dual, ctx, fake
 
-    def test_rebind_state_error_becomes_failed_not_exception(self):
-        """rebind_run raising StateError must surface as failed + evidence,
-        never bubble out of query() into an unknown wedge."""
+    def test_rebind_state_error_preserves_native_run_for_recovery(self):
+        """A local rebind error cannot invalidate the accepted Native run."""
         dual, ctx, _ = self._dual_with_gadget_failed()
+        self.store.mark_submitted(ctx.claim, "worker:1001")
         real_rebind = self.store.rebind_run
 
         def _boom(claim, run_id):
@@ -179,8 +199,9 @@ class TestRebindFailure(unittest.TestCase):
             out = dual.query(ctx, "worker:1001")
         finally:
             self.store.rebind_run = real_rebind
-        self.assertEqual(out.state, "failed")
+        self.assertEqual(out.state, "unknown")
         self.assertIn("rebind", (out.evidence or "").lower())
+        self.assertEqual(dual.query(ctx, "worker:1001").state, "running")
 
     def test_fallback_submit_exception_becomes_failed_not_exception(self):
         """A fallback submit that raises must also surface as failed + evidence."""
@@ -189,6 +210,25 @@ class TestRebindFailure(unittest.TestCase):
         out = dual.query(ctx, "worker:1001")
         self.assertEqual(out.state, "failed")
         self.assertIn("fallback_submit_failed", out.evidence or "")
+
+    def test_recover_native_run_after_ownership_expires_during_rebind(self):
+        """A confirmed fallback already has a durable run and must not resend."""
+        now = [1000.0]
+        self.store.clock = lambda: now[0]
+        dual, ctx, _ = self._dual_with_gadget_failed()
+        self.store.mark_submitted(ctx.claim, "worker:1001")
+        submit = dual.fallback.submit
+        def submit_then_expire(context):
+            outcome = submit(context)
+            now[0] += 61
+            return outcome
+        dual.fallback.submit = Mock(side_effect=submit_then_expire)
+        runner = CoreRunner(self.store, dual, "worker_1")
+        self.assertEqual(runner.tick(), "ownership_lost")
+        self.assertEqual(runner.tick(), "running")
+        self.assertEqual(dual.fallback.submit.call_count, 1)
+        run_id = self.store.connection.execute("SELECT run_id FROM execution_attempts").fetchone()["run_id"]
+        self.assertEqual(run_id, "stream:7")
 
 
 if __name__ == "__main__":

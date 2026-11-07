@@ -7,10 +7,11 @@ import hashlib
 import json
 import logging
 import os
+import re
 import time
 import unicodedata
 import uuid
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 from .approvals import decision_allowed
@@ -28,12 +29,14 @@ LOGGER = logging.getLogger(__name__)
 # row shape and the identical first-submission-wins dedup.
 APPROVAL_RELAY_DIR = Path(os.environ.get(
     "APPROVAL_RELAY_DIR", "/home/hatch/workspace/approval-relay"))
-APPROVAL_LETTER_DECISIONS = {"a": "allow_once", "b": "allow_always",
-                             "c": "deny"}
+APPROVAL_COMMAND_DECISIONS = {"/a": "allow_once", "/b": "allow_always",
+                              "/c": "deny"}
 APPROVAL_DECISION_LABELS = {"allow_once": "批准（仅这次）",
                             "allow_always": "批准（永久）",
                             "deny": "拒绝"}
 APPROVAL_USAGE = "a=仅这次  b=永久  c=拒绝\n回 /a N｜/b N｜/c N"
+APPROVAL_WRITE_FAILED = "提交失败：暂时写不了审批指令，请稍后再试。"
+LEGACY_RANDOM_NOTICE_ID = re.compile(r"appr-.+-[0-9a-f]{8}")
 
 # Same shape as approval-relay's APPROVAL_NOTICES_DDL: the relay writes
 # pending rows here for core-mode channels, and the core delivery loop
@@ -51,6 +54,9 @@ APPROVAL_NOTICES_DDL = (
 # only refuses past ~50 MiB / 100 chunks; the 10 MiB cap is the
 # documented platform limit for a single media message).
 WECOM_OUTBOUND_MEDIA_MAX_BYTES = 10 * 1024 * 1024
+# Legacy WeChat allows 180s compression, 15s upload negotiation and
+# 300s CDN upload per file. Keep the owned delivery lease beyond that work.
+WEIXIN_MEDIA_PREPARE_SECONDS = 600
 
 
 class _PermanentMediaError(Exception):
@@ -144,7 +150,7 @@ def _append_decision_row(row):
 
 def _approval_decide_ack(num, decision, channel, operator_id="",
                          chat_id=""):
-    """Record an authorized decision with its trusted inbound identity.
+    """Record an authorized decision while the caller holds the decisions lock.
 
     Same row shape and dedup as the legacy gateways'
     slash_approval_decide_ack, so the relay's consume_decisions can
@@ -164,21 +170,14 @@ def _approval_decide_ack(num, decision, channel, operator_id="",
     if it.get("status") != "pending":
         return f"审批 #{num} 已经处理过了。"
     label = APPROVAL_DECISION_LABELS[decision]
-    # Check and append share one lock. Two channels can both observe
-    # "pending" and both append if this stays check-then-append.
-    try:
-        with _decisions_lock():
-            prev = _approval_pending_submission(num)
-            if prev is not None:
-                prev_label = APPROVAL_DECISION_LABELS.get(prev, prev)
-                return (f"审批 #{num} 已提交过（{prev_label}），"
-                        f"等执行结果就行，不用重复提交。")
-            wrote = _append_decision_row(decision_row)
-    except OSError:
-        wrote = False
-    if wrote:
+    prev = _approval_pending_submission(num)
+    if prev is not None:
+        prev_label = APPROVAL_DECISION_LABELS.get(prev, prev)
+        return (f"审批 #{num} 已提交过（{prev_label}），"
+                f"等执行结果就行，不用重复提交。")
+    if _append_decision_row(decision_row):
         return f"已提交{label} #{num}：{it.get('who', '')}。审批中转确认后会通知你；当前尚未确认生效。"
-    return "提交失败：暂时写不了审批指令，请稍后再试。"
+    return APPROVAL_WRITE_FAILED
 
 
 class GatewayBinding:
@@ -326,7 +325,19 @@ class GatewayBinding:
                         conv_id = row['conversation_id'] if row else ''
                     return IngestResult(conv_id, existing_task_id, False)
 
-        with Store(self.database) as store, store.transaction():
+        tokens = unicodedata.normalize("NFKC", text or "").lower().split()
+        with ExitStack() as stack:
+            approval_write_failed = False
+            if (len(tokens) > 1 and tokens[0] in APPROVAL_COMMAND_DECISIONS
+                    and _approval_ascii_number(tokens[1]) is not None):
+                # The relay takes the decisions lock before writing its
+                # SQLite notices. Use the same order for slash decisions.
+                try:
+                    stack.enter_context(_decisions_lock())
+                except OSError:
+                    approval_write_failed = True
+            store = stack.enter_context(Store(self.database))
+            stack.enter_context(store.transaction())
             ingress = CoreIngress(store, self.channel, self.account_id, self.settings['allowed_senders'])
             effective_text = text if (isinstance(text, str) and text.strip()) else ('[附件]' if media else (text or ''))
             item = ingress.receive(
@@ -359,7 +370,8 @@ class GatewayBinding:
                     (item.task_id, ext_id)
                 )
 
-            reply = self._command(store, item, text or '', media)
+            reply = (APPROVAL_WRITE_FAILED if approval_write_failed
+                     else self._command(store, item, tokens, media))
             if reply is not None:
                 store.complete_command(item.task_id, reply)
             return item
@@ -474,9 +486,14 @@ class GatewayBinding:
             return "当前没有排队或正在跑的任务。"
         labels = {"queued": "排队中", "claimed": "已认领", "running": "执行中", "reconciling": "对账中"}
         lines = ["当前聊天排队明细："]
-        for index, row in enumerate(rows, 1):
+        queue_index = 0
+        for row in rows:
+            prefix = "-"
+            if row["state"] == "queued":
+                queue_index += 1
+                prefix = f"{queue_index}."
             snippet = (row["text"] or "").strip().split("\n")[0][:24]
-            lines.append(f"{index}. [{labels.get(row['state'], row['state'])}] {snippet}")
+            lines.append(f"{prefix} [{labels.get(row['state'], row['state'])}] {snippet}")
         return "\n".join(lines)
 
     def _queue_clear_reply(self, store, item) -> str:
@@ -556,7 +573,7 @@ class GatewayBinding:
             lines.append(f"{name}：{'通过' if ok else '失败'}（{detail}）")
         return "\n".join(lines)
 
-    def _command(self, store, item, text: str, media: list | None = None) -> str | None:
+    def _command(self, store, item, tokens: list[str], media: list | None = None) -> str | None:
         """Execute only scoped core commands; never call global legacy administration.
 
         Commands are parsed as (command word, args), never exact
@@ -564,9 +581,6 @@ class GatewayBinding:
         A message with media is gated only when it is not a command:
         a command with an attachment still runs the command.
         """
-        raw = (text or "").strip()
-        normalized = unicodedata.normalize("NFKC", raw).lower()
-        tokens = normalized.split()
         word = tokens[0] if tokens else ""
         args = tokens[1:]
         if word in ("/new", "/新会话", "/stop", "/停止") or (
@@ -606,9 +620,8 @@ class GatewayBinding:
             return self._queue_reply(store, item)
         if word in ("/check", "/自检"):
             return self._check_reply(store)
-        if tokens and tokens[0] in ("/a", "/b", "/c"):
-            letter = tokens[0][1]
-            num = _approval_ascii_number(tokens[1] if len(tokens) > 1 else "")
+        if word in APPROVAL_COMMAND_DECISIONS:
+            num = _approval_ascii_number(args[0] if args else "")
             if num is None:
                 return APPROVAL_USAGE
             scope = store.connection.execute(
@@ -616,7 +629,7 @@ class GatewayBinding:
                 'JOIN inbound_messages m ON m.id=t.message_id WHERE t.id=?', (item.task_id,)).fetchone()
             operator_id = scope["sender_id"] if scope else ""
             chat_id = scope["chat_id"] if scope else ""
-            return _approval_decide_ack(num, APPROVAL_LETTER_DECISIONS[letter],
+            return _approval_decide_ack(num, APPROVAL_COMMAND_DECISIONS[word],
                                         self.channel, operator_id, chat_id)
         if word.startswith("/"):
             return "新核心当前支持 /ping /status /queue /new /stop /help /check /a /b /c。该命令尚未迁移，未执行；请联系管理员。"
@@ -649,8 +662,9 @@ class GatewayBinding:
                 "SELECT r.id,r.task_id,r.kind,r.text,c.chat_id,c.chat_type,"
                 "t.state AS task_state FROM task_receipts r "
                 "JOIN conversations c ON c.id=r.conversation_id "
-                "JOIN tasks t ON t.id=r.task_id "
-                "WHERE r.state='pending' ORDER BY r.created_at,r.id").fetchall()
+                "JOIN tasks t ON t.id=r.task_id AND t.conversation_id=c.id "
+                "WHERE r.state='pending' AND c.channel=? AND c.account_id=? "
+                "ORDER BY r.created_at,r.id", (self.channel, self.account_id)).fetchall()
         except Exception:
             LOGGER.exception("receipt delivery list failed")
             return counts
@@ -681,36 +695,35 @@ class GatewayBinding:
     def deliver_approval_notices(self, store, sender) -> dict:
         """Send this channel's pending approval_notices through sender.
 
-        Same sender shape as deliver_receipts. Dedup rule: when a
-        delivered row with the same (channel, chat_id, text) already
-        exists, a later pending duplicate is marked delivered without
-        being sent again — the relay can write a duplicate row when it
-        crashes between "row written" and "notified recorded". A failed
-        send stays pending for the next tick.
+        Event IDs are unique, and distinct events can repeat the same text.
+        Old random IDs retain text deduplication against other old rows.
+        A failed send stays pending for the next tick.
         Returns {"sent", "skipped", "failed"} counts.
         """
         counts = {"sent": 0, "skipped": 0, "failed": 0}
         try:
             rows = store.connection.execute(
-                "SELECT id,channel,chat_id,text FROM approval_notices "
+                "SELECT id,chat_id,text FROM approval_notices "
                 "WHERE channel=? AND state='pending' ORDER BY created_at,id",
                 (self.channel,)).fetchall()
-            delivered = {(r["channel"], r["chat_id"], r["text"]) for r in store.connection.execute(
-                "SELECT channel,chat_id,text FROM approval_notices WHERE state='delivered'").fetchall()}
         except Exception:
             return counts
         for row in rows:
-            key = (row["channel"], row["chat_id"], row["text"])
-            if key in delivered:
-                self._mark_notice_delivered(store, row["id"])
-                counts["skipped"] += 1
-                continue
+            if LEGACY_RANDOM_NOTICE_ID.fullmatch(row["id"]):
+                previous = store.connection.execute(
+                    "SELECT id FROM approval_notices WHERE channel=? AND chat_id=? "
+                    "AND text=? AND state='delivered'",
+                    (self.channel, row["chat_id"], row["text"]))
+                if any(LEGACY_RANDOM_NOTICE_ID.fullmatch(notice["id"]) for notice in previous):
+                    self._mark_notice_delivered(store, row["id"])
+                    counts["skipped"] += 1
+                    continue
             if not (row["chat_id"] or "").strip():
                 counts["failed"] += 1
                 continue
             conv = store.connection.execute(
-                "SELECT chat_type FROM conversations WHERE channel=? AND chat_id=? LIMIT 1",
-                (row["channel"], row["chat_id"])).fetchone()
+                "SELECT chat_type FROM conversations WHERE channel=? AND account_id=? AND chat_id=? LIMIT 1",
+                (self.channel, self.account_id, row["chat_id"])).fetchone()
             chat_type = conv["chat_type"] if conv is not None else "single"
             try:
                 ok = bool(sender(row["chat_id"], chat_type, row["text"], ""))
@@ -719,7 +732,6 @@ class GatewayBinding:
                 ok = False
             if ok:
                 self._mark_notice_delivered(store, row["id"])
-                delivered.add(key)
                 counts["sent"] += 1
             else:
                 counts["failed"] += 1
@@ -728,22 +740,29 @@ class GatewayBinding:
     async def _upload_outbound_media(self, gateway, item):
         """Upload one outbound media item; returns (media_id, kind).
 
-        Raises _PermanentMediaError for a missing file, an unknown kind
-        or an over-cap payload (the caller turns those into a rejection
-        + delivery_failed receipt); any other error propagates as
-        transient so the part retries without anything having been sent.
+        Rejects disallowed paths and files over the upload limit before
+        sending anything. Upload failures can retry cleanly.
         """
         kind = str((item or {}).get("kind") or "").lower()
         if kind not in ("image", "video", "file"):
             raise _PermanentMediaError(f"unsupported outbound media kind: {kind or 'unknown'}")
-        path = (item or {}).get("path") or ""
-        filename = str((item or {}).get("filename") or (Path(path).name if path else "file"))
-        if not path:
+        path = (item or {}).get("path")
+        if not isinstance(path, str) or not Path(path).is_absolute():
             raise _PermanentMediaError("outbound media has no local path")
-        try:
-            data = await asyncio.to_thread(Path(path).read_bytes)
-        except FileNotFoundError:
-            raise _PermanentMediaError(f"outbound media file missing: {filename}") from None
+        filename = str((item or {}).get("filename") or Path(path).name)
+
+        def read_allowed_file() -> bytes:
+            """Validate the resolved file and read at most the upload limit plus one byte."""
+            try:
+                file_path = Path(path).resolve(strict=True)
+                if not gateway.allows_outbound_file(file_path):
+                    raise _PermanentMediaError("outbound media path is not allowed")
+                with file_path.open("rb") as source:
+                    return source.read(WECOM_OUTBOUND_MEDIA_MAX_BYTES + 1)
+            except (FileNotFoundError, RuntimeError, ValueError):
+                raise _PermanentMediaError("outbound media path could not be resolved") from None
+
+        data = await asyncio.to_thread(read_allowed_file)
         if len(data) > WECOM_OUTBOUND_MEDIA_MAX_BYTES:
             raise _PermanentMediaError(
                 f"outbound media {filename} exceeds the 10 MiB WeCom upload cap")
@@ -762,10 +781,33 @@ class GatewayBinding:
             if self.channel == 'weixin':
                 if route is None:
                     return SendOutcome('rejected', evidence='no authenticated inbound reply route')
-                result = await gateway.send_text(client, credentials, claim.chat_id, claim.text,
-                                                 context_token=route['context_token'],
-                                                 client_id='core-' + hashlib.sha256(claim.part_id.encode()).hexdigest()[:24])
-                success = isinstance(result, dict) and bool(result) and ('ret' in result or 'errcode' in result) and result.get('ret') in (None, 0) and result.get('errcode') in (None, 0)
+                media_items = []
+                for item in claim.media:
+                    try:
+                        media_items.append(await asyncio.wait_for(
+                            gateway.prepare_core_media(client, credentials, claim.chat_id, item),
+                            timeout=WEIXIN_MEDIA_PREPARE_SECONDS))
+                    except (FileNotFoundError, PermissionError, ValueError) as exc:
+                        return SendOutcome('rejected', evidence=f'weixin_media_invalid:{type(exc).__name__}')
+                    except Exception as exc:
+                        return SendOutcome('retry', evidence=f'weixin_upload_failed:{type(exc).__name__}', retry_after=30)
+                success = True
+                if claim.text.strip() or not media_items:
+                    result = await gateway.send_text(client, credentials, claim.chat_id, claim.text,
+                                                     context_token=route['context_token'],
+                                                     client_id='core-' + hashlib.sha256(claim.part_id.encode()).hexdigest()[:24])
+                    success = isinstance(result, dict) and bool(result) and ('ret' in result or 'errcode' in result) and result.get('ret') in (None, 0) and result.get('errcode') in (None, 0)
+                if success:
+                    for index, media in enumerate(media_items):
+                        media_client_id = 'core-' + hashlib.sha256(f'{claim.part_id}:media:{index}'.encode()).hexdigest()[:24]
+                        result = await gateway._send_items(client, credentials, claim.chat_id, [media],
+                                                           context_token=route['context_token'],
+                                                           client_id=media_client_id)
+                        if not (isinstance(result, dict) and bool(result)
+                                and ('ret' in result or 'errcode' in result)
+                                and result.get('ret') in (None, 0) and result.get('errcode') in (None, 0)):
+                            success = False
+                            break
             elif self.channel == 'feishu':
                 # 原生请求级 uuid 幂等键：由 part_id 生成确定性 UUID
                 part_uuid = str(uuid.uuid5(uuid.NAMESPACE_URL, f"muse:claim:{claim.part_id}"))
@@ -789,8 +831,7 @@ class GatewayBinding:
                     result = {'code': -1, 'msg': 'unsupported feishu gateway'}
                 success = isinstance(result, dict) and result.get('code') == 0
             else:
-                # Outbound media (WeCom only; the Weixin branch has no
-                # media send path yet). Order is deliberate: (1) upload
+                # Outbound media on WeCom. Order is deliberate: (1) upload
                 # everything BEFORE any platform send, so a transient
                 # upload failure can retry cleanly — nothing was sent
                 # yet, so no duplicate. A permanent failure (missing
@@ -871,19 +912,28 @@ class GatewayBinding:
             with Store(self.database) as store:
                 def transport(claim):
                     route = None
+                    timeout = 30
                     if self.channel == 'weixin':
                         route = store.connection.execute(
                             'SELECT r.context_token FROM gateway_routes r JOIN outbound_messages o ON o.task_id=r.task_id WHERE o.id=?',
                             (claim.outbound_id,),
                         ).fetchone()
+                        if claim.media:
+                            timeout += len(claim.media) * (WEIXIN_MEDIA_PREPARE_SECONDS + 30)
+                            with store.transaction():
+                                runner.delivery._owned(claim)
+                                store.connection.execute(
+                                    "UPDATE outbound_parts SET lease_until=? WHERE id=? AND token=?",
+                                    (store.clock() + timeout + 30, claim.part_id, claim.token))
                     future = asyncio.run_coroutine_threadsafe(send(claim, route), loop)
                     try:
-                        return future.result(timeout=30)
+                        return future.result(timeout=timeout)
                     except BaseException:
                         future.cancel()
                         raise
-                outcome = DeliveryRunner(store, transport, owner, chunk_limit=1000,
-                                         channel=self.channel, account_id=self.account_id).tick()
+                runner = DeliveryRunner(store, transport, owner, chunk_limit=1000,
+                                        channel=self.channel, account_id=self.account_id)
+                outcome = runner.tick()
 
                 def sender(chat_id, chat_type, text, context_token):
                     future = asyncio.run_coroutine_threadsafe(

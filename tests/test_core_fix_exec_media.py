@@ -11,9 +11,9 @@ contract:
   items, and the Native _open passes the body JSON through verbatim).
 - Video/file media on the Native track is NOT silently dropped: submit
   fails explicitly before opening any stream.
-- GadgetExecutor.submit never silently drops media either: it fails
-  explicitly (the Gadget worker's sendMessage is text-only), and
-  DualTrackExecutor routes media-bearing tasks straight to the Native track.
+- GadgetExecutor.submit passes supported images together with text through
+  the Worker SDK. DualTrackExecutor prefers Gadget for supported images
+  and preserves Native routing for other media.
 - ExecutionOutcome carries media: list[dict] {kind, path, filename};
   [[FILE:...]] markers are parsed out of text into media, never left in text.
 """
@@ -59,7 +59,8 @@ class FakeWorkerClient:
     def is_configured(self):
         return True
 
-    def start_turn(self, attempt_id, session_id, text, timeout_seconds=None):
+    def start_turn(self, attempt_id, session_id, text, timeout_seconds=None, *, images=None):
+        self.images = images
         self._next_pid += 1
         self.alive.add(self._next_pid)
         self.started.append((attempt_id, session_id, text))
@@ -202,17 +203,26 @@ class TestGadgetMediaRouting(unittest.TestCase):
         self.png = Path(self.temp_dir.name) / "shot.png"
         self.png.write_bytes(b"\x89PNG\r\n\x1a\nfake-png-bytes")
 
-    def test_gadget_submit_with_media_fails_explicitly_and_spawns_nothing(self):
+    def test_gadget_submit_preserves_images_in_worker_input(self):
         fake = FakeWorkerClient()
         ex = GadgetExecutor(self.store, client=fake)
         ctx = with_media(make_context(self.store), [
             {"kind": "image", "path": str(self.png), "filename": "shot.png"}])
         out = ex.submit(ctx)
+        self.assertEqual(out.state, "accepted")
+        self.assertEqual(base64.b64decode(fake.images[0]["data_base64"]), self.png.read_bytes())
+        self.assertEqual(fake.images[0]["mime_type"], "image/png")
+
+    def test_gadget_rejects_oversized_images_before_spawning(self):
+        self.png.write_bytes(b"x" * (2 * 1024 * 1024 + 1))
+        fake = FakeWorkerClient()
+        ctx = with_media(make_context(self.store), [
+            {"kind": "image", "path": str(self.png), "filename": "shot.png"}])
+        out = GadgetExecutor(self.store, client=fake).submit(ctx)
         self.assertEqual(out.state, "failed")
-        self.assertIn("gadget_media", out.evidence or "")
         self.assertEqual(fake.started, [])
 
-    def test_dual_track_routes_media_tasks_straight_to_native(self):
+    def test_dual_track_routes_supported_images_to_gadget(self):
         fake = FakeWorkerClient()
         primary = GadgetExecutor(self.store, client=fake)
         native_client = FakeNativeClient([[], [user_event(1)], [user_event(1)]])
@@ -222,10 +232,8 @@ class TestGadgetMediaRouting(unittest.TestCase):
             {"kind": "image", "path": str(self.png), "filename": "shot.png"}])
         out = dual.submit(ctx)
         self.assertEqual(out.state, "accepted")
-        self.assertEqual(fake.started, [])
-        self.assertEqual(len(native_client.opened_bodies), 1)
-        items = native_client.opened_bodies[0]["items"]
-        self.assertTrue(any(i.get("type") == "image" for i in items))
+        self.assertEqual(len(fake.started), 1)
+        self.assertEqual(native_client.opened_bodies, [])
 
 
 if __name__ == "__main__":

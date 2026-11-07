@@ -20,17 +20,17 @@
 // (client.js / credentials.js) is mocked. No network, no production
 // files, no real credentials: everything runs in a temp dir.
 // Run via: bun test tests/gadget_turn_history_fallback.test.ts
-import { describe, expect, mock, test } from 'bun:test';
+import { describe, expect, test } from 'bun:test';
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-
-const REF = join(import.meta.dir, '..', 'reference', 'muse-client', 'src');
+import { configureWorkerMock } from './gadget_worker_mocks';
 
 type ChatEvent = { type: 'event'; event: string; seq?: number; payload: Record<string, unknown>; raw: Record<string, unknown> };
 
 // Switch: whether the mocked subscription ever delivers the terminal event.
 let deliverTerminal = false;
+let replyText = '收到';
 
 function event(name: string, payload: Record<string, unknown>, seq: number): ChatEvent {
   return { type: 'event', event: name, seq, payload, raw: { ...payload } };
@@ -39,10 +39,10 @@ function event(name: string, payload: Record<string, unknown>, seq: number): Cha
 async function* stalledSubscription(): AsyncGenerator<ChatEvent> {
   yield event('task.status', { session_id: 'sess-1', status: 'running', task_id: 'task-1' }, 1);
   yield event('delta.text_append', {
-    session_id: 'sess-1', message_id: 'a-1', reply_to_message_id: 'u-1', text: '收到',
+    session_id: 'sess-1', message_id: 'a-1', reply_to_message_id: 'u-1', text: replyText,
   }, 2);
   yield event('delta.message_done', {
-    session_id: 'sess-1', message_id: 'a-1', reply_to_message_id: 'u-1', display_text: '收到',
+    session_id: 'sess-1', message_id: 'a-1', reply_to_message_id: 'u-1', display_text: replyText,
   }, 3);
   if (deliverTerminal) {
     yield event('task.status', { session_id: 'sess-1', status: 'completed', task_id: 'task-1' }, 4);
@@ -65,21 +65,11 @@ const fakeClient = {
   close: () => {},
 };
 
-mock.module(join(REF, 'client.js'), () => ({
-  MuseClient: class {
-    static async connect() {
-      return fakeClient;
-    }
-  },
-}));
-mock.module(join(REF, 'credentials.js'), () => ({
-  loadCredentials: async () => ({}),
-  saveCredentials: async () => {},
-}));
 // NOTE: turn.js is deliberately NOT mocked here: the stall lives in the
 // real MuseTurn completion rules.
 
 async function runWorkerMain(timeoutSeconds: number) {
+  configureWorkerMock(() => fakeClient);
   const { main } = await import('../mobile_channels/gadget_worker/turn.ts');
   const dir = mkdtempSync(join(tmpdir(), 'gadget-stall-repro-'));
   const messageFile = join(dir, 'msg.txt');
@@ -114,10 +104,25 @@ describe('Gadget subscription-terminal stall (repro)', () => {
 
   test('control: terminal event present completes promptly', async () => {
     deliverTerminal = true;
+    replyText = '收到';
     const { code, result, elapsedMs } = await runWorkerMain(5);
     expect(code).toBe(0);
     expect(result.state).toBe('succeeded');
     expect(result.text).toBe('收到');
+    expect(result.ack_message_id).toBe('u-1');
+    expect(result.reply_message_ids).toEqual(['a-1']);
     expect(elapsedMs).toBeLessThan(5000);
+  }, 30000);
+
+  test('completed attachment without caption is a successful worker result', async () => {
+    deliverTerminal = true;
+    replyText = '[[FILE:/workspace/report.pdf]]';
+    const { code, result } = await runWorkerMain(5);
+    expect(code).toBe(0);
+    expect(result.state).toBe('succeeded');
+    expect(result.text).toBe('');
+    expect(result.media).toEqual([
+      { kind: 'file', path: '/workspace/report.pdf', filename: 'report.pdf' },
+    ]);
   }, 30000);
 });

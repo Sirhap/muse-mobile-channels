@@ -44,47 +44,153 @@ resolve_install_home() {
   printf '%s\n' "$HOME"
 }
 
+core_mode_requested() {
+  # An absent file or an explicit legacy mode is a normal opt-out.
+  local modes="$1/state/channel-modes.json"
+  [[ -e "$modes" ]] || return 1
+  python3 - "$modes" <<'PYEOF'
+import json, sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+sys.path.insert(0, str(path.parents[1]))
+try:
+    from mobile_channels.modes import ModeError, validate_settings
+except ImportError:
+    print('channel-restore: FAIL cannot validate core configuration', file=sys.stderr)
+    sys.exit(2)
+
+try:
+    channels = json.loads(path.read_text())['channels']
+    wecom = channels.get('wecom')
+    if wecom is None:
+        sys.exit(1)
+    validate_settings('wecom', wecom)
+    if wecom['mode'] != 'core':
+        sys.exit(1)
+    if not Path(wecom['database']).is_file():
+        raise ModeError('core database does not exist')
+except (AttributeError, KeyError, ModeError, OSError, TypeError, ValueError):
+    print('channel-restore: FAIL invalid WeCom core configuration or missing database', file=sys.stderr)
+    sys.exit(2)
+PYEOF
+}
+
+gateway_selected() {
+  # An existing service should still be repaired if its credentials are lost.
+  [[ -f "$2/.config/$1/credentials.env" || -f "$3/$1.service" ]]
+}
+
+render_dropin() {
+  # Preserve local overrides while adapting the shipped mode path to this home.
+  local content modes="$2/state/channel-modes.json"
+  content="$(cat "$1")" || return 1
+  modes="${modes//\\/\\\\}"
+  modes="${modes//\"/\\\"}"
+  printf '%s\n' "${content//\/home\/hatch\/workspace\/state\/channel-modes.json/"$modes"}"
+}
+
+render_unit() {
+  # Render shipped absolute paths; preserve locally edited command arguments.
+  python3 - "$1" "$2" <<'PYEOF'
+import json, shlex, sys
+from pathlib import Path
+
+source, workspace = map(Path, sys.argv[1:])
+home = str(workspace.parent)
+database = None
+if source.name == 'muse-core-run.service':
+    database = json.loads((workspace / 'state/channel-modes.json').read_text())['channels']['wecom']['database']
+
+def quote(value):
+    return '"' + value.replace('\\', '\\\\').replace('"', '\\"').replace('%', '%%') + '"'
+
+for line in source.read_text().splitlines():
+    key, separator, value = line.partition('=')
+    if separator and ('/home/hatch' in value or (key == 'ExecStart' and database is not None)):
+        if key == 'ExecStart':
+            arguments = [argument.replace('/home/hatch', home) for argument in shlex.split(value)]
+            if database is not None:
+                arguments[arguments.index('--database') + 1] = database
+            value = ' '.join(quote(argument) for argument in arguments)
+        elif key in ('Environment', 'EnvironmentFile', 'WorkingDirectory'):
+            value = quote(value.strip('"').replace('/home/hatch', home))
+        else:
+            value = value.replace('/home/hatch', home)
+        line = key + '=' + value
+    print(line)
+PYEOF
+}
+
 install_unit() {
   local src="$1"
-  local name
+  local name content temporary
   name="$(basename "$src")"
   local dst="/etc/systemd/system/$name"
   if [[ ! -f "$src" ]]; then
     echo "channel-restore: FAIL unit copy missing: $src"
     return 1
   fi
-  if [[ ! -f "$dst" ]] || ! cmp -s "$src" "$dst"; then
-    cp "$src" "$dst" && echo "channel-restore: installed $name"
-    RELOAD=1
+  content="$(render_unit "$src" "$WS")" || return 1
+  if [[ ! -f "$dst" ]] || ! printf '%s\n' "$content" | cmp -s - "$dst"; then
+    touch "/etc/systemd/system/.muse-reload-pending" || return 1
+    temporary="$(mktemp "/etc/systemd/system/.muse-unit.XXXXXX")" || return 1
+    if ! printf '%s\n' "$content" > "$temporary" ||
+        ! chmod 0644 "$temporary" || ! mv -f "$temporary" "$dst"; then
+      rm -f "$temporary"
+      return 1
+    fi
+    echo "channel-restore: installed $name"
   fi
   return 0
 }
 
+reload_units() {
+  # Retain the reload obligation when daemon-reload fails after a copy.
+  local marker="/etc/systemd/system/.muse-reload-pending"
+  [[ -f "$marker" ]] || return 0
+  systemctl daemon-reload && rm -f "$marker"
+}
+
 install_dropins() {
-  # Sync a service's systemd drop-in overrides from the workspace copy.
-  # A drop-in carries the MUSE_CHANNEL_MODES env that selects core mode;
-  # without it the service stays active yet silently legacy (seen
-  # 2026-11-07: the 12:43 replacement wiped /etc drop-ins and both
-  # services ran legacy for 24 minutes). Sets DROPIN_CHANGED=1 (and
-  # RELOAD=1) when any file was (re)installed, so the caller can
-  # daemon-reload and restart the service. Services without a workspace
-  # drop-in dir (e.g. weixin-bot, legacy by design) are untouched.
-  # $1 = service name, $2 = workspace drop-in dir, relative to $WS.
-  local svc="$1" srcdir="$WS/$2"
+  # Save the restart obligation before replacing files so a failed restart
+  # or interrupted restore is retried even when the files now match.
+  local svc="$1" srcdir="$WS/channel-restore/$1.service.d"
   local dstdir="/etc/systemd/system/$svc.service.d"
-  [[ -d "$srcdir" ]] || return 0
-  mkdir -p "$dstdir"
-  local src dst
+  local src dst content temporary
+  [[ "$CORE_CONFIGURED" == "1" && -d "$srcdir" ]] || return 0
   for src in "$srcdir"/*.conf; do
     [[ -f "$src" ]] || continue
     dst="$dstdir/$(basename "$src")"
-    if [[ ! -f "$dst" ]] || ! cmp -s "$src" "$dst"; then
-      cp "$src" "$dst" && echo "$svc: drop-in (re)installed: $(basename "$src")"
-      DROPIN_CHANGED=1
-      RELOAD=1
+    content="$(render_dropin "$src" "$WS")" || return 1
+    if [[ ! -f "$dst" ]] || ! printf '%s\n' "$content" | cmp -s - "$dst"; then
+      mkdir -p "$dstdir" && touch "$dstdir/.muse-restart-pending" || return 1
+      temporary="$(mktemp "$dstdir/.muse-dropin.XXXXXX")" || return 1
+      if ! printf '%s\n' "$content" > "$temporary" ||
+          ! chmod 0644 "$temporary" || ! mv -f "$temporary" "$dst"; then
+        rm -f "$temporary"
+        return 1
+      fi
+      echo "$svc: drop-in (re)installed: $(basename "$src")"
     fi
   done
   return 0
+}
+
+apply_pending_dropins() {
+  local svc="$1" marker="/etc/systemd/system/$1.service.d/.muse-restart-pending"
+  [[ "$CORE_CONFIGURED" == "1" && -f "$marker" ]] || return 0
+  if ! systemctl daemon-reload || ! systemctl restart "$svc"; then
+    echo "$svc: FAIL could not apply drop-in; will retry"
+    return 1
+  fi
+  sleep 3
+  if ! systemctl is-active --quiet "$svc"; then
+    echo "$svc: FAIL inactive after drop-in restart; will retry"
+    return 1
+  fi
+  rm -f "$marker" || return 1
+  echo "$svc: restarted (drop-in changed)"
 }
 
 ensure_hatch_tree() {
@@ -103,7 +209,6 @@ ensure_hatch_tree() {
 heal_one() {
   local svc="$1" proj="$2" cred="$3"
   local src="$WS/$proj/$svc.service"
-  local dst="/etc/systemd/system/$svc.service"
 
   if [[ ! -x "$WS/$proj/.venv/bin/python" ]]; then
     echo "$svc: FAIL venv python missing at $WS/$proj/.venv/bin/python"
@@ -116,20 +221,9 @@ heal_one() {
     echo "$svc: FAIL workspace unit copy missing: $src"
     return 1
   fi
-  if [[ ! -f "$dst" ]] || ! cmp -s "$src" "$dst"; then
-    cp "$src" "$dst" && echo "$svc: unit (re)installed from workspace copy"
-    RELOAD=1
-  fi
-  # Drop-in overrides (core-mode env) live beside the unit copy in
-  # channel-restore/. A changed drop-in must restart the service: a
-  # running process keeps the environment it started with, so install
-  # + reload alone would leave it silently legacy.
-  DROPIN_CHANGED=0
-  install_dropins "$svc" "channel-restore/$svc.service.d"
-  if [[ "$RELOAD" == "1" ]]; then
-    systemctl daemon-reload
-    RELOAD=0
-  fi
+  install_unit "$src" || return 1
+  install_dropins "$svc" || return 1
+  reload_units || return 1
   # Only the first time the tree is still root-owned. Repeating chown
   # on a large media directory every 5 minutes stalls the healer.
   ensure_hatch_tree "$WS/$proj/state"
@@ -137,11 +231,9 @@ heal_one() {
   if ! systemctl is-enabled --quiet "$svc" 2>/dev/null; then
     systemctl enable "$svc" >/dev/null 2>&1 && echo "$svc: enabled"
   fi
+  apply_pending_dropins "$svc" || return 1
   if ! systemctl is-active --quiet "$svc" 2>/dev/null; then
     systemctl start "$svc" 2>/dev/null && echo "$svc: started"
-    sleep 3
-  elif [[ "$DROPIN_CHANGED" == "1" ]]; then
-    systemctl restart "$svc" 2>/dev/null && echo "$svc: restarted (drop-in changed)"
     sleep 3
   fi
   if systemctl is-active --quiet "$svc" 2>/dev/null; then
@@ -169,7 +261,6 @@ heal_bridge() {
   local WS="$1" HOME_DIR="$2"
   local svc=native-bridge
   local src="$WS/native-bridge/native-bridge.service"
-  local dst="/etc/systemd/system/$svc.service"
   if [[ ! -x "$HOME_DIR/muse-test-venv/bin/python" ]]; then
     echo "$svc: FAIL venv python missing at $HOME_DIR/muse-test-venv/bin/python"
     return 1
@@ -181,10 +272,8 @@ heal_bridge() {
     echo "$svc: FAIL workspace unit copy missing: $src"
     return 1
   fi
-  if [[ ! -f "$dst" ]] || ! cmp -s "$src" "$dst"; then
-    cp "$src" "$dst" && echo "$svc: unit (re)installed from workspace copy"
-    systemctl daemon-reload
-  fi
+  install_unit "$src" || return 1
+  reload_units || return 1
   if ! systemctl is-enabled --quiet "$svc" 2>/dev/null; then
     systemctl enable "$svc" >/dev/null 2>&1 && echo "$svc: enabled"
   fi
@@ -224,16 +313,21 @@ main() {
   local HOME_DIR
   HOME_DIR="$(resolve_install_home)"
   local WS="$HOME_DIR/workspace"
+  local UNIT_DIR="/etc/systemd/system"
   local FAIL=0
-  local RELOAD=0
-  local DROPIN_CHANGED=0
+  local CORE_CONFIGURED=0
+  # The timer and inbox hooks can call restore concurrently.
+  exec 8>"$UNIT_DIR/.muse-channel-restore.lock" || return 1
+  flock -n -E 75 8 || { [[ "$?" == "75" ]] && return 0; return 1; }
+  if core_mode_requested "$WS"; then
+    CORE_CONFIGURED=1
+  elif [[ "$?" != "1" ]]; then
+    return 1
+  fi
 
   install_unit "$WS/channel-restore/channel-restore.service" || FAIL=1
   install_unit "$WS/channel-restore/channel-restore.timer" || FAIL=1
-  if [[ "$RELOAD" == "1" ]]; then
-    systemctl daemon-reload
-    RELOAD=0
-  fi
+  reload_units || return 1
   if ! systemctl is-enabled --quiet channel-restore.timer 2>/dev/null; then
     systemctl enable channel-restore.timer >/dev/null 2>&1 && echo "channel-restore: timer enabled"
   fi
@@ -241,11 +335,17 @@ main() {
     systemctl start channel-restore.timer >/dev/null 2>&1 && echo "channel-restore: timer started"
   fi
 
-  heal_one wecom-bot wecom-bot "$HOME_DIR/.config/wecom-bot/credentials.env" || FAIL=1
-  heal_one weixin-bot weixin-bot "$HOME_DIR/.config/weixin-bot/credentials.env" || FAIL=1
+  if [[ "$CORE_CONFIGURED" == "1" ]]; then
+    heal_core_run "$WS" "$HOME_DIR" || FAIL=1
+  fi
+  if [[ "$CORE_CONFIGURED" == "1" ]] || gateway_selected wecom-bot "$HOME_DIR" "$UNIT_DIR"; then
+    heal_one wecom-bot wecom-bot "$HOME_DIR/.config/wecom-bot/credentials.env" || FAIL=1
+  fi
+  if gateway_selected weixin-bot "$HOME_DIR" "$UNIT_DIR"; then
+    heal_one weixin-bot weixin-bot "$HOME_DIR/.config/weixin-bot/credentials.env" || FAIL=1
+  fi
   heal_bridge "$WS" "$HOME_DIR" || FAIL=1
   heal_relay "$WS" "$HOME_DIR" || FAIL=1
-  heal_core_run "$WS" "$HOME_DIR" || FAIL=1
 
   # Outbound delivery probe (2026-10-14): process-alive is not the
   # same as can-deliver — a channel whose sends keep failing (e.g.
@@ -266,28 +366,19 @@ heal_relay() {
   local WS="$1" HOME_DIR="$2"
   local svc=approval-relay
   local src="$WS/approval-relay/approval-relay.service"
-  local dst="/etc/systemd/system/$svc.service"
   if [[ ! -f "$src" ]]; then
     echo "$svc: FAIL workspace unit copy missing: $src"
     return 1
   fi
-  local changed=0
-  if [[ ! -f "$dst" ]] || ! cmp -s "$src" "$dst"; then
-    cp "$src" "$dst" && echo "$svc: unit (re)installed from workspace copy"
-    changed=1
-  fi
-  DROPIN_CHANGED=0
-  install_dropins "$svc" "channel-restore/$svc.service.d"
-  if [[ "$changed" == "1" || "$DROPIN_CHANGED" == "1" ]]; then
-    systemctl daemon-reload
-  fi
+  install_unit "$src" || return 1
+  reload_units || return 1
+  install_dropins "$svc" || return 1
   if ! systemctl is-enabled --quiet "$svc" 2>/dev/null; then
     systemctl enable "$svc" >/dev/null 2>&1 && echo "$svc: enabled"
   fi
+  apply_pending_dropins "$svc" || return 1
   if ! systemctl is-active --quiet "$svc" 2>/dev/null; then
     systemctl start "$svc" 2>/dev/null && echo "$svc: started"
-  elif [[ "$DROPIN_CHANGED" == "1" ]]; then
-    systemctl restart "$svc" 2>/dev/null && echo "$svc: restarted (drop-in changed)"
   fi
   systemctl is-active --quiet "$svc" 2>/dev/null && echo "$svc: active"
 }
@@ -302,7 +393,6 @@ heal_core_run() {
   local WS="$1" HOME_DIR="$2"
   local svc=muse-core-run
   local src="$WS/channel-restore/muse-core-run.service"
-  local dst="/etc/systemd/system/$svc.service"
   if [[ ! -x "$HOME_DIR/muse-test-venv/bin/python" ]]; then
     echo "$svc: FAIL venv python missing at $HOME_DIR/muse-test-venv/bin/python"
     return 1
@@ -311,10 +401,8 @@ heal_core_run() {
     echo "$svc: FAIL workspace unit copy missing: $src"
     return 1
   fi
-  if [[ ! -f "$dst" ]] || ! cmp -s "$src" "$dst"; then
-    cp "$src" "$dst" && echo "$svc: unit (re)installed from workspace copy"
-    systemctl daemon-reload
-  fi
+  install_unit "$src" || return 1
+  reload_units || return 1
   if ! systemctl is-enabled --quiet "$svc" 2>/dev/null; then
     systemctl enable "$svc" >/dev/null 2>&1 && echo "$svc: enabled"
   fi

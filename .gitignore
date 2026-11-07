@@ -29,6 +29,9 @@ id_dsa*
 # Credential and secret files
 credentials.env
 .env
+.env.*
+!.env.example
+!.env.sample
 *.env
 cookies.txt
 cookies.json
@@ -69,6 +72,9 @@ __pycache__/
 .venv/
 venv/
 *.egg-info/
+build/
+dist/
+node_modules/
 *.log
 *.bak
 *.bak-*

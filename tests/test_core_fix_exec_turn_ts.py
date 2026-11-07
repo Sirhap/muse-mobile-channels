@@ -1,8 +1,7 @@
 """Unittest wrapper for the Gadget worker bun tests (items 1 + 4).
 
-Runs tests/gadget_turn.test.ts (turn.ts helpers + send-failure branches
-with a mocked reference client) through bun and fails when any bun test
-fails. The bun file itself holds the real assertions.
+Runs both Gadget worker suites in one Bun process, including the real
+MuseTurn timeout reproduction, so module mocks must remain compatible.
 """
 from __future__ import annotations
 
@@ -26,7 +25,8 @@ class TestGadgetTurnTs(unittest.TestCase):
     def test_bun_turn_tests_pass(self):
         root = Path(__file__).resolve().parents[1]
         proc = subprocess.run(
-            [_resolve_bun(), "test", str(root / "tests" / "gadget_turn.test.ts")],
+            [_resolve_bun(), "test", str(root / "tests" / "gadget_turn.test.ts"),
+             str(root / "tests" / "gadget_turn_history_fallback.test.ts")],
             cwd=root, capture_output=True, text=True, timeout=120,
         )
         self.assertEqual(proc.returncode, 0,

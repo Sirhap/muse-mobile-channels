@@ -14,7 +14,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from mobile_channels.executors import GadgetExecutor, MuseExecutor
 from mobile_channels.ingress import CoreIngress
@@ -183,6 +183,55 @@ class TestNativeMultiReply(unittest.TestCase):
         self.assertEqual(out.text, "only one")
         self.assertEqual(out.media, [])
 
+    def test_query_keeps_polling_through_one_quiet_round(self):
+        """The second part may arrive between 1s and 2s after the first."""
+        user = user_event(1)
+        first = assistant(2, "first part")
+        client = FakeNativeClient([
+            [], [user], [user, first], [user, first],
+            [user, first, assistant(3, f"[[FILE:{self.video}]]")],
+        ])
+        ctx, ex = self._submit(client)
+        with patch("mobile_channels.executors.time.sleep"):
+            out = ex.query(ctx, "stream:7")
+        self.assertEqual(out.state, "succeeded")
+        self.assertEqual(out.media[0]["path"], str(self.video))
+
+    def test_query_succeeds_with_media_only(self):
+        """An attachment is a deliverable reply even when it has no caption."""
+        user = user_event(1)
+        client = FakeNativeClient([
+            [], [user], [user, assistant(2, f"[[FILE:{self.video}]]")],
+        ])
+        ctx, ex = self._submit(client)
+        with patch("mobile_channels.executors.time.sleep"):
+            out = ex.query(ctx, "stream:7")
+        self.assertEqual((out.state, out.text), ("succeeded", ""))
+        self.assertEqual(out.media[0]["path"], str(self.video))
+
+    def test_completed_reply_retains_history_identity_for_late_followups(self):
+        """The reply cursor identifies already-delivered messages after restart."""
+        user = user_event(10)
+        user["message_id"] = "u-current"
+        first = assistant(11, "first answer")
+        first["message_id"] = "a-first"
+        client = FakeNativeClient([[], [user], [user, first]])
+        ctx, ex = self._submit(client)
+        with patch("mobile_channels.executors.time.sleep"):
+            out = ex.query(ctx, "stream:7")
+        self.assertEqual(out.reply_watch["ack_id"], "u-current")
+        self.assertEqual(out.reply_watch["seen_ids"], ["a-first"])
+        self.assertEqual(out.reply_watch["session_id"], "sess-1")
+
+    def test_query_does_not_finish_while_another_segment_is_active(self):
+        """History still exposes ongoing reply generation after the first part."""
+        user = user_event(1)
+        events = [user, assistant(2, "first"), assistant(3, "working", "running")]
+        client = FakeNativeClient([[], [user], events])
+        ctx, ex = self._submit(client)
+        with patch("mobile_channels.executors.time.sleep"):
+            self.assertEqual(ex.query(ctx, "stream:7").state, "running")
+
 
 class TestUnknownEvidence(unittest.TestCase):
     def setUp(self):
@@ -205,13 +254,13 @@ class TestUnknownEvidence(unittest.TestCase):
         self.assertTrue(out.evidence, "unknown without evidence is uncountable")
 
     def test_native_submit_exception_carries_evidence(self):
-        """An exception during submit must not become a bare unknown."""
+        """A failure before opening the stream proves no user task was sent."""
         client = Mock()
         client.call_json.side_effect = RuntimeError("boom-history")
         ctx = make_context(self.store)
         out = MuseExecutor(self.store, client_factory=lambda: client).submit(ctx)
-        self.assertEqual(out.state, "unknown")
-        self.assertIn("boom-history", out.evidence or "")
+        self.assertEqual(out.state, "not_submitted")
+        self.assertEqual(out.evidence, "submit_failed:RuntimeError")
 
     def test_gadget_dead_worker_with_running_placeholder_is_failed_not_running(self):
         """Worker died mid-turn (result file still 'running', has message_id):
@@ -269,6 +318,19 @@ class TestGadgetQueryMedia(unittest.TestCase):
         self.assertNotIn("[[FILE:", q.text)
         self.assertIn("第一段", q.text)
         self.assertEqual(q.media, [{"kind": "video", "path": str(self.video), "filename": "clip.mp4"}])
+
+    def test_gadget_succeeded_result_accepts_media_without_caption(self):
+        fake = FakeWorkerClient()
+        ex = GadgetExecutor(self.store, client=fake)
+        ctx = make_context(self.store)
+        submitted = ex.submit(ctx)
+        fake.results[ctx.claim.attempt_id] = {
+            "state": "succeeded", "text": "", "message_id": "m-1",
+            "media": [{"kind": "video", "path": str(self.video), "filename": "clip.mp4"}],
+        }
+        q = ex.query(ctx, submitted.run_id)
+        self.assertEqual((q.state, q.text), ("succeeded", ""))
+        self.assertEqual(q.media[0]["path"], str(self.video))
 
 
 if __name__ == "__main__":

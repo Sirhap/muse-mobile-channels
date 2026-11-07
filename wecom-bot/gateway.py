@@ -3769,6 +3769,12 @@ class Gateway:
                 if plain_path is not None:
                     remove_file_quietly(plain_path)
 
+    @staticmethod
+    def allows_outbound_file(file_path: Path) -> bool:
+        """Apply the same local-file policy to core and legacy sends."""
+        return outbound_file_allowed(file_path, CRED_FILE,
+                                     [muse_home(), STATE, BASE, Path("/tmp")])
+
     async def _outbound_media_bytes(self, file_path: Path) -> tuple[bytes, str, str]:
         """Bytes, WeCom media type, and upload filename for one outbound file.
 
@@ -4665,7 +4671,7 @@ class Gateway:
                     await self._notify_permanent_failure(
                         item, mode, result["errmsg"])
                     return True
-                if not outbound_file_allowed(file_path, CRED_FILE, [muse_home(), STATE, BASE, Path("/tmp")]):
+                if not self.allows_outbound_file(file_path):
                     result["errmsg"] = f"file path is not allowed: {fpath}"
                     self.append_jsonl(OUTBOX_RESULTS, result)
                     log(f"outbox reply_file {item_id}: {result['errmsg']}")
@@ -4838,7 +4844,7 @@ class Gateway:
                 chat_type = int(item.get("chat_type", 1))
                 fpath = item.get("file_path", "")
                 file_path = Path(fpath)
-                if not outbound_file_allowed(file_path, CRED_FILE, [muse_home(), STATE, BASE, Path("/tmp")]):
+                if not self.allows_outbound_file(file_path):
                     result["errmsg"] = f"file path is not allowed: {fpath}"
                     self.append_jsonl(OUTBOX_RESULTS, result)
                     log(f"outbox send_file {item_id}: {result['errmsg']}")

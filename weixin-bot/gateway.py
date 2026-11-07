@@ -3499,12 +3499,14 @@ class Gateway:
                 "cipher_size": len(cipher)}
 
     async def _send_items(self, client: httpx.AsyncClient, creds: dict,
-                          to_user_id: str, items: list[dict], context_token: str = "") -> dict:
+                          to_user_id: str, items: list[dict], context_token: str = "",
+                          client_id: str = "") -> dict:
+        """Send encoded items, preserving an explicit Core delivery identity."""
         body = {
             "msg": {
                 "from_user_id": "",
                 "to_user_id": to_user_id,
-                "client_id": f"muse-{uuid.uuid4().hex}",
+                "client_id": client_id or f"muse-{uuid.uuid4().hex}",
                 "message_type": 2,
                 "message_state": 2,
                 "item_list": items,
@@ -3549,6 +3551,31 @@ class Gateway:
             raise UploadStageError(f"{UPLOAD_STAGE_MARKER}: {e}") from e
         item = self._media_item(mtype, up, Path(fpath).name, len(data))
         return await self._send_items(client, creds, to_user_id, [item], context_token)
+
+    async def prepare_core_media(self, client: httpx.AsyncClient, creds: dict,
+                                 to_user_id: str, item: dict) -> dict:
+        """Validate, compress and upload one Core attachment before any message send.
+
+        Reuse the legacy file policy, compression cache and iLink encoding.
+        Invalid paths raise PermissionError or FileNotFoundError so Core can
+        reject the result. CDN failures leave all message sends unattempted.
+        """
+        if not isinstance(item, dict) or item.get("kind") not in ("image", "video", "file"):
+            raise ValueError("unsupported WeChat media kind")
+        raw_path = item.get("path")
+        if not isinstance(raw_path, str) or not Path(raw_path).is_absolute():
+            raise ValueError("WeChat media requires an absolute local path")
+        path = Path(raw_path).resolve(strict=True)
+        if not file_send_allowed(str(path)):
+            raise PermissionError("WeChat media path is not allowed")
+        effective, _ = await self._prepare_file_for_send(str(path))
+        path = Path(effective).resolve(strict=True)
+        if not file_send_allowed(str(path)):
+            raise PermissionError("prepared WeChat media path is not allowed")
+        data = await asyncio.to_thread(path.read_bytes)
+        mtype = weixin_media_type(str(path))
+        uploaded = await self._upload_media(client, creds, to_user_id, data, mtype)
+        return self._media_item(mtype, uploaded, path.name, len(data))
 
     # ---------- outbox ----------
 

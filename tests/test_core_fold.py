@@ -12,7 +12,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from mobile_channels.executors import DualTrackExecutor, GadgetExecutor, MuseExecutor
 from mobile_channels.ingress import CoreIngress
@@ -198,6 +198,39 @@ class MuseFoldTests(unittest.TestCase):
         claim = self.store.connection.execute(
             "SELECT * FROM execution_attempts WHERE task_id=?", (first.task_id,)).fetchone()
         return first, claim['run_id']
+
+    def test_late_reply_to_a_confirmed_fold_remains_bound_after_completion(self):
+        """A merged user message remains a reply ancestor after its first result."""
+        original_open = self.client._open.side_effect
+
+        def open_with_identity(*args, **kwargs):
+            stream = original_open(*args, **kwargs)
+            event = self.state['events'][-1]
+            event['message_id'] = f"u-{event['seq']}"
+            return stream
+
+        self.client._open.side_effect = open_with_identity
+        primary = Mock()
+        primary.is_configured.return_value = False
+        dual = DualTrackExecutor(self.store, primary=primary, fallback=self.executor)
+        runner = CoreRunner(self.store, dual, 'worker')
+        first = self.ingress.receive('m-a', 'alice', 'chat1', 'single', 'first')
+        self.assertEqual(runner.tick(), 'accepted')
+        self.ingress.receive('m-b', 'alice', 'chat1', 'single', 'fold this')
+        self.assertEqual(runner.tick(), 'folded')
+        self.assertEqual(self.store.folded_platform_messages(first.task_id), {'u-2'})
+        initial = assistant_event(self.state, 'first answer')
+        initial['message_id'] = 'a-1'
+        initial['payload']['reply_to_message_id'] = 'u-1'
+        with patch('mobile_channels.executors.time.sleep'):
+            self.assertEqual(runner.tick(), 'succeeded')
+        late = assistant_event(self.state, 'answer to folded input')
+        late['message_id'] = 'a-2'
+        late['payload']['reply_to_message_id'] = 'u-2'
+        self.now += 20
+        self.assertEqual(dual.poll_replies(), 'appended')
+        self.assertEqual(self.store.task(first.task_id)['result'],
+                         'first answer\nanswer to folded input')
 
     def test_fold_sends_to_same_session(self):
         first, run_id = self.submit_one()

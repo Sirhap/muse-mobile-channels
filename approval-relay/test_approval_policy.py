@@ -18,6 +18,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 # 设置测试环境
 os.environ["APPROVAL_RELAY_TEST"] = "1"
@@ -712,6 +713,18 @@ class TestNoticeAndCardRendering(unittest.TestCase):
         fields = {h["keyname"]: h["value"] for h in card.get("horizontal_content_list", [])}
         self.assertNotIn("风险", fields)
 
+    def test_manual_approval_card_contains_policy_failure_reason(self):
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(relay, "BASE", temporary):
+            item = {"approval_id": "failed-auto-allow", "who": "Shell command",
+                    "what": "命令：pip install requests\n原因：package install",
+                    "policy_reason": "自动放行提交失败，转人工审批（TimeoutError）",
+                    "decision_scope": {"channel": "wecom", "chat_id": "room"}}
+            relay.send_approval_notice("8", item)
+            row = json.loads((Path(temporary) / "shadow" / "wecom-outbox.jsonl").read_text())
+            card_fields = row["card"]["horizontal_content_list"]
+
+        self.assertTrue(any("自动放行提交失败" in field["value"] for field in card_fields))
+
 
 class TestRelayPolicyIntegration(unittest.TestCase):
     """测试策略引擎与 approval_relay 的端到端集成模拟。"""
@@ -897,6 +910,24 @@ class TestRelayPolicyIntegration(unittest.TestCase):
         # 不应产生第二次 decide 调用
         self.assertEqual(len(gw.decide_calls), 1)
         self.assertEqual(self.state["items"]["1"]["status"], "auto_approved")
+
+    def test_failed_manual_notice_retries_without_resubmitting_auto_allow(self):
+        pending = {"approval_id": "aid-retry-notice", "display_name": "Shell command",
+                   "registered_command": "pip install requests", "method": "GET",
+                   "host": "pypi.org", "request_expires_at_ms": 9999999999999}
+        gw = MockGateway(pending_list=[pending], fail_decide=True)
+        with mock.patch.object(relay, "send_approval_notice", side_effect=OSError):
+            relay.poll_once(gw, self.state)
+        first_attempt = self.state["items"]["1"]["decision_attempt"]
+
+        restarted = relay.load_state()
+        relay.poll_once(gw, restarted)
+
+        self.assertEqual(gw.decide_calls, [("aid-retry-notice", "allow_once")])
+        self.assertEqual(restarted["items"]["1"]["decision_attempt"], first_attempt)
+        self.assertEqual(restarted["items"]["1"]["status"], "pending")
+        rows = self.shadow_rows("weixin") + self.shadow_rows("wecom")
+        self.assertTrue(any("自动放行提交失败" in row["text"] for row in rows))
 
     def test_auto_allow_persists_decision_unknown_and_handles_exception(self):
         """集成测试：平台 RPC 异常时自动放行失败退到手动审批。

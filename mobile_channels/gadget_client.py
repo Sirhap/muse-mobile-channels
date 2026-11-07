@@ -131,6 +131,7 @@ class GadgetClient:
         session_id: str,
         text: str,
         timeout_seconds: int | None = None,
+        *, images: list[dict] | None = None,
     ) -> subprocess.Popen:
         """Spawn the worker for one turn; returns the child process.
 
@@ -151,6 +152,14 @@ class GadgetClient:
             pass
         message_path.write_text(text, encoding="utf-8")
         os.chmod(message_path, 0o600)
+        image_args = []
+        if images:
+            image_path = message_path.with_suffix('.images.json')
+            descriptor = os.open(image_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, 'w', encoding='utf-8') as output:
+                json.dump(images, output)
+            image_args = ["--images-file", str(image_path)]
         log_file = open(log_path, "ab")
         try:
             proc = subprocess.Popen(
@@ -159,7 +168,7 @@ class GadgetClient:
                  "--message-file", str(message_path),
                  "--out", str(result_path),
                  "--timeout", str(int(timeout_seconds or self.turn_timeout_seconds)),
-                 "--credentials", str(self.credentials.directory)],
+                 "--credentials", str(self.credentials.directory), *image_args],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=log_file,
@@ -245,10 +254,15 @@ class GadgetClient:
     def worker_alive(pid: int) -> bool:
         """True when the process exists and is not a zombie.
 
-        A zombie still answers os.kill(pid, 0), so the /proc state is
-        checked: 'Z' means the worker already exited and only awaits
-        reaping by its parent.
+        Reap our exited children before the existence check. Other owners'
+        workers use /proc where available. A zombie is already stopped.
         """
+        try:
+            stopped, _ = os.waitpid(pid, os.WNOHANG)
+            if stopped == pid:
+                return False
+        except (ChildProcessError, OSError):
+            pass
         try:
             os.kill(pid, 0)
         except ProcessLookupError:

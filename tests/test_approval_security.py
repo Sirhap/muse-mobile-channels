@@ -116,7 +116,8 @@ class ApprovalSecurityTests(unittest.TestCase):
                 (self.base / 'decisions.offset').read_text(),
                 str(len(json.dumps(self.row) + '\n')))
             relay = load_relay()
-            relay.BASE, relay.TEST = str(self.base), True
+            relay.BASE, relay.TEST = str(self.base), False
+            relay.CHANNELS['wecom']['row']['chatid'] = 'room'
             relay.notify('private', 'notice', channels=['wecom'])
         self.assertFalse((self.base / 'shadow/wecom-outbox.jsonl').exists())
         import sqlite3
@@ -125,7 +126,7 @@ class ApprovalSecurityTests(unittest.TestCase):
                 "SELECT channel, chat_id, text, state FROM approval_notices"
             ).fetchall()
         self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0], ('wecom', '', 'private', 'pending'))
+        self.assertEqual(rows[0], ('wecom', 'room', 'private', 'pending'))
 
     def test_mode_lease_is_held_through_external_submission(self):
         """A cutover cannot race an approval already leaving the process."""

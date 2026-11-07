@@ -1,8 +1,9 @@
 # Gadget token extension
 
 Minimal code to **get and keep a Muse Gadget device token**, extracted from
-[wong2/muse-client](https://github.com/wong2/muse-client) (`reference/muse-client`,
-vendored in this repo, Apache-2.0). Only the token flow is kept; chat, Noise
+[wong2/muse-client](https://github.com/wong2/muse-client) (Apache-2.0).
+The full SDK is an external checkout at `reference/muse-client`, excluded
+from Git. Only the token flow is kept in this extension; chat, Noise
 transport, VM lookup and the Bluetooth pairing protocol are intentionally
 **not** here. Run it with `bun` (the project's Gadget runtime).
 
@@ -45,6 +46,24 @@ Dropped from the source on purpose: `listVMs` / `MuseVM`, chat (`client.ts`,
 (`pairing/controller.ts`, `pairing/protocol.ts`, `native/macos/`). If you need
 those, use the full `reference/muse-client`.
 
+## Install the full Gadget SDK
+
+The Gadget worker and its tests import source files from the full SDK.
+From the channel repository root, install the verified source revision
+with Bun 1.4.4 (Node.js 22.18+ is required when using the SDK's Node tools):
+
+```sh
+mkdir -p reference
+git clone https://github.com/wong2/muse-client.git reference/muse-client
+git -C reference/muse-client checkout 1043c1687234593d1308245c62afcfe23be37b91
+(cd reference/muse-client && bun install --frozen-lockfile)
+```
+
+For an existing SDK checkout, inspect local changes before changing its
+revision. The pinned source has been used for offline worker tests.
+Account authentication and real channel delivery require separate live
+verification.
+
 Notes kept from the project: the REST timeout is 60s, not the upstream 15s,
 because the egress proxy here is slow (a 15s timeout killed a live Gadget
 turn on 2026-11-06). Token values are never logged; `status` shows metadata
@@ -72,9 +91,9 @@ bun extensions/gadget-token/cli.ts unpair --credentials $CRED
 Pairing needs **macOS + Bluetooth** and cannot run on this Linux machine.
 
 1. Open `https://gadgets.muse.ai/settings/sdk-tokens` in a browser, copy the SDK token.
-2. On a Mac, pair with the full client (vendored at `reference/muse-client`):
+2. On a Mac, install the full client as above, then pair:
    ```sh
-   cd reference/muse-client && bun run cli pair
+   (cd reference/muse-client && bun run cli pair)
    ```
    Paste the SDK token when prompted, allow Bluetooth access, open
    Muse > Settings > Devices > Add Device (Developer mode enabled), and wait

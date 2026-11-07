@@ -27,7 +27,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from mobile_channels.executors import (
     CircuitBreaker,
@@ -239,6 +239,14 @@ class TestGadgetClient(unittest.TestCase):
         # The message travels by file, not inline in argv.
         self.assertNotIn("secret check", joined)
         self.assertIn("--message-file", argv)
+
+    def test_start_turn_serializes_images_in_a_private_manifest(self):
+        images = [{"type": "image", "mime_type": "image/png", "filename": "shot.png", "data_base64": "aGVsbG8="}]
+        proc = self.client.start_turn("att_images", "sess_images", "caption", images=images)
+        proc.wait(timeout=5)
+        manifest = self.run_dir / "gadget-att_images.images.json"
+        self.assertEqual(json.loads(manifest.read_text()), images)
+        self.assertEqual(manifest.stat().st_mode & 0o777, 0o600)
 
     def test_start_turn_without_credentials_raises_auth(self):
         """A missing pairing directory fails fast as an auth error, before spawning."""
@@ -1228,19 +1236,150 @@ class TestGadgetHistoryFallback(unittest.TestCase):
         return outcome
 
     def test_query_settles_from_history_while_worker_running(self):
-        """Worker still running + history completed -> succeeded, worker stopped."""
+        """History can settle a running Worker, with cleanup after commit only."""
         context = self._get_context()
-        self._submit_running(context)
+        submitted = self._submit_running(context)
+        self.store.mark_submitted(context.claim, submitted.run_id)
         self.history.events = [
             _history_event(10, "message.user", "u-ack-1"),
             _history_event(11, "message.assistant", "a-1", "completed", "pong via history"),
         ]
-        q = self.executor.query(context, "worker:1001")
+        with patch("mobile_channels.executors.time.sleep"):
+            q = self.executor.query(context, "worker:1001")
         self.assertEqual(q.state, "succeeded")
         self.assertEqual(q.text, "pong via history")
         self.assertEqual(q.message_id, "a-1")
+        self.assertEqual(q.reply_watch["ack_id"], "u-ack-1")
+        self.assertEqual(q.reply_watch["seen_ids"], ["a-1"])
+        self.assertEqual(self.fake_client.stopped, [])
+        # Simulate a crashed runner discarding the returned outcome. A new
+        # runner can still recover and must commit before stopping the Worker.
+        stop_turn = self.fake_client.stop_turn
+        def stop_after_commit(pid):
+            self.assertEqual(self.store.task(context.claim.task_id)["result"], "pong via history")
+            return stop_turn(pid)
+        self.fake_client.stop_turn = stop_after_commit
+        runner = CoreRunner(self.store, self.executor, "worker_1")
+        with patch("mobile_channels.executors.time.sleep"):
+            self.assertEqual(runner.tick(), "succeeded")
         self.assertEqual(self.fake_client.stopped, [1001])
         self.assertTrue(self.history.closed)
+
+    def test_query_rechecks_worker_after_history_io(self):
+        """A Worker that completed while history was in flight has a real reply."""
+        context = self._get_context()
+        self._submit_running(context)
+        def history_when_worker_finishes(*args, **kwargs):
+            self.fake_client.results[context.claim.attempt_id] = {
+                "state": "succeeded", "message_id": "a-live", "text": "live reply",
+            }
+            self.fake_client.alive.discard(1001)
+            return {"chat_events": []}
+        self.history.call_json = history_when_worker_finishes
+        q = self.executor.query(context, "worker:1001")
+        self.assertEqual((q.state, q.text), ("succeeded", "live reply"))
+
+    def test_confirmed_history_survives_a_local_worker_timeout(self):
+        """A subscription timeout cannot erase an already confirmed reply."""
+        context = self._get_context()
+        self._submit_running(context)
+        history = self.history.call_json
+        self.history.events = [
+            _history_event(10, "message.user", "u-ack-1"),
+            _history_event(11, "message.assistant", "a-1", "completed", "confirmed reply"),
+        ]
+        def history_when_worker_times_out(*args, **kwargs):
+            self.fake_client.results[context.claim.attempt_id] = {
+                "state": "unknown", "message_id": "u-ack-1", "evidence": "turn_timeout",
+            }
+            self.fake_client.alive.discard(1001)
+            return history(*args, **kwargs)
+        self.history.call_json = history_when_worker_times_out
+        with patch("mobile_channels.executors.time.sleep"):
+            q = self.executor.query(context, "worker:1001")
+        self.assertEqual((q.state, q.text), ("succeeded", "confirmed reply"))
+
+    def test_expired_history_poll_leaves_worker_for_the_next_owner(self):
+        """Lease expiry before commit must preserve a recoverable reply source."""
+        now = [1000.0]
+        self.store.clock = lambda: now[0]
+        context = self._get_context()
+        submitted = self._submit_running(context)
+        self.store.mark_submitted(context.claim, submitted.run_id)
+        self.history.events = [
+            _history_event(10, "message.user", "u-ack-1"),
+            _history_event(11, "message.assistant", "a-1", "completed", "recoverable reply"),
+        ]
+        history = self.history.call_json
+        def slow_once(*args, **kwargs):
+            if not self.history.calls:
+                now[0] += 61
+            return history(*args, **kwargs)
+        self.history.call_json = slow_once
+        runner = CoreRunner(self.store, self.executor, "worker_1")
+        with patch("mobile_channels.executors.time.sleep"):
+            self.assertEqual(runner.tick(), "ownership_lost")
+            self.assertEqual(self.fake_client.stopped, [])
+            self.assertEqual(runner.tick(), "succeeded")
+        self.assertEqual(self.store.task(context.claim.task_id)["result"], "recoverable reply")
+        self.assertEqual(self.fake_client.stopped, [1001])
+
+    def test_query_ignores_late_reply_to_previous_turn(self):
+        """An explicit old parent cannot be reassigned by sequence alone."""
+        context = self._get_context()
+        self._submit_running(context)
+        old_reply = _history_event(11, "message.assistant", "a-old", "completed", "old reply")
+        old_reply["payload"]["reply_to_message_id"] = "u-old"
+        self.history.events = [
+            _history_event(9, "message.user", "u-old"),
+            _history_event(10, "message.user", "u-ack-1"),
+            old_reply,
+        ]
+        q = self.executor.query(context, "worker:1001")
+        self.assertEqual(q.state, "running")
+
+    def test_query_waits_for_observed_incomplete_reply(self):
+        """A completed first segment does not settle a still-generating second."""
+        context = self._get_context()
+        self._submit_running(context)
+        self.history.events = [
+            _history_event(10, "message.user", "u-ack-1"),
+            _history_event(11, "message.assistant", "a-1", "completed", "first"),
+            _history_event(12, "message.assistant", "a-2", "running", "still writing"),
+        ]
+        with patch("mobile_channels.executors.time.sleep"):
+            q = self.executor.query(context, "worker:1001")
+        self.assertEqual(q.state, "running")
+        self.assertEqual(self.fake_client.stopped, [])
+
+    def test_query_accepts_self_parented_side_session_reply(self):
+        """Mirror MuseTurn's ownsChat binding for a self-parented reply."""
+        context = self._get_context()
+        self._submit_running(context)
+        reply = _history_event(11, "message.assistant", "a-self", "completed", "self reply")
+        reply["payload"]["reply_to_message_id"] = "a-self"
+        self.history.events = [_history_event(10, "message.user", "u-ack-1"), reply]
+        with patch("mobile_channels.executors.time.sleep"):
+            q = self.executor.query(context, "worker:1001")
+        self.assertEqual((q.state, q.text), ("succeeded", "self reply"))
+
+    def test_query_accepts_folded_and_handoff_ancestry(self):
+        """Confirmed follow-up messages and their internal handoffs stay bound."""
+        context = self._get_context()
+        self._submit_running(context)
+        self.fake_client.send_only = Mock(return_value={"state": "sent", "message_id": "u-fold"})
+        self.assertEqual(self.executor.fold(context, "worker:1001", "follow-up").state, "accepted")
+        handoff = _history_event(12, "message.tool", "handoff")
+        handoff["payload"]["reply_to_message_id"] = "u-fold"
+        reply = _history_event(13, "message.assistant", "a-last", "completed", "combined reply")
+        reply["payload"]["parent_message_id"] = "handoff"
+        self.history.events = [
+            _history_event(10, "message.user", "u-ack-1"),
+            _history_event(11, "message.user", "u-fold"), handoff, reply,
+        ]
+        with patch("mobile_channels.executors.time.sleep"):
+            q = self.executor.query(context, "worker:1001")
+        self.assertEqual((q.state, q.text), ("succeeded", "combined reply"))
 
     def test_query_ignores_stale_completed_below_anchor(self):
         """A completed reply from a previous attempt (seq <= anchor) is not ours."""

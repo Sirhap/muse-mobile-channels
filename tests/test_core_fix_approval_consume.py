@@ -127,6 +127,21 @@ class ConsumeOffsetTests(unittest.TestCase):
         self.assertEqual(self.offset(),
                          str(len(json.dumps(self.row) + "\n")))
 
+    def test_confirmed_decision_notice_retries_after_restart_without_resubmission(self):
+        self.write()
+        gateway = mock.Mock()
+        self.relay.notify.side_effect = OSError("notification queue unavailable")
+        with mock.patch.dict(os.environ, {"MUSE_CHANNEL_MODES": ""}):
+            self.relay.consume_decisions(gateway, self.state)
+            restarted = self.relay.load_state()
+            self.relay.notify.reset_mock()
+            self.relay.notify.side_effect = None
+            self.relay.consume_decisions(gateway, restarted)
+
+        gateway.call_json.assert_called_once()
+        self.relay.notify.assert_called_once()
+        self.assertIn("平台已确认", self.relay.notify.call_args.args[0])
+
 
 class PollOnceIsolationTests(unittest.TestCase):
     def setUp(self):

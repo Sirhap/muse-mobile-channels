@@ -53,6 +53,10 @@ class ExecutionOutcome:
     # {"kind": "image"|"video"|"file", "path": <absolute path under
     # ~/workspace>, "filename": str}.
     media: list = field(default_factory=list)
+    # Worker cleanup runs only after the reply and outbox commit together.
+    after_commit: Callable[[], None] | None = field(default=None, repr=False, compare=False)
+    # Confirmed history identities retained for later reply fragments.
+    reply_watch: dict | None = field(default=None, repr=False, compare=False)
 
 
 class Executor(Protocol):
@@ -108,6 +112,12 @@ class CoreRunner:
             'FROM tasks t JOIN inbound_messages m ON m.id=t.message_id '
             'JOIN conversations c ON c.id=t.conversation_id WHERE t.id=?', (claim.task_id,)
         ).fetchone()
+        return ExecutionContext(claim, row['text'], row['external_id'], row['sender_id'],
+                                row['channel'], row['account_id'], row['chat_type'], row['chat_id'],
+                                media=self._task_media(claim.task_id))
+
+    def _task_media(self, task_id: str) -> list:
+        """Read persisted route attachments for submission and fold eligibility."""
         # Media lives on the gateway route, not the message row; a store
         # created without a gateway binding has no such table, so a
         # missing table means "no media", never a crash.
@@ -115,16 +125,12 @@ class CoreRunner:
         try:
             route = self.store.connection.execute(
                 'SELECT media_json FROM gateway_routes WHERE task_id=?',
-                (claim.task_id,)).fetchone()
+                (task_id,)).fetchone()
             if route is not None:
                 media = json.loads(route['media_json'] or '[]')
         except (ValueError, TypeError, sqlite3.OperationalError):
             media = []
-        if not isinstance(media, list):
-            media = []
-        return ExecutionContext(claim, row['text'], row['external_id'], row['sender_id'],
-                                row['channel'], row['account_id'], row['chat_type'], row['chat_id'],
-                                media=media)
+        return media if isinstance(media, list) else []
 
     def _active_claim(self) -> Claim | None:
         """Renew our original attempt or acquire query-only ownership after expiry."""
@@ -162,6 +168,10 @@ class CoreRunner:
             return None
         running = pair["running"]
         queued = pair["queued"]
+        # Fold sends only text. Preserve the attachment and queue order by
+        # letting a media task go through regular submission.
+        if self._task_media(queued["id"]):
+            return None
         claim = Claim(running["id"], running["conversation_id"], running["generation"],
                       self.owner, running["attempt_id"], running["token"])
         context = self._context(claim)
@@ -239,7 +249,16 @@ class CoreRunner:
     def _apply(self, claim: Claim, outcome: ExecutionOutcome) -> str:
         """Persist only outcomes backed by the adapter's explicit evidence."""
         if outcome.state == 'succeeded' and isinstance(outcome.text, str):
-            self.store.complete(claim, outcome.text, media=outcome.media or [])
+            with self.store.transaction():
+                self.store.complete(claim, outcome.text, media=outcome.media or [])
+                if outcome.reply_watch is not None:
+                    from .replies import Replies
+                    Replies(self.store).register(claim.task_id, claim.attempt_id, outcome.reply_watch)
+            if outcome.after_commit is not None:
+                try:
+                    outcome.after_commit()
+                except Exception:
+                    LOGGER.warning('execution result committed but worker cleanup failed')
         elif outcome.state == 'accepted' and outcome.run_id:
             self.store.mark_submitted(claim, outcome.run_id)
         elif outcome.state == 'not_submitted' and outcome.evidence:
@@ -286,6 +305,8 @@ class CoreRunner:
             self.store.begin_submission(claim)
             try:
                 outcome = self.executor.submit(context)
+            except OwnershipError:
+                return 'ownership_lost'
             except Exception:
                 try:
                     return self._handle_unknown(claim)
@@ -295,6 +316,8 @@ class CoreRunner:
             try:
                 operation = self.executor.cancel if task['cancel_requested'] else self.executor.query
                 outcome = operation(context, attempt['run_id'])
+            except OwnershipError:
+                return 'ownership_lost'
             except Exception:
                 try:
                     return self._handle_unknown(claim)

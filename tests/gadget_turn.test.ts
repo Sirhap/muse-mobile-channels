@@ -11,22 +11,25 @@
 // - A failure before the send was attempted (connect) is a determinable
 //   'failed': nothing could have been delivered.
 //
-// Mocks for the reference client are registered at the top of this file
-// BEFORE turn.ts is imported (dynamic import inside the tests), and the
-// mocked send/connect behaviour is switched per test through mutable
-// variables the mocks close over.
+// The shared harness replaces only the reference transport. Each worker
+// invocation selects its connection, so both test files can run together
+// while MuseTurn keeps its real state machine.
 //
 // Run via: bun test tests/gadget_turn.test.ts
 // (tests/test_core_fix_exec_turn_ts.py drives this from unittest.)
-import { describe, expect, mock, test } from 'bun:test';
+import { describe, expect, test } from 'bun:test';
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { configureWorkerMock } from './gadget_worker_mocks';
 
-const REF = join(import.meta.dir, '..', 'reference', 'muse-client', 'src');
+interface SendOptions {
+  sessionId?: string;
+  images?: { data: Uint8Array; mimeType: string; filename: string }[];
+}
 
 // Per-test behaviour switches, read by the mocks at call time.
-let sendImpl: (text: string) => unknown = () => ({ messageId: 'm-1', raw: {} });
+let sendImpl: (text: string, options?: SendOptions) => unknown = () => ({ messageId: 'm-1', raw: {} });
 let connectImpl: () => unknown = () => fakeClient;
 
 const fakeClient = {
@@ -37,33 +40,6 @@ const fakeClient = {
   },
   close: () => {},
 };
-
-mock.module(join(REF, 'client.js'), () => ({
-  MuseClient: class {
-    static async connect() {
-      return connectImpl();
-    }
-  },
-}));
-mock.module(join(REF, 'credentials.js'), () => ({
-  loadCredentials: async () => ({}),
-  saveCredentials: async () => {},
-}));
-mock.module(join(REF, 'turn.js'), () => ({
-  MuseTurn: class {
-    replies = new Map();
-    acknowledge() {}
-    feed() {
-      return [];
-    }
-    complete() {
-      return true;
-    }
-    completionDelay() {
-      return 0;
-    }
-  },
-}));
 
 async function loadTurn() {
   return import('../mobile_channels/gadget_worker/turn.ts');
@@ -127,15 +103,19 @@ describe('validateAckMessageId', () => {
   });
 });
 
-async function runWorkerMain() {
+async function runWorkerMain(images?: unknown[]) {
+  configureWorkerMock(() => connectImpl());
   const { main } = await loadTurn();
   const dir = mkdtempSync(join(tmpdir(), 'gadget-turn-test-'));
   const messageFile = join(dir, 'msg.txt');
   const outFile = join(dir, 'result.json');
   writeFileSync(messageFile, 'hello gadget', 'utf8');
+  const imagesFile = join(dir, 'images.json');
+  if (images) writeFileSync(imagesFile, JSON.stringify(images), 'utf8');
   const savedArgv = process.argv;
   process.argv = ['bun', 'turn.ts', '--session', 'sess-1', '--message-file', messageFile,
-    '--out', outFile, '--timeout', '30', '--credentials', join(dir, 'creds')];
+    '--out', outFile, '--timeout', '30', '--credentials', join(dir, 'creds'),
+    ...(images ? ['--images-file', imagesFile] : [])];
   try {
     const code = await main();
     const result = JSON.parse(readFileSync(outFile, 'utf8'));
@@ -175,5 +155,39 @@ describe('send failure handling in main()', () => {
     const { code, result } = await runWorkerMain();
     expect(code).toBe(0);
     expect(result.state).toBe('failed');
+  });
+});
+
+
+describe('Gadget image input', () => {
+  test('passes raw image bytes and caption together to the SDK', async () => {
+    let sentOptions: SendOptions | undefined;
+    sendImpl = (text, options) => {
+      expect(text).toBe('hello gadget');
+      sentOptions = options;
+      throw new Error('stop after send boundary');
+    };
+    connectImpl = () => fakeClient;
+    const { result } = await runWorkerMain([
+      { type: 'image', data_base64: Buffer.from('png-bytes').toString('base64'), mime_type: 'image/png', filename: 'shot.png' },
+    ]);
+    expect(result.state).toBe('unknown');
+    expect(sentOptions?.sessionId).toBe('sess-1');
+    expect(sentOptions?.images?.[0]?.data).toEqual(Buffer.from('png-bytes'));
+    expect(sentOptions?.images?.[0]?.mimeType).toBe('image/png');
+    expect(sentOptions?.images?.[0]?.filename).toBe('shot.png');
+  });
+
+  test('rejects oversized or empty images before attempting send', async () => {
+    let attempted = false;
+    sendImpl = () => { attempted = true; throw new Error('must not send'); };
+    connectImpl = () => fakeClient;
+    for (const bytes of [Buffer.alloc(0), Buffer.alloc(2 * 1024 * 1024 + 1)]) {
+      const { result } = await runWorkerMain([
+        { type: 'image', data_base64: bytes.toString('base64'), mime_type: 'image/png', filename: 'shot.png' },
+      ]);
+      expect(result.state).toBe('failed');
+      expect(attempted).toBe(false);
+    }
   });
 });

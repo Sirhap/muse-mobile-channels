@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import sqlite3
 import sys
 import time
 from contextlib import ExitStack
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from .config import RuntimeConfig
@@ -31,6 +33,15 @@ def main(argv: list[str] | None = None) -> int:
     readiness = commands.add_parser('core-readiness')
     readiness.add_argument('--database', type=Path, required=True)
     readiness.add_argument('--modes', type=Path, required=True)
+    doctor = commands.add_parser('doctor')
+    doctor.add_argument('--workspace', type=Path, default=config.workspace)
+    doctor.add_argument('--home', type=Path, default=Path.home())
+    doctor.add_argument('--modes', type=Path)
+    plan = commands.add_parser('service-plan')
+    plan.add_argument('--workspace', type=Path, default=config.workspace)
+    plan.add_argument('--home', type=Path, default=Path.home())
+    plan.add_argument('--output', type=Path, required=True)
+    plan.add_argument('--channels', nargs='+', choices=('weixin', 'wecom'), required=True)
     for name in ('database-check', 'database-backup', 'database-restore'):
         operation = commands.add_parser(name)
         operation.add_argument('--source', type=Path, required=True)
@@ -61,6 +72,12 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == 'core-readiness':
             from .readiness import inspect_readiness
             report = inspect_readiness(args.database, args.modes)
+        elif args.command == 'doctor':
+            from .doctor import inspect_installation
+            report = inspect_installation(args.workspace, args.home, args.modes)
+        elif args.command == 'service-plan':
+            from .install import write_service_plan
+            report = write_service_plan(args.workspace, args.home, args.output, channels=args.channels)
         elif args.command.startswith('database-'):
             from .maintenance import check_database, backup_database, restore_database
             functions = {'database-check': check_database, 'database-backup': backup_database,
@@ -88,6 +105,13 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
+def poll_reply_updates(database: Path) -> str:
+    """Keep slow history reads on a separate, short-lived SQLite connection."""
+    from .executors import DualTrackExecutor
+    with Store(database) as store:
+        return DualTrackExecutor(store).poll_replies()
+
+
 def run_core(database: Path, modes: Path, once: bool = False) -> dict:
     """Hold all account mode leases while advancing the opt-in execution core."""
     from .executors import DualTrackExecutor, validate_transport_source
@@ -113,11 +137,21 @@ def run_core(database: Path, modes: Path, once: bool = False) -> dict:
             raise ModeError('database contains accounts not owned by this runner configuration')
         # Dual track: Gadget side chats first, native MuseExecutor as fallback.
         # Without this the core path would never exercise the Gadget track.
-        runner = CoreRunner(store, DualTrackExecutor(store), f'core-{os.getpid()}')
+        runner = CoreRunner(store, DualTrackExecutor(store, modes=modes), f'core-{os.getpid()}')
+        observer = stack.enter_context(ThreadPoolExecutor(max_workers=1, thread_name_prefix='muse-replies'))
+        pending_update = None
         while True:
             state = runner.tick()
             if once:
                 return dict(store.snapshot(), tick=state)
+            if pending_update is not None and pending_update.done():
+                try:
+                    pending_update.result()
+                except Exception:
+                    logging.getLogger(__name__).warning('reply history observation failed; it will retry')
+                pending_update = None
+            if pending_update is None:
+                pending_update = observer.submit(poll_reply_updates, database)
             time.sleep(1)
 
 

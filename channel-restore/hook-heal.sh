@@ -32,9 +32,11 @@
 # HOOK_HEAL_THROTTLE_SECS override the production paths.
 set -uo pipefail
 
-WS="${HOOK_HEAL_WS:-/home/hatch/workspace}"
+source "$(dirname "${BASH_SOURCE[0]}")/restore.sh"
+INSTALL_HOME="$(resolve_install_home)"
+WS="${HOOK_HEAL_WS:-$INSTALL_HOME/workspace}"
 UNIT_DIR="${HOOK_HEAL_UNIT_DIR:-/etc/systemd/system}"
-STATE_DIR="${HOOK_HEAL_STATE_DIR:-/home/hatch/hooks/state/channel-restore}"
+STATE_DIR="${HOOK_HEAL_STATE_DIR:-$INSTALL_HOME/hooks/state/channel-restore}"
 RESTORE="${HOOK_HEAL_RESTORE:-$WS/channel-restore/restore.sh}"
 SYSTEMCTL="${HOOK_HEAL_SYSTEMCTL:-systemctl}"
 THROTTLE_SECS="${HOOK_HEAL_THROTTLE_SECS:-120}"
@@ -69,21 +71,37 @@ dropins_unhealthy() {
   for rel in "${DROPINS[@]}"; do
     src="$WS/channel-restore/$rel"
     dst="$UNIT_DIR/$rel"
-    [[ -f "$src" ]] || return 1
-    [[ -f "$dst" ]] || return 0
-    cmp -s "$src" "$dst" || return 0
+    [[ -f "$src" ]] || continue
+    if [[ -f "${dst%/*}/.muse-restart-pending" || ! -f "$dst" ]] ||
+        ! render_dropin "$src" "$WS" | cmp -s - "$dst"; then
+      core_mode_requested "$WS" 2>/dev/null
+      return $?
+    fi
   done
+  src="$WS/channel-restore/muse-core-run.service"
+  if [[ -f "$src" ]] && core_mode_requested "$WS" 2>/dev/null; then
+    render_unit "$src" "$WS" | cmp -s - "$UNIT_DIR/muse-core-run.service" || return 0
+  fi
   return 1
+}
+
+service_selected() {
+  case "$1" in
+    wecom-bot|weixin-bot) gateway_selected "$1" "${WS%/workspace}" "$UNIT_DIR" ;;
+    *) return 0 ;;
+  esac
 }
 
 units_unhealthy() {
   local rel src dst
+  [[ -f "$UNIT_DIR/.muse-reload-pending" ]] && return 0
   for rel in "${UNITS[@]}"; do
     src="$WS/$rel"
     dst="$UNIT_DIR/$(basename "$rel")"
-    [[ -f "$src" ]] || return 1
+    [[ -f "$src" ]] || continue
+    service_selected "$(basename "$rel" .service)" || continue
     [[ -f "$dst" ]] || return 0
-    cmp -s "$src" "$dst" || return 0
+    render_unit "$src" "$WS" | cmp -s - "$dst" || return 0
   done
   return 1
 }
@@ -92,7 +110,7 @@ stamp_age() {
   local f="$1" now mtime
   [[ -f "$f" ]] || { echo 999999; return; }
   now="$(date +%s)"
-  mtime="$(stat -c %Y "$f" 2>/dev/null || echo 0)"
+  mtime="$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null || echo 0)"
   echo $((now - mtime))
 }
 
@@ -107,8 +125,12 @@ deep_unhealthy() {
   "$SYSTEMCTL" is-enabled --quiet channel-restore.timer 2>/dev/null || return 0
   local svc
   for svc in "${SERVICES[@]}"; do
+    service_selected "$svc" || continue
     "$SYSTEMCTL" is-active --quiet "$svc" 2>/dev/null || return 0
   done
+  if core_mode_requested "$WS" 2>/dev/null; then
+    "$SYSTEMCTL" is-active --quiet muse-core-run 2>/dev/null || return 0
+  fi
   return 1
 }
 

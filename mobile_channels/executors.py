@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .gadget_client import GadgetAuthError, GadgetClient, GadgetCredentials, GadgetError, GadgetNetworkError
+from .models import OwnershipError
 from .runtime import ExecutionContext, ExecutionOutcome
 from .storage import Store
 
@@ -35,15 +36,11 @@ from .storage import Store
 # history API has no after_seq cursor, so this is a plain limit.
 HISTORY_LIMIT = 500
 
-# How many extra history fetch rounds MuseExecutor.query waits through
-# after the first completed assistant message, one poll_interval apart,
-# while new completed messages keep arriving. A turn can legitimately
-# split its answer across several assistant messages (proven live
-# 2026-11-06: the video reference + link arrived 1.44s after the first
-# message, after the executor had already settled). The loop stops early
-# the moment a round adds no new completed message, so a single-message
-# turn costs exactly one extra poll cycle.
+# Total history reads once a reply is visible. Wait through one quiet
+# round: a video reference and link arrived 1.44s after the first reply.
 QUERY_SETTLE_ROUNDS = 3
+COMPLETED_REPLY_STATES = ('completed', 'complete', 'succeeded')
+ACTIVE_REPLY_STATES = ('running', 'pending', 'in_progress', 'streaming', 'generating')
 
 # [[FILE:/absolute/path]] markers, legacy bridge format
 # (native_bridge.py _deliver_reply_raw / _deliver_idle). Executors parse
@@ -266,13 +263,15 @@ class MuseExecutor:
         events = response.get('chat_events', []) if isinstance(response, dict) else []
         return max((event.get('seq', 0) for event in events), default=0)
 
-    def _confirm_recorded(self, client, session_id: str, baseline: int) -> tuple[bool, int]:
+    def _confirm_recorded(self, client, session_id: str, baseline: int,
+                          recorded_events: list[dict] | None = None) -> tuple[bool, int]:
         """Poll history on the same connection until a new event appears.
 
         ``_open`` is fire-and-forget: the frame alone does not prove the
         message landed. Only a history event after the baseline proves it.
         Returns (confirmed, polls) so an unconfirmed submission can carry
-        a countable unknown instead of a bare one.
+        a countable unknown instead of a bare one. Fold callers can retain
+        the confirming events to preserve their platform message ancestry.
         """
         deadline = time.time() + self.confirm_timeout
         polls = 0
@@ -282,7 +281,10 @@ class MuseExecutor:
                 'limit': 10, 'session_id': session_id,
             }, timeout=15)
             events = response.get('chat_events', []) if isinstance(response, dict) else []
-            if any(event.get('seq', 0) > baseline for event in events):
+            new_events = [event for event in events if event.get('seq', 0) > baseline]
+            if new_events:
+                if recorded_events is not None:
+                    recorded_events.extend(new_events)
                 return True, polls
             if time.time() >= deadline:
                 return False, polls
@@ -332,10 +334,13 @@ class MuseExecutor:
         deleted, so the attempt cannot be silently sent twice.
         """
         client = None
+        stream_attempted = False
         try:
             client = self.client_factory()
         except (ImportError, ModuleNotFoundError):
-            return ExecutionOutcome('failed', evidence='executor_dependency_unavailable')
+            return ExecutionOutcome('not_submitted', evidence='executor_dependency_unavailable')
+        except Exception as exc:
+            return ExecutionOutcome('not_submitted', evidence=f'executor_connect_failed:{type(exc).__name__}')
         try:
             existing = self.store.connection.execute(
                 'SELECT * FROM executor_runs WHERE attempt_id=?', (context.claim.attempt_id,)
@@ -347,7 +352,7 @@ class MuseExecutor:
             try:
                 baseline = self._baseline(client, sid)
             except Exception:
-                return ExecutionOutcome('unknown', evidence='baseline_unavailable')
+                return ExecutionOutcome('not_submitted', evidence='baseline_unavailable')
             try:
                 items = build_stream_items(
                     context.text, getattr(context, 'media', None))
@@ -369,6 +374,7 @@ class MuseExecutor:
                     (context.claim.attempt_id, sid, None, 'submission_unknown', self.store.clock()),
                 )
             self._validate_owner(context, submitting=True)
+            stream_attempted = True
             stream = client._open('chat.stream', body={
                 'items': items, 'node_id': self.node_id,
                 'capabilities': {}, 'session_id': sid,
@@ -389,10 +395,17 @@ class MuseExecutor:
                     (run_id, baseline, context.claim.attempt_id),
                 )
             return ExecutionOutcome('accepted', run_id=run_id)
+        except OwnershipError:
+            raise
+        except PermissionError:
+            if not stream_attempted:
+                return ExecutionOutcome('not_submitted', evidence='cancelled_before_stream')
+            return ExecutionOutcome('unknown', evidence='stream_permission_result_unknown')
         except Exception as exc:
             # A bare unknown is uncountable upstream: carry what failed.
             return ExecutionOutcome(
-                'unknown', evidence=f"submit_failed:{type(exc).__name__}:{exc}"[:200])
+                'unknown' if stream_attempted else 'not_submitted',
+                evidence=f"submit_failed:{type(exc).__name__}"[:200])
         finally:
             if client is not None:
                 try:
@@ -417,14 +430,11 @@ class MuseExecutor:
         The binding guarantees the sent message was recorded; the reply
         is every completed assistant event after the recorded baseline,
         in this attempt's dedicated session. A turn may legitimately
-        split its answer across several assistant messages (the video
-        reference + link arrived 1.44s after the first message live),
-        so the first completed message does NOT settle the turn: after
-        it appears, up to QUERY_SETTLE_ROUNDS extra history fetches run
-        one poll_interval apart, stopping early when a round adds no new
-        completed message, and all collected texts + [[FILE:]] media are
-        merged before the outcome is returned. No reply_to exclusion: a
-        genuine turn answer gets stamped with reply_to_message_id
+        split its answer across several assistant messages. Once a reply
+        is visible, the remaining history reads run one poll_interval
+        apart, including a quiet round, and merge texts and [[FILE:]]
+        media. An observed active segment keeps the turn running. A
+        genuine turn answer can carry reply_to_message_id
         whenever the turn was resumed by an internal handoff, and the
         legacy bridge counts it (native_bridge.is_turn_reply, 2026-10-07
         20:47 live loss). Events at or before the baseline -- including
@@ -441,48 +451,75 @@ class MuseExecutor:
             texts: list[str] = []
             media: list[dict] = []
             seen_seqs: set[int] = set()
+            seen_ids: set[str] = set()
+            ack_id: str | None = None
+            anchor_seq: int | None = None
+            active_replies: set[str | int] = set()
             terminal: str | None = None
             for round_no in range(QUERY_SETTLE_ROUNDS):
-                new_found = False
                 response = client.call_json('chat.history', body={
                     'limit': HISTORY_LIMIT, 'session_id': binding['session_id'],
-                }, timeout=15)
+                }, timeout=5)
                 events = response.get('chat_events', []) if isinstance(response, dict) else []
+                if anchor_seq is None:
+                    users = [event for event in events
+                             if event.get('event_name') == 'message.user'
+                             and event.get('seq', 0) > baseline]
+                    if users:
+                        anchor = min(users, key=lambda value: value.get('seq', 0))
+                        anchor_seq = anchor.get('seq')
+                        mid = anchor.get('message_id')
+                        ack_id = mid if isinstance(mid, str) and mid else None
                 for event in sorted(events, key=lambda value: value.get('seq', 0)):
                     if event.get('seq', 0) <= baseline:
                         continue
                     if event.get('event_name') != 'message.assistant':
                         continue
                     payload = event.get('payload') or {}
-                    if payload.get('status') in ('cancelled', 'canceled'):
+                    status = payload.get('status')
+                    seq = event.get('seq', 0)
+                    reply_id = event.get('message_id') or payload.get('message_id') or seq
+                    if status in ACTIVE_REPLY_STATES or payload.get('display_text_ready') is False:
+                        active_replies.add(reply_id)
+                        continue
+                    active_replies.discard(reply_id)
+                    if status in ('cancelled', 'canceled'):
                         terminal = terminal or 'cancelled'
                         continue
-                    if payload.get('status') in ('failed', 'error'):
+                    if status in ('failed', 'error'):
                         terminal = terminal or 'failed'
                         continue
-                    if payload.get('status') not in ('completed', 'complete', 'succeeded'):
-                        continue
-                    seq = event.get('seq', 0)
-                    if seq in seen_seqs:
+                    if status not in COMPLETED_REPLY_STATES or seq in seen_seqs:
                         continue
                     seen_seqs.add(seq)
-                    new_found = True
+                    mid = event.get('message_id') or payload.get('message_id')
+                    seen_ids.add(mid if isinstance(mid, str) and mid else f'seq:{seq}')
                     text = payload.get('display_text')
                     if isinstance(text, str) and text:
                         clean, found = extract_file_media(text)
                         if clean:
                             texts.append(clean)
                         media = merge_media(media, found)
-                if not texts and terminal is None:
+                if not (texts or media) and terminal is None:
                     return ExecutionOutcome('running')
-                if not new_found:
+                if terminal is not None and not (texts or media):
                     break
                 if round_no < QUERY_SETTLE_ROUNDS - 1:
-                    # A new message arrived this round; wait one poll
-                    # cycle for a possible follow-up before settling.
+                    # Keep the quiet interval for a possible later segment.
                     time.sleep(self.poll_interval)
-            if texts:
-                return ExecutionOutcome('succeeded', text="\n".join(texts), media=media)
+            if active_replies and terminal is None:
+                return ExecutionOutcome('running')
+            if texts or media:
+                return ExecutionOutcome('succeeded', text="\n".join(texts), media=media,
+                                        reply_watch={
+                                            'session_id': binding['session_id'], 'track': 'native',
+                                            'baseline_seq': baseline, 'anchor_seq': anchor_seq,
+                                            'ack_id': ack_id, 'seen_ids': sorted(seen_ids),
+                                            'linked_ids': [value for value in [
+                                                ack_id, *seen_ids,
+                                                *self.store.folded_platform_messages(context.claim.task_id),
+                                            ] if value],
+                                        })
             if terminal == 'cancelled':
                 return ExecutionOutcome('cancelled', evidence='platform_run_cancelled')
             return ExecutionOutcome('failed', evidence='platform_run_failed')
@@ -558,10 +595,19 @@ class MuseExecutor:
                 'items': [{'type': 'text', 'text': text}], 'node_id': self.node_id,
                 'capabilities': {}, 'session_id': sid,
             })
-            confirmed, polls = self._confirm_recorded(client, sid, pre)
+            recorded_events: list[dict] = []
+            confirmed, polls = self._confirm_recorded(client, sid, pre, recorded_events)
             if not confirmed:
                 return ExecutionOutcome(
                     'unknown', evidence=f'fold_not_recorded polls={polls}')
+            with self.store.transaction():
+                for event in recorded_events:
+                    if event.get('event_name') != 'message.user':
+                        continue
+                    payload = event.get('payload') or {}
+                    message_id = event.get('message_id') or payload.get('message_id')
+                    if isinstance(message_id, str) and message_id:
+                        self.store.record_folded_platform_message(context.claim, message_id)
             return ExecutionOutcome('accepted', run_id=run_id)
         except Exception as exc:
             return ExecutionOutcome(
@@ -677,6 +723,7 @@ class GadgetExecutor:
         # Optional Cookie-bridge client factory for the history fallback
         # (bridge_client by default in DualTrackExecutor; None disables it).
         self.history_client_factory = history_client_factory
+        self.server_cancel = os.environ.get('MUSE_GADGET_SERVER_CANCEL') == '1'
         # Per-attempt query poll counts, so an unknown outcome can carry
         # countable evidence (polls=N) instead of a bare unknown.
         self._query_counts: dict[str, int] = {}
@@ -759,13 +806,15 @@ class GadgetExecutor:
         """Spawn the Gadget worker for this attempt and record track='gadget'."""
         if not self.is_configured():
             return ExecutionOutcome('not_submitted', evidence='gadget_credentials_missing')
+        images = None
         if getattr(context, 'media', None):
-            # The Gadget worker's sendMessage is text-only; a media task
-            # must never be silently text-stripped here. DualTrack routes
-            # media tasks to the Native track before reaching this point;
-            # a direct Gadget submit fails explicitly instead.
-            return ExecutionOutcome(
-                'failed', evidence='gadget_media_not_supported: gadget worker sends text only')
+            try:
+                images = [item for item in build_stream_items(context.text, context.media)
+                          if item['type'] == 'image']
+                if any(not item['data_base64'] for item in images):
+                    raise ValueError('gadget_image_empty')
+            except ValueError as exc:
+                return ExecutionOutcome('failed', evidence=str(exc))
 
         try:
             existing = self.store.connection.execute(
@@ -791,7 +840,10 @@ class GadgetExecutor:
                 )
 
             self._validate_owner(context, submitting=True)
-            proc = self.client.start_turn(context.claim.attempt_id, session_id, context.text)
+            if images is not None:
+                proc = self.client.start_turn(context.claim.attempt_id, session_id, context.text, images=images)
+            else:
+                proc = self.client.start_turn(context.claim.attempt_id, session_id, context.text)
             run_id = f"worker:{proc.pid}"
 
             with self.store.transaction():
@@ -850,28 +902,52 @@ class GadgetExecutor:
         mid = result.get('message_id')
         message_id = mid if isinstance(mid, str) and mid else None
         if state == 'running':
-            settled = self._settle_from_history(binding, message_id)
-            if settled is not None:
-                return settled
+            settled = self._settle_from_history(context, binding, message_id)
             pid = self._worker_pid(binding['platform_run_id'])
-            if pid is not None and not self._worker_alive(pid):
+            worker_exited = pid is not None and not self._worker_alive(pid)
+            # History I/O can outlive the worker. Read again after checking
+            # liveness so a real terminal result wins over the stale snapshot.
+            latest = self.client.read_result(attempt_id)
+            if latest is not None and latest.get('state') != 'running':
+                if latest.get('state') == 'unknown' and settled is not None:
+                    return settled
+                result = latest
+                state = latest.get('state')
+                mid = latest.get('message_id')
+                message_id = mid if isinstance(mid, str) and mid else message_id
+            elif settled is not None:
+                return settled
+            elif worker_exited:
                 # The driver is dead mid-turn: the reply will never be
                 # collected. Terminal failure, with the message id kept
                 # so the fallback path cannot double-deliver.
                 return ExecutionOutcome(
                     'failed', evidence=f'worker_died_mid_turn polls={polls}',
                     message_id=message_id)
-            return ExecutionOutcome('running', message_id=message_id)
+            else:
+                return ExecutionOutcome('running', message_id=message_id)
         if state == 'succeeded':
-            text = result.get('text')
-            if not isinstance(text, str) or not text:
+            clean_text, marker_media = extract_file_media(result.get('text'))
+            media = merge_media(result.get('media'), marker_media)
+            if not (clean_text or media):
                 return ExecutionOutcome(
                     'unknown', evidence=f'worker_succeeded_without_text polls={polls}',
                     message_id=message_id)
-            clean_text, marker_media = extract_file_media(text)
-            media = merge_media(result.get('media'), marker_media)
+            ack = result.get('ack_message_id')
+            reply_ids = result.get('reply_message_ids')
+            watch = None
+            if isinstance(ack, str) and ack and isinstance(reply_ids, list) and reply_ids:
+                if all(isinstance(value, str) and value for value in reply_ids):
+                    watch = {
+                        'session_id': binding['session_id'], 'track': 'gadget',
+                        'baseline_seq': 0, 'ack_id': ack,
+                        'seen_ids': reply_ids,
+                        'linked_ids': [ack, *reply_ids,
+                                       *self.store.folded_platform_messages(context.claim.task_id)],
+                    }
             return ExecutionOutcome(
-                'succeeded', text=clean_text, message_id=message_id, media=media)
+                'succeeded', text=clean_text, message_id=message_id, media=media,
+                reply_watch=watch)
         if state == 'failed':
             return ExecutionOutcome('failed', evidence=str(result.get('evidence') or 'platform_turn_failed'), message_id=message_id)
         if state == 'cancelled':
@@ -885,15 +961,13 @@ class GadgetExecutor:
             'unknown', evidence=f'unrecognized_result_state_{state} polls={polls}',
             message_id=message_id)
 
-    def _settle_from_history(self, binding, ack_message_id: str | None):
+    def _settle_from_history(self, context: ExecutionContext, binding, ack_message_id: str | None):
         """Settle a still-running worker from Cookie-bridge history, if possible.
 
-        Anchors on this attempt's sent user message (its message id is the
-        worker result's message_id) and accepts completed assistant messages
-        after it -- the same correlation MuseExecutor.query uses, minus the
-        pre-send baseline (the anchor plays that role). Returns a succeeded
-        outcome, or None when the fallback cannot settle yet. Never raises:
-        any failure returns None and the caller keeps the old path.
+        Only accept history after this attempt's acknowledged user message.
+        Explicit parents must belong to this turn, its confirmed folds,
+        or the SDK's self-parented side-session replies. Transport failures
+        leave the worker's subscription as the source of the result.
         """
         if self.history_client_factory is None or not ack_message_id:
             return None
@@ -905,8 +979,9 @@ class GadgetExecutor:
         except Exception:
             return None
         try:
-            texts, media, last_id = self._collect_completed_after_anchor(
-                client, session_id, ack_message_id)
+            folded = self.store.folded_platform_messages(context.claim.task_id)
+            texts, media, last_id, watch = self._collect_completed_after_anchor(
+                client, session_id, ack_message_id, folded)
         except Exception:
             return None
         finally:
@@ -916,40 +991,39 @@ class GadgetExecutor:
                     close()
             except Exception:
                 pass
-        if not texts:
+        if not (texts or media):
             return None
-        # The reply is already collected from authoritative history: stop
-        # the still-waiting worker so it does not linger on the late
-        # subscription terminal. Best effort; a failure here changes
-        # nothing -- the worker's own result is ignored once settled.
         pid = self._worker_pid(binding['platform_run_id'])
-        if pid is not None:
-            try:
+
+        def cleanup_worker() -> None:
+            """Stop the observer after a restart can recover the durable reply."""
+            latest = self.client.read_result(context.claim.attempt_id)
+            if (pid is not None and latest is not None and latest.get('state') == 'running'
+                    and self._worker_alive(pid)):
                 self.client.stop_turn(pid)
-            except Exception:
-                pass
         return ExecutionOutcome(
-            'succeeded', text='\n'.join(texts), message_id=last_id, media=media)
+            'succeeded', text='\n'.join(texts), message_id=last_id, media=media,
+            after_commit=cleanup_worker, reply_watch=watch)
 
-    def _collect_completed_after_anchor(self, client, session_id: str, ack_message_id: str):
-        """Fetch history until a settle round adds no new completed reply.
+    def _collect_completed_after_anchor(self, client, session_id: str, ack_message_id: str,
+                                        folded_message_ids: set[str]):
+        """Collect bound texts and media over at most three reads, 1s apart.
 
-        Returns (texts, media, last_message_id); empty texts means no
-        completed reply after the anchor yet. Raises on transport failure.
-        Mirrors MuseExecutor.query's settle rounds: a turn may split its
-        answer across several assistant messages, so after the first
-        completed message, up to QUERY_SETTLE_ROUNDS extra fetches run one
-        second apart, stopping early when a round adds nothing new.
+        An observed incomplete assistant segment prevents settlement.
+        Empty texts and media mean history cannot settle the turn yet.
         """
         texts: list[str] = []
         media: list[dict] = []
         seen_seqs: set[int] = set()
+        seen_ids: set[str] = set()
         last_id: str | None = None
         anchor_seq: int | None = None
+        linked_ids = {ack_message_id, *folded_message_ids}
+        active_replies: set[str | int] = set()
         for round_no in range(QUERY_SETTLE_ROUNDS):
             response = client.call_json('chat.history', body={
                 'limit': HISTORY_LIMIT, 'session_id': session_id,
-            }, timeout=15)
+            }, timeout=5)
             events = response.get('chat_events', []) if isinstance(response, dict) else []
             if anchor_seq is None:
                 for event in events:
@@ -958,37 +1032,51 @@ class GadgetExecutor:
                         anchor_seq = event.get('seq', 0)
                         break
                 if anchor_seq is None:
-                    return [], [], None
-            new_found = False
+                    return [], [], None, None
             for event in sorted(events, key=lambda value: value.get('seq', 0)):
                 if event.get('seq', 0) <= anchor_seq:
                     continue
-                if event.get('event_name') != 'message.assistant':
-                    continue
                 payload = event.get('payload') or {}
-                if payload.get('status') not in ('completed', 'complete', 'succeeded'):
+                mid = event.get('message_id') or payload.get('message_id')
+                parent = (payload.get('reply_to_message_id') or payload.get('parent_message_id')
+                          or event.get('reply_to_message_id') or event.get('parent_message_id'))
+                if parent and parent != mid and parent not in linked_ids:
                     continue
                 seq = event.get('seq', 0)
-                if seq in seen_seqs:
+                is_assistant = event.get('event_name') == 'message.assistant'
+                if isinstance(mid, str) and mid and (is_assistant or parent in linked_ids):
+                    linked_ids.add(mid)
+                if not is_assistant:
+                    continue
+                reply_id = mid or seq
+                status = payload.get('status')
+                if status in ACTIVE_REPLY_STATES or payload.get('display_text_ready') is False:
+                    active_replies.add(reply_id)
+                    continue
+                active_replies.discard(reply_id)
+                if status not in COMPLETED_REPLY_STATES or seq in seen_seqs:
                     continue
                 seen_seqs.add(seq)
-                new_found = True
+                seen_ids.add(mid if isinstance(mid, str) and mid else f'seq:{seq}')
                 text = payload.get('display_text')
                 if isinstance(text, str) and text:
                     clean, found = extract_file_media(text)
                     if clean:
                         texts.append(clean)
                     media = merge_media(media, found)
-                mid = event.get('message_id')
                 if isinstance(mid, str) and mid:
                     last_id = mid
-            if not texts:
-                return [], [], None
-            if not new_found:
-                break
+            if not (texts or media):
+                return [], [], None, None
             if round_no < QUERY_SETTLE_ROUNDS - 1:
                 time.sleep(1.0)
-        return texts, media, last_id
+        if active_replies:
+            return [], [], None, None
+        return texts, media, last_id, {
+            'session_id': session_id, 'track': 'gadget', 'baseline_seq': 0,
+            'anchor_seq': anchor_seq, 'ack_id': ack_message_id,
+            'seen_ids': sorted(seen_ids), 'linked_ids': sorted(linked_ids),
+        }
 
     def _worker_alive(self, pid: int) -> bool:
         """True when the worker is alive; an unreadable state fails safe to alive.
@@ -1070,6 +1158,7 @@ class GadgetExecutor:
         if isinstance(result, dict) and result.get('state') == 'sent':
             mid = result.get('message_id')
             if isinstance(mid, str) and mid:
+                self.store.record_folded_platform_message(context.claim, mid)
                 return ExecutionOutcome('accepted', run_id=run_id, message_id=mid)
         return ExecutionOutcome('unknown', evidence='fold_send_unconfirmed')
 
@@ -1089,12 +1178,18 @@ class GadgetExecutor:
         binding = self._binding(context, run_id)
         if binding is None:
             return ExecutionOutcome('unknown', evidence='platform_run_identity_unavailable')
+        remote_cancelled = self._cancel_server_turn(context, binding) if self.server_cancel else False
+        self._validate_owner(context)
         pid = self._worker_pid(binding['platform_run_id'])
-        if pid is not None:
-            try:
-                self.client.stop_turn(pid)
-            except Exception as exc:
-                return ExecutionOutcome('unknown', evidence=str(exc))
+        if pid is None:
+            return ExecutionOutcome('unknown', evidence='worker_pid_unavailable')
+        try:
+            if not self.client.stop_turn(pid):
+                return ExecutionOutcome('unknown', evidence='worker_stop_unconfirmed')
+        except Exception as exc:
+            return ExecutionOutcome('unknown', evidence=str(exc))
+        if remote_cancelled:
+            return ExecutionOutcome('cancelled', evidence='platform_turn_cancelled_via_native')
         result = self.client.read_result(context.claim.attempt_id)
         if isinstance(result, dict) and result.get('state') == 'cancelled':
             evidence = str(result.get('evidence') or 'platform_turn_cancelled')
@@ -1102,6 +1197,55 @@ class GadgetExecutor:
                 evidence = f"{evidence}; server_turn_may_continue"
             return ExecutionOutcome('cancelled', evidence=evidence)
         return ExecutionOutcome('cancelled', evidence=GADGET_CANCEL_LOCAL_ONLY)
+
+    def _cancel_server_turn(self, context: ExecutionContext, binding) -> bool:
+        """Cancel only when history identifies this task as the latest session turn."""
+        if self.history_client_factory is None:
+            return False
+        client = None
+        try:
+            result = self.client.read_result(context.claim.attempt_id) or {}
+            ack = result.get('ack_message_id') or (
+                result.get('message_id') if result.get('state') == 'running' else None)
+            if not isinstance(ack, str) or not ack:
+                return False
+            client = self.history_client_factory()
+            body = {'session_id': binding['session_id'], 'limit': HISTORY_LIMIT}
+            response = client.call_json('chat.history', body=body, timeout=5)
+            events = response.get('chat_events', []) if isinstance(response, dict) else []
+            users = sorted((event for event in events if event.get('event_name') == 'message.user'),
+                           key=lambda event: event.get('seq', 0))
+            anchor = next((event for event in users if event.get('message_id') == ack), None)
+            allowed = {ack, *self.store.folded_platform_messages(context.claim.task_id)}
+            if anchor is None or any(event.get('message_id') not in allowed
+                                     for event in users if event.get('seq', 0) > anchor.get('seq', 0)):
+                return False
+            tasks = {event.get('payload', {}).get('task_id') for event in events
+                     if event.get('event_name') == 'task.status'
+                     and event.get('seq', 0) > anchor.get('seq', 0)
+                     and event.get('payload', {}).get('status') == 'running'}
+            tasks.discard(None)
+            self._validate_owner(context)
+            client.call_json('chat.cancel', body={'session_id': binding['session_id']}, timeout=5)
+            response = client.call_json('chat.history', body=body, timeout=5)
+            events = response.get('chat_events', []) if isinstance(response, dict) else []
+            return any(
+                event.get('event_name') == 'task.status'
+                and event.get('seq', 0) > anchor.get('seq', 0)
+                and event.get('payload', {}).get('status') in ('cancelled', 'canceled')
+                and (event.get('payload', {}).get('task_id') in tasks
+                     or event.get('payload', {}).get('reply_to_message_id') in allowed)
+                for event in events)
+        except OwnershipError:
+            raise
+        except Exception:
+            return False
+        finally:
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    pass
 
     def close(self) -> None:
         """Close the underlying client; live workers keep running so their results survive."""
@@ -1132,12 +1276,15 @@ class DualTrackExecutor:
         primary: GadgetExecutor | None = None,
         fallback: MuseExecutor | None = None,
         circuit: CircuitBreaker | None = None,
+        modes: str | Path | None = None,
     ):
         self.store = store
         ensure_executor_schema(store)
         self.primary = primary or GadgetExecutor(store, history_client_factory=bridge_client)
         self.fallback = fallback or MuseExecutor(store)
         self.circuit = circuit or CircuitBreaker()
+        from .handoff import HookHandoffExecutor
+        self.handoff = HookHandoffExecutor(store, modes)
 
     def current_track(self, attempt_id: str) -> str | None:
         """根据 attempt_id 查询当前任务绑定的执行轨 ('gadget' 或 'native')。"""
@@ -1152,20 +1299,44 @@ class DualTrackExecutor:
         """获取当前熔断器状态。"""
         return self.circuit.status
 
+    def poll_replies(self) -> str:
+        """Check one due completed turn without submitting or regenerating work."""
+        from .replies import Replies
+
+        def fetch_history(watch: dict) -> list:
+            """Read the original session using its configured transport."""
+            if watch['track'] == 'gadget':
+                factory = self.primary.history_client_factory
+                if factory is None:
+                    return []
+            else:
+                factory = self.fallback.client_factory
+            client = factory()
+            try:
+                response = client.call_json('chat.history', body={
+                    'session_id': watch['session_id'], 'limit': HISTORY_LIMIT,
+                }, timeout=5)
+                if not isinstance(response, dict) or not isinstance(response.get('chat_events'), list):
+                    raise ValueError('history response has no event list')
+                return response['chat_events']
+            finally:
+                client.close()
+
+        return Replies(self.store).tick(fetch_history)
+
     def submit(self, context: ExecutionContext) -> ExecutionOutcome:
         """提交任务：优先主轨，故障/熔断时平滑降级至备轨。
 
-        带媒体的任务不走 Gadget 轨：Gadget worker 只发纯文本，直接送
-        过去会把媒体静默丢掉，所以媒体任务直走 Native 备轨（它按
-        reference/muse-client message.ts 的图片 schema 发图）。
+        支持的图片与文字一起走 Gadget；未配置或故障时走 Native。
+        其他媒体保留 Native 的显式能力校验，不能静默丢弃。
         """
-        # Media tasks never touch the Gadget track: its worker sends
-        # text only, so routing them there would silently drop the media.
-        if getattr(context, 'media', None):
-            return self.fallback.submit(context)
+        # Only image inputs have a documented Gadget message representation.
+        if any(not isinstance(item, dict) or item.get('kind') != 'image'
+               for item in getattr(context, 'media', []) or []):
+            return self._submit_native(context)
         # 1. 检查主轨凭证与熔断状态
         if not self.primary.is_configured() or not self.circuit.can_execute():
-            return self.fallback.submit(context)
+            return self._submit_native(context)
 
         # 2. 尝试主轨提交
         try:
@@ -1175,7 +1346,7 @@ class DualTrackExecutor:
                 if outcome.evidence in ('cancelled_before_submission', 'cancelled_before_stream'):
                     return outcome
                 self.circuit.record_failure()
-                return self.fallback.submit(context)
+                return self._submit_native(context)
             elif outcome.state == 'accepted':
                 self.circuit.record_success()
                 return outcome
@@ -1186,15 +1357,29 @@ class DualTrackExecutor:
                 ).fetchone()
                 if not row or not row['platform_run_id']:
                     self.circuit.record_failure()
-                    return self.fallback.submit(context)
+                    return self._submit_native(context)
             return outcome
+        except OwnershipError:
+            raise
         except Exception:
             self.circuit.record_failure()
-            return self.fallback.submit(context)
+            return self._submit_native(context)
+
+    def _submit_native(self, context: ExecutionContext) -> ExecutionOutcome:
+        """Offer to opted-in Core hooks only after explicit proof Native never sent."""
+        outcome = self.fallback.submit(context)
+        if (outcome.state == 'not_submitted' and outcome.evidence
+                and not outcome.evidence.startswith('cancelled_')):
+            if self.handoff.enabled(context):
+                return self.handoff.submit(context, outcome.evidence)
+            return ExecutionOutcome('failed', evidence=outcome.evidence)
+        return outcome
 
     def query(self, context: ExecutionContext, run_id: str | None) -> ExecutionOutcome:
         """根据持久化绑定的 track 严格分发，严禁跨轨串话。"""
         track = self.current_track(context.claim.attempt_id)
+        if track == 'hooks':
+            return self.handoff.query(context, run_id)
         if track == 'gadget':
             try:
                 outcome = self.primary.query(context, run_id)
@@ -1213,7 +1398,7 @@ class DualTrackExecutor:
                         (context.claim.attempt_id,),
                     )
                 try:
-                    fallback_outcome = self.fallback.submit(context)
+                    fallback_outcome = self._submit_native(context)
                 except Exception as exc:
                     # The fallback never bound a run: fail explicitly with
                     # evidence instead of bubbling into an unknown wedge.
@@ -1230,20 +1415,22 @@ class DualTrackExecutor:
                     # runner keeps polling the live run on the next tick.
                     try:
                         self.store.rebind_run(context.claim, fallback_outcome.run_id)
+                    except OwnershipError:
+                        # A later owner repairs the accepted binding before
+                        # polling. Keep the durable Native run recoverable.
+                        raise
                     except Exception as exc:
-                        # The native run is live but the runner can no
-                        # longer poll it (the attempt still points at the
-                        # dead gadget run). Fail explicitly with evidence
-                        # instead of letting the exception wedge the task
-                        # in unknown forever.
+                        # Keep the accepted run for the next owned query,
+                        # which reconciles the two durable identities.
                         return ExecutionOutcome(
-                            'failed',
+                            'unknown',
                             evidence=f"fallback_rebind_failed:{type(exc).__name__}:{exc}"[:200])
                     return ExecutionOutcome('running')
                 return fallback_outcome
             return outcome
         elif track == 'native':
             try:
+                run_id = self._recover_native_binding(context, run_id)
                 return self.fallback.query(context, run_id)
             except Exception as exc:
                 return ExecutionOutcome('unknown', evidence=str(exc))
@@ -1253,6 +1440,8 @@ class DualTrackExecutor:
     def cancel(self, context: ExecutionContext, run_id: str | None) -> ExecutionOutcome:
         """根据持久化绑定的 track 严格分发取消请求。"""
         track = self.current_track(context.claim.attempt_id)
+        if track == 'hooks':
+            return self.handoff.cancel(context, run_id)
         if track == 'gadget':
             try:
                 return self.primary.cancel(context, run_id)
@@ -1260,11 +1449,29 @@ class DualTrackExecutor:
                 return ExecutionOutcome('unknown', evidence=str(exc))
         elif track == 'native':
             try:
+                run_id = self._recover_native_binding(context, run_id)
                 return self.fallback.cancel(context, run_id)
             except Exception as exc:
                 return ExecutionOutcome('unknown', evidence=str(exc))
         else:
             return ExecutionOutcome('unknown', evidence='no_track_binding')
+
+    def _recover_native_binding(self, context: ExecutionContext, run_id: str | None) -> str | None:
+        """Repair an accepted fallback interrupted between its two local commits."""
+        binding = self.store.connection.execute(
+            "SELECT platform_run_id,status FROM executor_runs WHERE attempt_id=? AND track='native'",
+            (context.claim.attempt_id,),
+        ).fetchone()
+        if binding is not None and binding['status'] == 'accepted' and binding['platform_run_id']:
+            persisted_run = binding['platform_run_id']
+            attempt = self.store.connection.execute(
+                'SELECT run_id FROM execution_attempts WHERE id=?', (context.claim.attempt_id,),
+            ).fetchone()
+            if (attempt is not None and attempt['run_id'] != persisted_run
+                    and run_id in (None, attempt['run_id'])):
+                self.store.rebind_run(context.claim, persisted_run)
+                return persisted_run
+        return run_id
 
     def reply_started(self, context: ExecutionContext, run_id: str | None) -> bool:
         """Route the reply-started check to the track bound to this attempt.
