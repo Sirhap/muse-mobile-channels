@@ -12,10 +12,15 @@ bad(){ FAIL=$((FAIL+1)); echo "FAIL: $1"; }
 
 WS="$ROOT/ws"; UNITS="$ROOT/etc"; STATE="$ROOT/state"; BIN="$ROOT/bin"
 mkdir -p "$WS"/{wecom-bot,weixin-bot,native-bridge,approval-relay,channel-restore} "$UNITS" "$STATE" "$BIN"
+mkdir -p "$WS/channel-restore/wecom-bot.service.d" "$WS/channel-restore/approval-relay.service.d" "$UNITS/wecom-bot.service.d" "$UNITS/approval-relay.service.d"
 for rel in wecom-bot/wecom-bot.service weixin-bot/weixin-bot.service native-bridge/native-bridge.service approval-relay/approval-relay.service channel-restore/channel-restore.service channel-restore/channel-restore.timer; do
   echo "unit $rel" > "$WS/$rel"
   echo "unit $rel" > "$UNITS/$(basename "$rel")"
 done
+echo "dropin wecom" > "$WS/channel-restore/wecom-bot.service.d/core-mode.conf"
+echo "dropin wecom" > "$UNITS/wecom-bot.service.d/core-mode.conf"
+echo "dropin relay" > "$WS/channel-restore/approval-relay.service.d/modes.conf"
+echo "dropin relay" > "$UNITS/approval-relay.service.d/modes.conf"
 cat > "$BIN/restore" <<'EOF'
 #!/usr/bin/env bash
 echo x >> "$FAKE_COUNT_FILE"
@@ -23,6 +28,10 @@ echo x >> "$FAKE_COUNT_FILE"
 for rel in wecom-bot/wecom-bot.service weixin-bot/weixin-bot.service native-bridge/native-bridge.service approval-relay/approval-relay.service channel-restore/channel-restore.service channel-restore/channel-restore.timer; do
   cp "$FAKE_WS/$rel" "$FAKE_UNIT_DIR/$(basename "$rel")"
 done
+# And the drop-in overrides (core-mode env): same missing/differ rule.
+mkdir -p "$FAKE_UNIT_DIR/wecom-bot.service.d" "$FAKE_UNIT_DIR/approval-relay.service.d"
+cp "$FAKE_WS/channel-restore/wecom-bot.service.d/core-mode.conf" "$FAKE_UNIT_DIR/wecom-bot.service.d/core-mode.conf"
+cp "$FAKE_WS/channel-restore/approval-relay.service.d/modes.conf" "$FAKE_UNIT_DIR/approval-relay.service.d/modes.conf"
 echo "fake restore: healed"
 EOF
 cat > "$BIN/systemctl" <<'EOF'
@@ -67,6 +76,19 @@ FAKE_DOWN="channel-restore.timer" run_heal
 echo tampered > "$UNITS/wecom-bot.service"
 backdate 300 "$STATE/hook-heal.last-attempt"
 run_heal; [[ "$(calls)" == "4" ]] && grep -q '^unit ' "$UNITS/wecom-bot.service" && ok "differing-unit-healed" || bad "differing-unit-healed calls=$(calls)"
+
+# 7. Drop-in missing -> restore called, drop-in restored.
+# (2026-11-07: a VM replacement wiped /etc drop-ins while the units
+# stayed; the service stayed active yet silently legacy. The cheap
+# check must catch a missing drop-in too.)
+rm "$UNITS/wecom-bot.service.d/core-mode.conf"
+backdate 300 "$STATE/hook-heal.last-attempt"
+run_heal; [[ "$(calls)" == "5" && -f "$UNITS/wecom-bot.service.d/core-mode.conf" ]] && ok "missing-dropin-healed" || bad "missing-dropin-healed calls=$(calls)"
+
+# 8. Differing drop-in content counts as unhealthy.
+echo tampered > "$UNITS/approval-relay.service.d/modes.conf"
+backdate 300 "$STATE/hook-heal.last-attempt"
+run_heal; [[ "$(calls)" == "6" ]] && grep -q '^dropin relay' "$UNITS/approval-relay.service.d/modes.conf" && ok "differing-dropin-healed" || bad "differing-dropin-healed calls=$(calls)"
 
 echo "test_hook_heal: PASS=$PASS FAIL=$FAIL"
 [[ "$FAIL" == "0" ]]

@@ -53,6 +53,29 @@ UNITS=(
 )
 SERVICES=(wecom-bot weixin-bot native-bridge approval-relay)
 
+# Drop-in overrides (core-mode env) that must survive a VM replacement
+# alongside the units. A service can be active yet silently legacy
+# without its drop-in (seen 2026-11-07: the 12:43 replacement wiped
+# /etc drop-ins, both services stayed active in legacy mode), so these
+# are checked on every poll too. Paths are /etc-relative; the workspace
+# copy lives under channel-restore/<same path>.
+DROPINS=(
+  "wecom-bot.service.d/core-mode.conf"
+  "approval-relay.service.d/modes.conf"
+)
+
+dropins_unhealthy() {
+  local rel src dst
+  for rel in "${DROPINS[@]}"; do
+    src="$WS/channel-restore/$rel"
+    dst="$UNIT_DIR/$rel"
+    [[ -f "$src" ]] || return 1
+    [[ -f "$dst" ]] || return 0
+    cmp -s "$src" "$dst" || return 0
+  done
+  return 1
+}
+
 units_unhealthy() {
   local rel src dst
   for rel in "${UNITS[@]}"; do
@@ -92,7 +115,7 @@ deep_unhealthy() {
 main() {
   mkdir -p "$STATE_DIR" 2>/dev/null || exit 0
   local need_heal=0
-  if units_unhealthy; then
+  if units_unhealthy || dropins_unhealthy; then
     need_heal=1
   elif [[ "$(stamp_age "$DEEP_STAMP")" -ge "$THROTTLE_SECS" ]]; then
     touch "$DEEP_STAMP" 2>/dev/null || true
@@ -106,7 +129,7 @@ main() {
   flock -n 9 || exit 0
   [[ "$(stamp_age "$ATTEMPT_STAMP")" -ge "$THROTTLE_SECS" ]] || exit 0
   # Re-check inside the lock: the other hook may have just healed.
-  if ! units_unhealthy && ! deep_unhealthy; then
+  if ! units_unhealthy && ! dropins_unhealthy && ! deep_unhealthy; then
     exit 0
   fi
   touch "$ATTEMPT_STAMP" 2>/dev/null || true

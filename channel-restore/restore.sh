@@ -6,8 +6,12 @@
 # workspace copies do. This script, for each gateway service:
 #   1. reinstalls the unit from the workspace copy if it is missing or
 #      differs, then daemon-reloads
-#   2. enables the service if needed and starts it if not active
-#   3. verifies the service is active and reports the gateway state
+#   2. reinstalls the service's drop-in overrides (core-mode env) the
+#      same way; a changed drop-in restarts the service, because a
+#      running process keeps the environment it started with and would
+#      otherwise stay silently legacy
+#   3. enables the service if needed and starts it if not active
+#   4. verifies the service is active and reports the gateway state
 # It also reinstalls its own service and timer. Those units are what
 # invoke this script; a replacement VM otherwise loses the schedule.
 # Safe to run any time: when everything is healthy it changes
@@ -56,6 +60,33 @@ install_unit() {
   return 0
 }
 
+install_dropins() {
+  # Sync a service's systemd drop-in overrides from the workspace copy.
+  # A drop-in carries the MUSE_CHANNEL_MODES env that selects core mode;
+  # without it the service stays active yet silently legacy (seen
+  # 2026-11-07: the 12:43 replacement wiped /etc drop-ins and both
+  # services ran legacy for 24 minutes). Sets DROPIN_CHANGED=1 (and
+  # RELOAD=1) when any file was (re)installed, so the caller can
+  # daemon-reload and restart the service. Services without a workspace
+  # drop-in dir (e.g. weixin-bot, legacy by design) are untouched.
+  # $1 = service name, $2 = workspace drop-in dir, relative to $WS.
+  local svc="$1" srcdir="$WS/$2"
+  local dstdir="/etc/systemd/system/$svc.service.d"
+  [[ -d "$srcdir" ]] || return 0
+  mkdir -p "$dstdir"
+  local src dst
+  for src in "$srcdir"/*.conf; do
+    [[ -f "$src" ]] || continue
+    dst="$dstdir/$(basename "$src")"
+    if [[ ! -f "$dst" ]] || ! cmp -s "$src" "$dst"; then
+      cp "$src" "$dst" && echo "$svc: drop-in (re)installed: $(basename "$src")"
+      DROPIN_CHANGED=1
+      RELOAD=1
+    fi
+  done
+  return 0
+}
+
 ensure_hatch_tree() {
   local path="$1"
   local owner=""
@@ -89,6 +120,12 @@ heal_one() {
     cp "$src" "$dst" && echo "$svc: unit (re)installed from workspace copy"
     RELOAD=1
   fi
+  # Drop-in overrides (core-mode env) live beside the unit copy in
+  # channel-restore/. A changed drop-in must restart the service: a
+  # running process keeps the environment it started with, so install
+  # + reload alone would leave it silently legacy.
+  DROPIN_CHANGED=0
+  install_dropins "$svc" "channel-restore/$svc.service.d"
   if [[ "$RELOAD" == "1" ]]; then
     systemctl daemon-reload
     RELOAD=0
@@ -102,6 +139,9 @@ heal_one() {
   fi
   if ! systemctl is-active --quiet "$svc" 2>/dev/null; then
     systemctl start "$svc" 2>/dev/null && echo "$svc: started"
+    sleep 3
+  elif [[ "$DROPIN_CHANGED" == "1" ]]; then
+    systemctl restart "$svc" 2>/dev/null && echo "$svc: restarted (drop-in changed)"
     sleep 3
   fi
   if systemctl is-active --quiet "$svc" 2>/dev/null; then
@@ -186,6 +226,7 @@ main() {
   local WS="$HOME_DIR/workspace"
   local FAIL=0
   local RELOAD=0
+  local DROPIN_CHANGED=0
 
   install_unit "$WS/channel-restore/channel-restore.service" || FAIL=1
   install_unit "$WS/channel-restore/channel-restore.timer" || FAIL=1
@@ -230,8 +271,14 @@ heal_relay() {
     echo "$svc: FAIL workspace unit copy missing: $src"
     return 1
   fi
+  local changed=0
   if [[ ! -f "$dst" ]] || ! cmp -s "$src" "$dst"; then
     cp "$src" "$dst" && echo "$svc: unit (re)installed from workspace copy"
+    changed=1
+  fi
+  DROPIN_CHANGED=0
+  install_dropins "$svc" "channel-restore/$svc.service.d"
+  if [[ "$changed" == "1" || "$DROPIN_CHANGED" == "1" ]]; then
     systemctl daemon-reload
   fi
   if ! systemctl is-enabled --quiet "$svc" 2>/dev/null; then
@@ -239,6 +286,8 @@ heal_relay() {
   fi
   if ! systemctl is-active --quiet "$svc" 2>/dev/null; then
     systemctl start "$svc" 2>/dev/null && echo "$svc: started"
+  elif [[ "$DROPIN_CHANGED" == "1" ]]; then
+    systemctl restart "$svc" 2>/dev/null && echo "$svc: restarted (drop-in changed)"
   fi
   systemctl is-active --quiet "$svc" 2>/dev/null && echo "$svc: active"
 }
