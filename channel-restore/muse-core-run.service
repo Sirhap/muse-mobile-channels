@@ -1,0 +1,20 @@
+[Unit]
+Description=Muse core runner for WeCom core-mode trial (DualTrackExecutor: Gadget primary, Native fallback)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=/home/hatch/workspace
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-/etc/environment
+Environment=HOME=/home/hatch
+Environment=MUSE_HOME=/home/hatch
+ExecStart=/home/hatch/muse-test-venv/bin/python -m mobile_channels core-run --database /home/hatch/workspace/state/core.sqlite3 --modes /home/hatch/workspace/state/channel-modes.json
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

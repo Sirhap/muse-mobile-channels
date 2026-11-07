@@ -93,7 +93,6 @@ native-probe/probe*_results.txt
 native-probe/probe*_stdout.log
 native-probe/probe*_*.log
 channel-restore/outbound-probe-draft-*.md
-channel-restore/muse-core-run.service
 channel-restore/outbound_probe_state.json
 native-bridge/.fallback-weixin
 hooks/state/
