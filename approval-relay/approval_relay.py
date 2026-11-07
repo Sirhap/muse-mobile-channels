@@ -42,6 +42,10 @@ OFFSET_F = os.path.join(BASE, "decisions.offset")
 POLL_SECS = 20
 AUTH_RETRY_SECS = 600
 MAX_CONNECT_FAILURES = 3
+# Debounce 2026-11-07: a single failed poll is network jitter, not an
+# outage. Only MAX_CONNECT_FAILURES consecutive failures declare an
+# outage (and send one user notice); the same count already exhausts
+# the retry budget, so declaration and pause coincide.
 STICKY_DECISION_SECS = 30 * 60  # prefer_source sticky window
 CHANNEL_ORDER = ("weixin", "wecom")
 SUPPORTED_DECISION_CHANNELS = ("weixin", "wecom", "feishu")
@@ -1011,24 +1015,38 @@ def _credential_health(st):
 
 
 def _health_notice(health, text, phase):
-    """Retain a stable event until an outbox accepts it, including after restart."""
+    """Retain a stable event until an outbox accepts it, including after restart.
+
+    Only called for declared outages (see _connection_failed): a single
+    network jitter never reaches this function, so the user sees at most
+    one failed+recovered pair per real outage.
+    """
     health.setdefault("pending_notices", []).append({
         "id": f"{health['incident_id']}-{phase}", "text": text,
     })
 
 
 def _connection_failed(st, health, exc, now):
-    """Persist bounded retries without storing potentially sensitive exceptions."""
+    """Persist bounded retries without storing potentially sensitive exceptions.
+
+    Debounce: failures below MAX_CONNECT_FAILURES are jitter, not an
+    outage -- they are counted for the retry budget but declare nothing
+    and notify nobody. The outage is declared (and notified once) only
+    when the streak reaches the threshold, which is also when retries
+    pause. A new streak gets a fresh incident id so its notice can never
+    collide with a previous outage's stable id.
+    """
     kind = failure_kind(exc)
-    if not health.get("outage_active"):
+    count = int(health.get("failures", 0)) + 1
+    if count == 1:
         health["incident_id"] = uuid.uuid4().hex
         health["failure_notice_created"] = False
-    count = int(health.get("failures", 0)) + 1
     delay = AUTH_RETRY_SECS if kind in {"auth", "configuration"} else (5 if count == 1 else 10)
+    declared = count >= MAX_CONNECT_FAILURES
     health.update(state="failed", failure_kind=kind, failures=count,
                   reconnect_exhausted=count >= MAX_CONNECT_FAILURES,
-                  next_attempt_at=now + delay, outage_active=True)
-    if not health.get("failure_notice_created"):
+                  next_attempt_at=now + delay, outage_active=declared)
+    if declared and not health.get("failure_notice_created"):
         if kind == "auth":
             text = ("审批监听认证失败，当前无法读取或提交审批。请在已登录 Muse 的浏览器安装凭证扩展，"
                     "重新导出完整 muse-credentials.zip 文件交给 Muse 安装并验活；只更新 token 无法恢复审批监听。"
@@ -1037,10 +1055,12 @@ def _connection_failed(st, health, exc, now):
             text = ("审批监听凭证文件缺失或格式无效。请把浏览器扩展导出的完整 muse-credentials.zip "
                     "文件交给 Muse 核对并安装；只更新 token 无法恢复审批监听。重试有次数上限。")
         else:
-            text = ("审批监听连接异常，尚不能确认是凭证问题。将有限重试，连续失败 3 次后暂停；"
+            text = ("审批监听连接异常，已连续 3 次无法读取审批列表，重试已暂停。"
                     "请让 Muse 检查网络、依赖和连接状态，排除问题后通过受控运维方式恢复。")
         _health_notice(health, text, "failed")
         health["failure_notice_created"] = True
+    elif not declared:
+        log("approval health below declare threshold", count)
     save_state(st)
 
 

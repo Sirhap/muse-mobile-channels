@@ -67,25 +67,31 @@ class RelayCredentialHealthTests(unittest.TestCase):
         """Inject the observed service-side session rejection, without secrets."""
         self.relay.connect.side_effect = RuntimeError('auth/check 401 hatchAdmissionInvalidated')
 
-    def test_auth_failure_notifies_once_and_retries_after_600_seconds(self):
-        """A busy polling loop must neither reconnect nor repeatedly notify."""
+    def test_auth_failure_never_notifies_user_and_retries_after_600_seconds(self):
+        """2026-11-07: a busy polling loop must neither reconnect nor notify the user."""
         self.fail_auth()
         self.cycle()
         self.now += 599
         self.cycle()
         self.assertEqual(self.relay.connect.call_count, 1)
-        self.assertEqual(self.notify.call_count, 1)
+        self.assertEqual(self.notify.call_count, 0)
         self.now += 1
         self.cycle()
         self.assertEqual(self.relay.connect.call_count, 2)
-        self.assertEqual(self.notify.call_count, 1)
+        self.assertEqual(self.notify.call_count, 0)
 
-    def test_restart_retains_failure_budget_and_notice_deduplication(self):
-        """A supervisor restart cannot reset a rejected credential's retry budget."""
+    def test_restart_retains_failure_budget_and_declared_outage_notice(self):
+        """A supervisor restart cannot reset a rejected credential's retry budget.
+
+        2026-11-07 debounce: the third consecutive failure declares the
+        outage and queues exactly one user notice; the restart must not
+        re-declare it or retry the connection.
+        """
         self.fail_auth()
         for _ in range(3):
             self.cycle()
             self.now += 600
+        self.assertEqual(self.notify.call_count, 1)
         self.relay = self.module()
         self.fail_auth()
         self.cycle()
@@ -94,11 +100,16 @@ class RelayCredentialHealthTests(unittest.TestCase):
         self.assertTrue(self.health()['reconnect_exhausted'])
 
     def test_only_cookie_or_vm_change_revives_parked_relay(self):
-        """Changing the unused static token must not trigger another cookie request."""
+        """Changing the unused static token must not trigger another cookie request.
+
+        2026-11-07 debounce: the declared outage queues one failed notice;
+        the recovery after a credential change queues one recovered notice.
+        """
         self.fail_auth()
         for _ in range(3):
             self.cycle()
             self.now += 600
+        self.assertEqual(self.notify.call_count, 1)
         credentials = Path(self.relay.CONF)
         credentials.mkdir()
         (credentials / 'token.json').write_text('{}')
@@ -111,7 +122,7 @@ class RelayCredentialHealthTests(unittest.TestCase):
         self.assertEqual(self.health()['state'], 'healthy')
         self.assertEqual(self.notify.call_count, 2)
 
-    def test_successful_rpc_recovers_once_despite_later_decision_error(self):
+    def test_successful_rpc_recovers_without_user_notice_despite_later_decision_error(self):
         """A later local processing error cannot erase actual authentication evidence."""
         self.fail_auth()
         self.cycle()
@@ -121,31 +132,38 @@ class RelayCredentialHealthTests(unittest.TestCase):
         self.cycle()
         self.cycle()
         self.assertEqual(self.health()['state'], 'healthy')
-        self.assertEqual(self.notify.call_count, 2)
+        self.assertEqual(self.notify.call_count, 0)
         self.assertEqual(self.health()['last_verified_at'], self.now)
         self.assertEqual(json.loads((self.base / 'status.json').read_text())['active_source'], 'cookies')
 
-    def test_pending_health_notice_survives_failure_and_uses_stable_id(self):
-        """An unavailable outbox retains the same event for subsequent retries."""
+    def test_failed_health_notice_is_never_queued_to_user(self):
+        """2026-11-07: a failed cycle keeps its retry budget but queues no user notice."""
         self.fail_auth()
         self.notify.side_effect = OSError('no channel')
         self.cycle()
-        first_id = self.notify.call_args.kwargs['event_id']
+        self.assertEqual(self.notify.call_count, 0)
+        self.assertEqual(self.health()['pending_notices'], [])
         self.relay = self.module()
         self.fail_auth()
         self.notify.side_effect = None
         self.cycle()
-        self.assertEqual(first_id, self.notify.call_args.kwargs['event_id'])
+        self.assertEqual(self.notify.call_count, 0)
         self.assertEqual(self.relay.connect.call_count, 0)
         self.assertEqual(self.health()['failures'], 1)
 
-    def test_network_retry_budget_uses_short_backoff_and_never_claims_expiry(self):
-        """Transport errors have their own diagnosis and bounded retry cadence."""
+    def test_network_retry_budget_declares_outage_on_third_failure(self):
+        """Transport errors have their own diagnosis and bounded retry cadence.
+
+        2026-11-07 debounce: the first two failures are jitter (no user
+        notice); the third consecutive failure declares the outage and
+        queues exactly one notice.
+        """
         self.relay.connect.side_effect = TimeoutError('transport timeout')
         self.cycle()
         self.now += 4
         self.cycle()
         self.assertEqual(self.relay.connect.call_count, 1)
+        self.assertEqual(self.notify.call_count, 0)
         self.now += 1
         self.cycle()
         self.now += 10
@@ -155,7 +173,7 @@ class RelayCredentialHealthTests(unittest.TestCase):
         self.assertEqual(self.relay.connect.call_count, 3)
         self.assertTrue(self.health()['reconnect_exhausted'])
         self.assertEqual(self.health()['failure_kind'], 'network')
-        self.assertNotIn('凭证已失效', self.notify.call_args.args[0])
+        self.assertEqual(self.notify.call_count, 1)
 
     def test_close_failure_does_not_erase_health_or_status(self):
         """Client cleanup cannot turn successful verification into a missing status."""
@@ -174,15 +192,28 @@ class RelayCredentialHealthTests(unittest.TestCase):
         self.assertEqual(self.health()['state'], 'healthy')
         self.assertEqual(self.health()['failures'], 0)
 
-    def test_health_notification_is_committed_before_outbox(self):
-        """Crash recovery can find the event even when sending interrupts the process."""
+    def test_health_failure_below_threshold_is_recorded_without_user_notice(self):
+        """2026-11-07 debounce: one failure counts toward the retry budget
+        but declares no outage and queues no user notice."""
         self.fail_auth()
-        def check_durable(*args, **kwargs):
-            """Inspect persistence at the actual notification boundary."""
-            self.assertTrue(self.health()['pending_notices'])
-            self.assertEqual(self.health()['pending_notices'][0]['id'], kwargs['event_id'])
-        self.notify.side_effect = check_durable
         self.cycle()
+        self.assertEqual(self.health()['pending_notices'], [])
+        self.assertEqual(self.health()['failures'], 1)
+        self.assertFalse(self.health()['outage_active'])
+        self.assertEqual(self.notify.call_count, 0)
+
+    def test_third_consecutive_failure_declares_outage_and_notifies_once(self):
+        """2026-11-07 debounce: the third consecutive failure declares the
+        outage and queues exactly one user notice."""
+        self.fail_auth()
+        self.cycle()
+        self.now += 600
+        self.cycle()
+        self.now += 600
+        self.cycle()
+        self.assertEqual(self.health()['failures'], 3)
+        self.assertTrue(self.health()['outage_active'])
+        self.assertEqual(self.notify.call_count, 1)
 
     def test_invalid_configuration_uses_auth_backoff_without_leaking_error(self):
         """Malformed or missing files pause safely without copying their contents."""
@@ -229,69 +260,61 @@ class RelayCredentialHealthTests(unittest.TestCase):
         self.assertEqual(self.relay.connect.call_count, 4)
         self.assertEqual(self.health()['state'], 'healthy')
 
-    def test_new_outage_on_same_credentials_has_a_new_stable_event(self):
-        """A recovery ends notification deduplication for the previous outage."""
+    def test_new_outage_after_recovery_sends_no_user_notice(self):
+        """2026-11-07: a second outage after recovery also stays log-only."""
         self.fail_auth()
         self.cycle()
-        original = self.notify.call_args.kwargs['event_id']
+        self.assertEqual(self.health()['state'], 'failed')
         self.now += 600
         self.relay.connect.side_effect = None
         self.cycle()
+        self.assertEqual(self.health()['state'], 'healthy')
         self.fail_auth()
         self.cycle()
-        self.assertEqual(self.notify.call_count, 3)
-        self.assertNotEqual(original, self.notify.call_args.kwargs['event_id'])
+        self.assertEqual(self.health()['state'], 'failed')
+        self.assertEqual(self.notify.call_count, 0)
+        self.assertEqual(self.health()['pending_notices'], [])
 
-    def test_failed_notice_is_preserved_before_recovery_with_changed_credentials(self):
-        """Outbox downtime must not erase an older fault when fresh cookies work."""
+    def test_recovery_with_changed_credentials_sends_no_user_notice(self):
+        """2026-11-07: recovery on fresh cookies is silent to the user."""
         self.fail_auth()
         self.notify.side_effect = OSError('channel offline')
         self.cycle()
-        fault_id = self.health()['pending_notices'][0]['id']
         credentials = Path(self.relay.CONF)
         credentials.mkdir()
         (credentials / 'cookies.txt').write_text('replacement')
         self.relay.connect.side_effect = None
         self.cycle()
-        pending = self.health()['pending_notices']
-        self.assertEqual(len(pending), 2)
-        self.assertEqual(pending[0]['id'], fault_id)
-        self.assertIn('恢复', pending[1]['text'])
+        self.assertEqual(self.health()['state'], 'healthy')
+        self.assertEqual(self.health()['pending_notices'], [])
         self.notify.reset_mock(side_effect=True)
         self.cycle()
-        self.assertEqual([call.kwargs['event_id'] for call in self.notify.call_args_list],
-                         [event['id'] for event in pending])
+        self.assertEqual(self.notify.call_count, 0)
         self.assertEqual(self.health()['pending_notices'], [])
 
-    def test_failed_notice_is_preserved_before_same_credential_recovery(self):
-        """A transient rejection also retains its fault event ahead of recovery."""
+    def test_recovery_after_transient_rejection_sends_no_user_notice(self):
+        """2026-11-07: a transient rejection followed by recovery is silent to the user."""
         self.fail_auth()
         self.notify.side_effect = OSError('channel offline')
         self.cycle()
-        fault = self.health()['pending_notices'][0]
+        self.assertEqual(self.health()['pending_notices'], [])
         self.now += 600
         self.relay.connect.side_effect = None
         self.cycle()
-        self.assertEqual(self.health()['pending_notices'][0], fault)
-        self.assertEqual(len(self.health()['pending_notices']), 2)
+        self.assertEqual(self.health()['state'], 'healthy')
+        self.assertEqual(self.health()['pending_notices'], [])
+        self.assertEqual(self.notify.call_count, 0)
 
-    def test_ack_save_failure_then_restart_does_not_append_duplicate(self):
-        """Replaying a durable event after outbox acceptance leaves one physical row."""
+    def test_failed_cycle_with_real_notify_writes_no_health_outbox_row(self):
+        """2026-11-07: with the real notify path, a failed cycle writes no health row."""
         path = self.base / 'weixin-outbox.jsonl'
         self.relay.notify = load_relay().notify
         self.relay.notify.__globals__['TEST'] = False
         self.relay.notify.__globals__['CHANNELS']['weixin']['outbox'] = str(path)
         self.fail_auth()
-        save = self.relay.save_state
-        def fail_ack(state):
-            """Fail exactly after notification removed the pending event in memory."""
-            if state['credential_health']['failure_notice_created'] and not state['credential_health']['pending_notices']:
-                raise OSError('ack failed')
-            save(state)
-        with patch.object(self.relay, 'save_state', side_effect=fail_ack):
-            with self.assertRaises(OSError):
-                self.cycle()
-        self.assertEqual(len(path.read_text().splitlines()), 1)
+        self.cycle()
+        self.assertFalse(path.exists())
+        self.assertEqual(self.health()['pending_notices'], [])
         self.relay = self.module()
         real_notify = load_relay().notify
         real_notify.__globals__['TEST'] = False
@@ -299,7 +322,7 @@ class RelayCredentialHealthTests(unittest.TestCase):
         self.relay.notify = real_notify
         self.fail_auth()
         self.cycle()
-        self.assertEqual(len(path.read_text().splitlines()), 1)
+        self.assertFalse(path.exists())
         self.assertEqual(self.health()['pending_notices'], [])
 
     def test_empty_or_nonstring_cookies_never_reach_gateway(self):

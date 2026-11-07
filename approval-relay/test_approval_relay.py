@@ -177,5 +177,91 @@ class PollTests(RelayTestCase):
         self.assertEqual(len(self.shadow_rows("weixin")), 1)
 
 
+class HealthNoticeDebounceTests(RelayTestCase):
+    """2026-11-07 debounce: one network jitter must not notify the user.
+
+    A single failed poll is a blip, not an outage. Only 3 consecutive
+    failures declare an outage (matching the MAX_CONNECT_FAILURES retry
+    budget), one "failed" notice per declared outage, and a "recovered"
+    notice only when a declared outage ends. A blip that recovers on its
+    own produces no user notice at all.
+    """
+
+    def _health(self, failures=0, outage_active=False):
+        return {"incident_id": "test-incident", "failures": failures,
+                "pending_notices": [], "outage_active": outage_active,
+                "failure_notice_created": False}
+
+    def test_single_failure_does_not_declare_outage_or_notify(self):
+        health = self._health()
+        st = {"credential_health": health}
+        relay._connection_failed(st, health, RuntimeError("boom"), 1794020220)
+        self.assertEqual(health["pending_notices"], [])
+        self.assertEqual(health["failures"], 1)
+        self.assertFalse(health["outage_active"])
+
+    def test_two_failures_still_below_declare_threshold(self):
+        health = self._health()
+        st = {"credential_health": health}
+        relay._connection_failed(st, health, RuntimeError("boom"), 1794020220)
+        relay._connection_failed(st, health, RuntimeError("boom"), 1794020240)
+        self.assertEqual(health["pending_notices"], [])
+        self.assertEqual(health["failures"], 2)
+        self.assertFalse(health["outage_active"])
+
+    def test_third_consecutive_failure_declares_outage_and_notifies_once(self):
+        health = self._health()
+        st = {"credential_health": health}
+        for now in (1794020220, 1794020240, 1794020260):
+            relay._connection_failed(st, health, RuntimeError("boom"), now)
+        self.assertTrue(health["outage_active"])
+        self.assertEqual(health["failures"], 3)
+        self.assertEqual(len(health["pending_notices"]), 1)
+        self.assertTrue(health["pending_notices"][0]["id"].endswith("-failed"))
+
+    def test_further_failures_do_not_renotify(self):
+        health = self._health()
+        st = {"credential_health": health}
+        for now in (1794020220, 1794020240, 1794020260, 1794020280):
+            relay._connection_failed(st, health, RuntimeError("boom"), now)
+        self.assertEqual(len(health["pending_notices"]), 1)
+
+    def test_recovery_after_declared_outage_notifies_once(self):
+        health = self._health()
+        st = {"credential_health": health}
+        for now in (1794020220, 1794020240, 1794020260):
+            relay._connection_failed(st, health, RuntimeError("boom"), now)
+        relay._connection_verified(st, health, 1794020280)
+        self.assertEqual(len(health["pending_notices"]), 2)
+        failed_id = health["pending_notices"][0]["id"]
+        recovered_id = health["pending_notices"][1]["id"]
+        self.assertTrue(failed_id.endswith("-failed"))
+        self.assertTrue(recovered_id.endswith("-recovered"))
+        self.assertEqual(failed_id[:-len("-failed")], recovered_id[:-len("-recovered")])
+        self.assertFalse(health["outage_active"])
+        self.assertEqual(health["failures"], 0)
+
+    def test_recovery_after_undeclared_blip_notifies_nothing(self):
+        health = self._health()
+        st = {"credential_health": health}
+        relay._connection_failed(st, health, RuntimeError("boom"), 1794020220)
+        relay._connection_verified(st, health, 1794020240)
+        self.assertEqual(health["pending_notices"], [])
+        self.assertFalse(health["outage_active"])
+
+    def test_flush_sends_queued_notices_with_stable_ids(self):
+        health = {"incident_id": "test-incident",
+                  "pending_notices": [{"id": "test-incident-failed", "text": "old"}]}
+        st = {"credential_health": health}
+        relay._flush_health_notices(st, health)
+        self.assertEqual(health["pending_notices"], [])
+        weixin = self.shadow_rows("weixin")
+        wecom = self.shadow_rows("wecom")
+        self.assertEqual(len(weixin), 1)
+        self.assertEqual(len(wecom), 1)
+        self.assertEqual(weixin[0]["id"], "appr-health-test-incident-failed-weixin")
+        self.assertEqual(wecom[0]["id"], "appr-health-test-incident-failed-wecom")
+
+
 if __name__ == "__main__":
     unittest.main()
