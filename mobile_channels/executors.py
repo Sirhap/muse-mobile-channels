@@ -23,7 +23,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from .gadget_client import GadgetAuthError, GadgetClient, GadgetCredentials, GadgetError, GadgetNetworkError
 from .runtime import ExecutionContext, ExecutionOutcome
@@ -649,6 +649,19 @@ class GadgetExecutor:
     gadget_sessions (separate from the native track's executor_sessions, so
     a fallback never reuses the other track's session). A session id is only
     a name until the worker's first send creates it server-side.
+
+    History fallback (2026-11-07): the worker waits on the live
+    /chat/subscribe stream for a task.status terminal event, which arrived
+    ~200s late in production (turns of 213-304s while the reply was
+    already in history). Gadget Noise /chat/history is 403 (endpoint not
+    in the device-token ACL), but the Cookie bridge reads a Gadget-created
+    session's history fine, so when history_client_factory is set,
+    query() settles a still-running worker from history once a completed
+    assistant message appears after this attempt's sent message. The
+    fallback is best-effort and never raises: without a factory, without
+    an anchor, or on any history failure, query() keeps the old
+    running/failed path, so the Gadget track stays usable when the bridge
+    credentials are dead.
     """
 
     def __init__(
@@ -656,10 +669,14 @@ class GadgetExecutor:
         store: Store,
         client: GadgetClient | None = None,
         client_factory: Callable[[], GadgetClient] | None = None,
+        history_client_factory: Callable[[], Any] | None = None,
     ):
         self.store = store
         self._client = client
         self.client_factory = client_factory
+        # Optional Cookie-bridge client factory for the history fallback
+        # (bridge_client by default in DualTrackExecutor; None disables it).
+        self.history_client_factory = history_client_factory
         # Per-attempt query poll counts, so an unknown outcome can carry
         # countable evidence (polls=N) instead of a bare unknown.
         self._query_counts: dict[str, int] = {}
@@ -833,6 +850,9 @@ class GadgetExecutor:
         mid = result.get('message_id')
         message_id = mid if isinstance(mid, str) and mid else None
         if state == 'running':
+            settled = self._settle_from_history(binding, message_id)
+            if settled is not None:
+                return settled
             pid = self._worker_pid(binding['platform_run_id'])
             if pid is not None and not self._worker_alive(pid):
                 # The driver is dead mid-turn: the reply will never be
@@ -864,6 +884,111 @@ class GadgetExecutor:
         return ExecutionOutcome(
             'unknown', evidence=f'unrecognized_result_state_{state} polls={polls}',
             message_id=message_id)
+
+    def _settle_from_history(self, binding, ack_message_id: str | None):
+        """Settle a still-running worker from Cookie-bridge history, if possible.
+
+        Anchors on this attempt's sent user message (its message id is the
+        worker result's message_id) and accepts completed assistant messages
+        after it -- the same correlation MuseExecutor.query uses, minus the
+        pre-send baseline (the anchor plays that role). Returns a succeeded
+        outcome, or None when the fallback cannot settle yet. Never raises:
+        any failure returns None and the caller keeps the old path.
+        """
+        if self.history_client_factory is None or not ack_message_id:
+            return None
+        session_id = binding['session_id'] if binding is not None else None
+        if not session_id:
+            return None
+        try:
+            client = self.history_client_factory()
+        except Exception:
+            return None
+        try:
+            texts, media, last_id = self._collect_completed_after_anchor(
+                client, session_id, ack_message_id)
+        except Exception:
+            return None
+        finally:
+            try:
+                close = getattr(client, 'close', None)
+                if callable(close):
+                    close()
+            except Exception:
+                pass
+        if not texts:
+            return None
+        # The reply is already collected from authoritative history: stop
+        # the still-waiting worker so it does not linger on the late
+        # subscription terminal. Best effort; a failure here changes
+        # nothing -- the worker's own result is ignored once settled.
+        pid = self._worker_pid(binding['platform_run_id'])
+        if pid is not None:
+            try:
+                self.client.stop_turn(pid)
+            except Exception:
+                pass
+        return ExecutionOutcome(
+            'succeeded', text='\n'.join(texts), message_id=last_id, media=media)
+
+    def _collect_completed_after_anchor(self, client, session_id: str, ack_message_id: str):
+        """Fetch history until a settle round adds no new completed reply.
+
+        Returns (texts, media, last_message_id); empty texts means no
+        completed reply after the anchor yet. Raises on transport failure.
+        Mirrors MuseExecutor.query's settle rounds: a turn may split its
+        answer across several assistant messages, so after the first
+        completed message, up to QUERY_SETTLE_ROUNDS extra fetches run one
+        second apart, stopping early when a round adds nothing new.
+        """
+        texts: list[str] = []
+        media: list[dict] = []
+        seen_seqs: set[int] = set()
+        last_id: str | None = None
+        anchor_seq: int | None = None
+        for round_no in range(QUERY_SETTLE_ROUNDS):
+            response = client.call_json('chat.history', body={
+                'limit': HISTORY_LIMIT, 'session_id': session_id,
+            }, timeout=15)
+            events = response.get('chat_events', []) if isinstance(response, dict) else []
+            if anchor_seq is None:
+                for event in events:
+                    if (event.get('event_name') == 'message.user'
+                            and event.get('message_id') == ack_message_id):
+                        anchor_seq = event.get('seq', 0)
+                        break
+                if anchor_seq is None:
+                    return [], [], None
+            new_found = False
+            for event in sorted(events, key=lambda value: value.get('seq', 0)):
+                if event.get('seq', 0) <= anchor_seq:
+                    continue
+                if event.get('event_name') != 'message.assistant':
+                    continue
+                payload = event.get('payload') or {}
+                if payload.get('status') not in ('completed', 'complete', 'succeeded'):
+                    continue
+                seq = event.get('seq', 0)
+                if seq in seen_seqs:
+                    continue
+                seen_seqs.add(seq)
+                new_found = True
+                text = payload.get('display_text')
+                if isinstance(text, str) and text:
+                    clean, found = extract_file_media(text)
+                    if clean:
+                        texts.append(clean)
+                    media = merge_media(media, found)
+                mid = event.get('message_id')
+                if isinstance(mid, str) and mid:
+                    last_id = mid
+            if not texts:
+                return [], [], None
+            if not new_found:
+                break
+            if round_no < QUERY_SETTLE_ROUNDS - 1:
+                time.sleep(1.0)
+        return texts, media, last_id
 
     def _worker_alive(self, pid: int) -> bool:
         """True when the worker is alive; an unreadable state fails safe to alive.
@@ -1010,7 +1135,7 @@ class DualTrackExecutor:
     ):
         self.store = store
         ensure_executor_schema(store)
-        self.primary = primary or GadgetExecutor(store)
+        self.primary = primary or GadgetExecutor(store, history_client_factory=bridge_client)
         self.fallback = fallback or MuseExecutor(store)
         self.circuit = circuit or CircuitBreaker()
 

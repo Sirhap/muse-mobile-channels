@@ -324,6 +324,11 @@ export async function main(): Promise<number> {
         terminalTaskStatus = event.payload.status;
       }
       turn.feed(event);
+      // Timestamp every subscription event (name + seq + elapsed only,
+      // never text): the 2026-11-07 stall took 213-304s per turn while the
+      // reply was already in history, and without per-event timings the
+      // next stall cannot tell a late terminal event from a stalled stream.
+      console.error(`event ${event.event} seq=${event.seq ?? ''} elapsed_ms=${Date.now() - startedAt}`);
       // The reply has started once any assistant message carries text,
       // even before it is done. Record it so the executor can refuse a
       // fold that would arrive too late to be integrated.
@@ -337,8 +342,21 @@ export async function main(): Promise<number> {
       next = iterator.next();
       void next.catch(() => {});
     }
-    try { await iterator.return?.(); } catch { /* subscription already closed */ }
+    // Close the subscription BEFORE awaiting the iterator's return:
+    // return() on an async generator suspended at an await waits for that
+    // await to settle, so awaiting return first can hang forever when the
+    // subscription is quiet -- a timed-out worker then never writes its
+    // result and never exits (seen live in the stall repro: the 5s
+    // deadline fired, the timer won the race, and main() still hung).
+    // Closing ends the body queue, which unblocks the generator; the 5s
+    // race is a belt-and-braces bound so settlement can never stick here.
     sub.close();
+    try {
+      await Promise.race([
+        iterator.return?.() ?? Promise.resolve(),
+        new Promise((resolve) => setTimeout(resolve, 5000)),
+      ]);
+    } catch { /* subscription already closed */ }
 
     if (timedOut) {
       settle({ state: 'unknown', evidence: 'turn_timeout', message_id: messageId, session_id: args.session });

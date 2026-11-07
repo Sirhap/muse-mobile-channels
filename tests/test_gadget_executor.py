@@ -34,6 +34,7 @@ from mobile_channels.executors import (
     DualTrackExecutor,
     GadgetExecutor,
     MuseExecutor,
+    bridge_client,
     ensure_executor_schema,
 )
 from mobile_channels.gadget_client import (
@@ -1143,6 +1144,183 @@ class TestSkepticalHardeningAndEdgeCases(unittest.TestCase):
         self.assertEqual(dual_executor.circuit_status(), "CLOSED")
         self.assertEqual(dual_executor.circuit.failure_count, 1)
         fallback.submit.assert_called_once_with(context)
+
+
+class FakeHistoryClient:
+    """In-memory Cookie-bridge history: call_json('chat.history') only.
+
+    Events mirror the live shape (2026-11-07 probe): top-level seq /
+    event_name / message_id, status and display_text inside payload.
+    """
+
+    def __init__(self, events=None, error=None):
+        self.events = list(events or [])
+        self.error = error
+        self.calls = []
+        self.closed = False
+
+    def call_json(self, method, body=None, timeout=None):
+        self.calls.append((method, body))
+        if self.error is not None:
+            raise self.error
+        assert method == "chat.history"
+        return {"chat_events": [dict(event) for event in self.events]}
+
+    def close(self):
+        self.closed = True
+
+
+def _history_event(seq, kind, message_id, status=None, text=""):
+    payload = {"status": status, "display_text": text} if status is not None or text else {}
+    return {"seq": seq, "event_name": kind, "message_id": message_id, "payload": payload}
+
+
+class TestGadgetHistoryFallback(unittest.TestCase):
+    """History fallback (2026-11-07): Gadget Noise /chat/history is 403
+    (endpoint not in the device-token ACL), but the Cookie bridge reads a
+    Gadget-created session's history fine (live probe: completed '收到'
+    on the first poll). When the worker is still running on a late
+    subscription terminal but history already shows the completed reply,
+    query() settles from history instead of waiting ~200s."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.db_path = Path(self.temp_dir.name) / "test.sqlite3"
+        self.store = Store(self.db_path)
+        self.addCleanup(self.store.close)
+        self.ingress = CoreIngress(self.store, "wecom", "bot", {"user_1"})
+        self.ingress.receive("msg_1", "user_1", "chat_1", "single", "ping")
+        self.fake_client = FakeWorkerClient(configured=True)
+        self.history = FakeHistoryClient()
+        self.executor = GadgetExecutor(
+            self.store, client=self.fake_client,
+            history_client_factory=lambda: self.history)
+
+    def _get_context(self) -> ExecutionContext:
+        claim = self.store.claim("worker_1", concurrency=1, lease_seconds=60)
+        self.assertIsNotNone(claim)
+        self.store.begin_submission(claim)
+        row = self.store.connection.execute(
+            "SELECT m.text,m.external_id,m.sender_id,c.channel,c.account_id,c.chat_type,c.chat_id "
+            "FROM tasks t JOIN inbound_messages m ON m.id=t.message_id "
+            "JOIN conversations c ON c.id=t.conversation_id WHERE t.id=?",
+            (claim.task_id,),
+        ).fetchone()
+        return ExecutionContext(
+            claim=claim,
+            text=row["text"],
+            external_message_id=row["external_id"],
+            sender_id=row["sender_id"],
+            channel=row["channel"],
+            account_id=row["account_id"],
+            chat_type=row["chat_type"],
+            chat_id=row["chat_id"],
+        )
+
+    def _submit_running(self, context):
+        """submit() then a worker result of running with an ack message id."""
+        outcome = self.executor.submit(context)
+        self.assertEqual(outcome.state, "accepted")
+        self.fake_client.results[context.claim.attempt_id] = {
+            "state": "running", "message_id": "u-ack-1",
+        }
+        return outcome
+
+    def test_query_settles_from_history_while_worker_running(self):
+        """Worker still running + history completed -> succeeded, worker stopped."""
+        context = self._get_context()
+        self._submit_running(context)
+        self.history.events = [
+            _history_event(10, "message.user", "u-ack-1"),
+            _history_event(11, "message.assistant", "a-1", "completed", "pong via history"),
+        ]
+        q = self.executor.query(context, "worker:1001")
+        self.assertEqual(q.state, "succeeded")
+        self.assertEqual(q.text, "pong via history")
+        self.assertEqual(q.message_id, "a-1")
+        self.assertEqual(self.fake_client.stopped, [1001])
+        self.assertTrue(self.history.closed)
+
+    def test_query_ignores_stale_completed_below_anchor(self):
+        """A completed reply from a previous attempt (seq <= anchor) is not ours."""
+        context = self._get_context()
+        self._submit_running(context)
+        self.history.events = [
+            _history_event(9, "message.assistant", "a-old", "completed", "old reply"),
+            _history_event(10, "message.user", "u-ack-1"),
+        ]
+        q = self.executor.query(context, "worker:1001")
+        self.assertEqual(q.state, "running")
+        self.assertEqual(self.fake_client.stopped, [])
+
+    def test_query_running_when_reply_not_completed_yet(self):
+        """An assistant message still generating (no completed status) settles nothing."""
+        context = self._get_context()
+        self._submit_running(context)
+        self.history.events = [
+            _history_event(10, "message.user", "u-ack-1"),
+            _history_event(11, "message.assistant", "a-1", "running", "half"),
+        ]
+        q = self.executor.query(context, "worker:1001")
+        self.assertEqual(q.state, "running")
+        self.assertEqual(self.fake_client.stopped, [])
+
+    def test_query_running_when_anchor_missing(self):
+        """No user event with the ack id yet (send not recorded) -> running, no guess."""
+        context = self._get_context()
+        self._submit_running(context)
+        self.history.events = [
+            _history_event(10, "message.user", "u-someone-else"),
+        ]
+        q = self.executor.query(context, "worker:1001")
+        self.assertEqual(q.state, "running")
+
+    def test_query_running_when_history_unavailable(self):
+        """A history failure (404 / auth / network) never breaks the running path."""
+        context = self._get_context()
+        self._submit_running(context)
+        self.history.error = RuntimeError("session not found")
+        q = self.executor.query(context, "worker:1001")
+        self.assertEqual(q.state, "running")
+        self.assertEqual(self.fake_client.stopped, [])
+
+    def test_query_running_without_history_factory(self):
+        """Without a history factory the fallback is disabled: plain running."""
+        context = self._get_context()
+        executor = GadgetExecutor(self.store, client=self.fake_client)
+        outcome = executor.submit(context)
+        self.assertEqual(outcome.state, "accepted")
+        self.fake_client.results[context.claim.attempt_id] = {
+            "state": "running", "message_id": "u-ack-1",
+        }
+        q = executor.query(context, "worker:1001")
+        self.assertEqual(q.state, "running")
+
+    def test_query_merges_split_replies(self):
+        """A turn split across two completed assistant messages merges, in seq order."""
+        context = self._get_context()
+        self._submit_running(context)
+        self.history.events = [
+            _history_event(10, "message.user", "u-ack-1"),
+            _history_event(11, "message.assistant", "a-1", "completed", "first part"),
+            _history_event(12, "message.assistant", "a-2", "completed", "second part"),
+        ]
+        q = self.executor.query(context, "worker:1001")
+        self.assertEqual(q.state, "succeeded")
+        self.assertEqual(q.text, "first part\nsecond part")
+        self.assertEqual(q.message_id, "a-2")
+
+    def test_submit_does_not_call_history(self):
+        """The fallback anchors on the ack message id at query time; submit stays history-free."""
+        context = self._get_context()
+        self.executor.submit(context)
+        self.assertEqual(self.history.calls, [])
+
+    def test_dual_track_default_wires_history_factory(self):
+        """Production construction DualTrackExecutor(store) enables the fallback."""
+        dual = DualTrackExecutor(store=self.store)
+        self.assertIs(dual.primary.history_client_factory, bridge_client)
 
 
 if __name__ == "__main__":
