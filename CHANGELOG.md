@@ -7,6 +7,11 @@ sdist/wheel + deployment tarball, create the GitHub Release). The scheduled
 updater (`ops/self_update.py`, daily 03:30) only compares versions and pulls
 a new release when the version differs.
 
+## 2026.11.14.6 — 2026-11-14
+
+- README 去重：.5 补全时“能做什么”里的自动更新和“组成”里的版本文件
+  各写了两遍，合并成一处。
+
 ## 2026.11.14.5 — 2026-11-14
 
 - README 补全：能做什么加了自动更新；组成补上了 `mobile_channels/`、

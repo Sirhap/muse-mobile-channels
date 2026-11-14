@@ -21,14 +21,10 @@ iLink, WeCom via the official smart-robot long connection.
   文字版推到个人微信，手机上点按钮或回 `/a` `/b` `/c` 即可批准或拒绝。
 - **掉线自愈**：整机换代或重启把 systemd 服务冲掉后，`channel-restore`
   每 5 分钟巡检并自动重装恢复；公网入口有 Cloudflare 隧道插件包兜底。
-- **自动更新**：每天凌晨 3:30 查一次新版，有新版就自动拉包、备份、
-  重部署，不用你手动升级；版本号是日期格式，每版改了什么见
-  [CHANGELOG.md](CHANGELOG.md)。
-- **凭证不进仓库**：Bot ID、Secret、cookie、token 只存本机配置目录，
-  仓库里只有代码和文档。
 - **自动更新**：每天凌晨 3:30 查一次最新 release，版本号变了才下载
   新部署包、验包、备份、解包、重启服务；没变就什么都不做。每次
-  更新都有版本号（`VERSION`，日期格式），改动记录见 `CHANGELOG.md`。
+  更新都有版本号（`VERSION`，日期格式），每版改了什么见
+  [CHANGELOG.md](CHANGELOG.md)。
 
 ## 组成
 
@@ -62,13 +58,7 @@ iLink, WeCom via the official smart-robot long connection.
   代码（刷新、凭证读写、SDK token 校验），配对与轮换见该扩展的 README。
 - `hooks/` — 消息唤醒层：双渠道收件钩子脚本与定义。
 - `ops/`、`tests/`、`docs/` — 运维巡检脚本、沙箱测试套件、问题清单
-  与设计文档。其中 `ops/bump_version.py` 在发版前定版本号，
-  `ops/self_update.py` 是定时自动更新器，`ops/install.sh` 是一键
-  安装 systemd 单元的脚本（见快速开始第 7 步）。
-- `VERSION`、`CHANGELOG.md` — 版本号的唯一出处（日期格式
-  `年.月.日.序号`）和每版的改动记录；发版流程见“版本、发版与自动更新”。
-- `self-update/` — 自动更新的 systemd 单元（`self-update.service`／
-  `self-update.timer`，每天凌晨 3:30 跑一次）。
+  与设计文档。
 
 ## 快速开始
 
