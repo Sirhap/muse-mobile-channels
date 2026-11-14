@@ -7,6 +7,16 @@ sdist/wheel + deployment tarball, create the GitHub Release). The scheduled
 updater (`ops/self_update.py`, daily 03:30) only compares versions and pulls
 a new release when the version differs.
 
+## 2026.11.14.5 — 2026-11-14
+
+- README 补全：能做什么加了自动更新；组成补上了 `mobile_channels/`、
+  版本与自动更新文件、`ops/install.sh`、`extensions/gadget-token/`、
+  `feishu-bot/`；第 7 步改指一键安装脚本（手工命令保留作备选）；
+  版本章节去掉了“第一次发版之前”的过期说法、写明更新器以 root 运行
+  是因为 `self-update.service` 没写 `User=`、加了 CHANGELOG 指引；
+  测试章节加了 `test_versioning.py` 与 `test_self_update.py`；
+  修了运行补充里指错的步骤号（第 5 步 → 第 7 步）。
+
 ## 2026.11.14.4 — 2026-11-14
 
 - Added `ops/install.sh`: one-command install of the systemd units, replacing

@@ -21,8 +21,14 @@ iLink, WeCom via the official smart-robot long connection.
   文字版推到个人微信，手机上点按钮或回 `/a` `/b` `/c` 即可批准或拒绝。
 - **掉线自愈**：整机换代或重启把 systemd 服务冲掉后，`channel-restore`
   每 5 分钟巡检并自动重装恢复；公网入口有 Cloudflare 隧道插件包兜底。
+- **自动更新**：每天凌晨 3:30 查一次新版，有新版就自动拉包、备份、
+  重部署，不用你手动升级；版本号是日期格式，每版改了什么见
+  [CHANGELOG.md](CHANGELOG.md)。
 - **凭证不进仓库**：Bot ID、Secret、cookie、token 只存本机配置目录，
   仓库里只有代码和文档。
+- **自动更新**：每天凌晨 3:30 查一次最新 release，版本号变了才下载
+  新部署包、验包、备份、解包、重启服务；没变就什么都不做。每次
+  更新都有版本号（`VERSION`，日期格式），改动记录见 `CHANGELOG.md`。
 
 ## 组成
 
@@ -34,15 +40,35 @@ iLink, WeCom via the official smart-robot long connection.
   Cookie 会话仍有效时可重新换取连接 token，静态 token 不会自行续期。
   失效恢复见 [凭证恢复说明](native-bridge/get-muse-token.md)，
   分来源验活与真实收发见 [Muse 实测清单](docs/bridge-credential-health-muse-cases.md)。
+- `mobile_channels/` — Core 事务核心：会话隔离、任务所有权、结果与
+  发件箱原子提交、投递核查；企微 core 模式的执行器（Gadget 主轨、
+  Native 备轨）与双轨降级都在这里。
+- `feishu-bot/` — 飞书网关：网关本体、命令行工具，systemd 单元
+  `feishu-bot.service`。
 - `channel-restore/` — 双网关自愈：定时重装被冲掉的 systemd 单元并
   拉起服务，自带存活探针与心跳清单（`HEARTBEAT.md`）。
 - `cloudflare-tunnel-plugin/` — Cloudflare 隧道插件：给 Muse 一个
   固定公网入口（命名隧道 + 本地中转），整机换代后一条命令重装。
 - `approval-relay/` — 审批中转：把 Muse 的操作审批推送到微信 / 企微，
   并回收你在手机上的决定。
+- `VERSION`、`ops/bump_version.py`、`ops/self_update.py`、`self-update/`、
+  `CHANGELOG.md` — 版本与自动更新：日期版本号的唯一出处是 `VERSION`，
+  发版打 tag 触发 GitHub Actions 打包发 release，部署机每天 3:30
+  自动拉新版重部署；每版改了什么见 `CHANGELOG.md`。
+- `ops/install.sh` — 一键安装 systemd 单元（替代快速开始第 7 步的
+  手工命令；`--dry-run` 先看不装，`--only weixin|wecom` 只装一边，
+  `--with-core` 再装 `muse-core-run.service`）。
+- `extensions/gadget-token/` — Gadget token 扩展：只留了取 token 的
+  代码（刷新、凭证读写、SDK token 校验），配对与轮换见该扩展的 README。
 - `hooks/` — 消息唤醒层：双渠道收件钩子脚本与定义。
 - `ops/`、`tests/`、`docs/` — 运维巡检脚本、沙箱测试套件、问题清单
-  与设计文档。
+  与设计文档。其中 `ops/bump_version.py` 在发版前定版本号，
+  `ops/self_update.py` 是定时自动更新器，`ops/install.sh` 是一键
+  安装 systemd 单元的脚本（见快速开始第 7 步）。
+- `VERSION`、`CHANGELOG.md` — 版本号的唯一出处（日期格式
+  `年.月.日.序号`）和每版的改动记录；发版流程见“版本、发版与自动更新”。
+- `self-update/` — 自动更新的 systemd 单元（`self-update.service`／
+  `self-update.timer`，每天凌晨 3:30 跑一次）。
 
 ## 快速开始
 
@@ -126,7 +152,21 @@ Muse 账号；接个人微信需要一个能当 iLink 机器人的微信号，�
    `APPROVAL_RELAY_WECOM_CHATID=实际聊天ID`，微信使用
    `APPROVAL_RELAY_WEIXIN_TO=实际微信用户ID`。
 
-7. 安装 systemd 单元。**先把各 `.service` 文件里的 `/home/hatch`
+7. 安装 systemd 单元。用一键脚本（推荐）：
+
+   ```sh
+   sudo ops/install.sh
+   ```
+
+   脚本做的是同一件事：把各 `.service` 文件里的 `/home/hatch` 换成
+   你自己的家目录，再拷到系统目录并启用。只装一边时加
+   `--only weixin` 或 `--only wecom`；企微 Core 模式再加
+   `--with-core`（装 `muse-core-run.service`）；先看不装加
+   `--dry-run`；只装文件不启用加 `--no-enable`。装完
+   `self-update.timer` 每天凌晨 3:30 自动查新版更新，不想要自动
+   更新就 `sudo systemctl disable --now self-update.timer`。
+
+   不用脚本也可以手工装（和脚本等价）。**先把各 `.service` 文件里的 `/home/hatch`
    全换成你自己的家目录**（`WorkingDirectory`、`ExecStart`、
    `Environment=HOME`／`MUSE_HOME`、`Environment=*_CRED_FILE` 这几处
    都是写死的），再拷到系统目录并启用：
@@ -156,13 +196,15 @@ Muse 账号；接个人微信需要一个能当 iLink 机器人的微信号，�
 
 版本号是日期格式 `年.月.日.序号`（如 `2026.11.14.1`），唯一的出处是
 仓库根目录的 `VERSION` 文件；`pyproject.toml` 的版本就是从它读的。
-版本号在提交代码时定好，定时任务只比对、从不自己涨号。
+版本号在提交代码时定好，定时任务只比对、从不自己涨号。每版改了
+什么见 [CHANGELOG.md](CHANGELOG.md)。
 
 发版（维护者操作）：
 
-1. 改完代码后跑 `python3 ops/bump_version.py`，它把新版本号写进
+1. 改完代码后先把这版的改动记进 `CHANGELOG.md` 对应版本的章节，
+   再跑 `python3 ops/bump_version.py`，它把新版本号写进
    `VERSION`（同一天多次发版序号自动加一）。
-2. 提交并打 tag：`git add VERSION && git commit -m "Release <版本>" &&
+2. 提交并打 tag：`git add VERSION CHANGELOG.md && git commit -m "Release <版本>" &&
    git tag v<版本> && git push origin main v<版本>`。
 3. 打 tag 会触发发版流程：先核对 tag 和 `VERSION` 是否一致，再跑
    版本相关测试、打包（`sdist`／`wheel`），并用 `git archive` 打一个
@@ -178,12 +220,13 @@ Muse 账号；接个人微信需要一个能当 iLink 机器人的微信号，�
   重启网关服务，并把旧版本 -> 新版本记到 `self-update.log`。
 - 它绝不碰凭证、配置和状态文件；本地有未提交的改动时跳过并记日志；
   解包前先验包（包里必须有且仅有一个顶层目录、VERSION 和版本号
-  对得上、不含凭证类文件），验不过就停手。更新器以 root 运行，
-  因为要写安装目录、重启服务。
+  对得上、不含凭证类文件），验不过就停手。更新器以 root 运行：
+  `self-update.service` 里没有写 `User=`，默认就是 root；它要写
+  安装目录、重启服务，必须是 root。
 - 手动跑：`python3 ops/self_update.py --check-only` 只比对不改动；
   `--dry-run` 只报告会做什么；`--no-restart` 跳过服务重启。
-- 第一次发版之前还没有 release 可查，更新器会直接报错等下一次，
-  这是正常的。
+- 如果 GitHub 上还没有任何 release（刚建仓库、还没发过第一版），
+  更新器会直接报错、等下一次，这是正常的。
 
 ## 架构改造与本地工具
 
@@ -320,7 +363,7 @@ gitignore 排除；探针结果转储（`native-probe/probe*_results.txt`、
 ## 运行补充
 
 两个网关的 systemd 单元把 `HOME` 和 `MUSE_HOME` 设为家目录（见快速
-开始第 5 步的路径替换说明），这样即使某个单元的进程家目录本会是
+开始第 7 步的路径替换说明），这样即使某个单元的进程家目录本会是
 `/root`，网关、聊天命令和收件钩子仍共用同一份状态目录
 （`channel_common.muse_home()` 用同样的口径解析安装家目录）。
 
@@ -398,6 +441,12 @@ CI 在 Ubuntu 和 macOS 安装同一 SDK 提交与 Bun 版本后运行这些检�
 - `tests/test_channel_common.py` — 共享的 `channel_common.py` 守卫
   （原子写、JSONL 半行处理、队列管理合并、回复闸门、路径/URL 白名单）。
   用 weixin-bot 的 venv python 跑（其中一个用例会 import `login.py`）。
+- `tests/test_versioning.py` — 版本号解析、递增与 `VERSION` 文件读写
+  （`python3 tests/test_versioning.py` 直接跑，unittest，不用额外依赖）。
+- `tests/test_self_update.py` — 更新器全流程：版本比对、验包、备份、
+  解包、脏树跳过、备份跳过 socket 等非常规文件。都在临时目录里用
+  假 release 跑，不碰网络、不碰真服务（`python3 tests/test_self_update.py`
+  直接跑）。发版流程跑的也是这两个文件。
 
 ## 问题上报（包括通过你的 Muse / AI 助手上报）
 
