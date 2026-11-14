@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily self-update check for muse-mobile-channels
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=HOME=/home/hatch
+Environment=MUSE_HOME=/home/hatch
+ExecStart=/usr/bin/python3 /home/hatch/workspace/ops/self_update.py

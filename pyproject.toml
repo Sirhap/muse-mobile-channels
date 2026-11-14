@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "muse-mobile-channels"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Local task core and WeChat/WeCom adapters for Muse"
 requires-python = ">=3.12"
 dependencies = []
@@ -19,3 +19,9 @@ muse-channels = "mobile_channels.__main__:main"
 
 [tool.setuptools.packages.find]
 include = ["mobile_channels*"]
+
+# The version lives in the VERSION file at the repo root (date-based
+# YYYY.MM.DD.N, set by `python3 ops/bump_version.py` before a release).
+# setuptools reads it here so the packaged version always matches.
+[tool.setuptools.dynamic]
+version = {file = "VERSION"}

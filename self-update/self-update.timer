@@ -1,0 +1,10 @@
+[Unit]
+Description=Check for a new muse-mobile-channels release once a day
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+Persistent=true
+Unit=self-update.service
+
+[Install]
+WantedBy=timers.target

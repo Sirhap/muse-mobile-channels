@@ -133,16 +133,17 @@ Muse 账号；接个人微信需要一个能当 iLink 机器人的微信号，�
 
    ```sh
    # 把 /home/hatch 换成你的 $HOME，例如：
-   # sed -i "s|/home/hatch|$HOME|g" weixin-bot/weixin-bot.service wecom-bot/wecom-bot.service native-bridge/native-bridge.service approval-relay/approval-relay.service channel-restore/channel-restore.service channel-restore/channel-restore.timer
+   # sed -i "s|/home/hatch|$HOME|g" weixin-bot/weixin-bot.service wecom-bot/wecom-bot.service native-bridge/native-bridge.service approval-relay/approval-relay.service channel-restore/channel-restore.service channel-restore/channel-restore.timer self-update/self-update.service self-update/self-update.timer
    sudo cp weixin-bot/weixin-bot.service wecom-bot/wecom-bot.service native-bridge/native-bridge.service approval-relay/approval-relay.service /etc/systemd/system/
    sudo cp channel-restore/channel-restore.service channel-restore/channel-restore.timer /etc/systemd/system/
+   sudo cp self-update/self-update.service self-update/self-update.timer /etc/systemd/system/
    sudo systemctl daemon-reload
-   sudo systemctl enable --now weixin-bot.service wecom-bot.service native-bridge.service approval-relay.service channel-restore.timer
+   sudo systemctl enable --now weixin-bot.service wecom-bot.service native-bridge.service approval-relay.service channel-restore.timer self-update.timer
    ```
 
    只装选中的一边时，只拷、只启用那一边的网关单元即可；原生桥、
-   审批中转、`channel-restore` 定时器是共用的。`channel-restore`
-   以 root 运行，以便重装包括它自己定时器在内的 systemd 单元。
+   审批中转、`channel-restore` 定时器、`self-update` 定时器是共用的。
+   `channel-restore` 以 root 运行，以便重装包括它自己定时器在内的 systemd 单元。
    恢复脚本只管理已有单元或存在渠道凭证的网关。没有明确的企微
    Core 配置时，它不会安装 Core drop-in 或启动 `muse-core-run`。
 8. 验证：在微信 / 企微里发 `/ping` 应回 `pong`，再发一条普通消息能
@@ -151,6 +152,38 @@ Muse 账号；接个人微信需要一个能当 iLink 机器人的微信号，�
 各单元都把 `HOME`、`MUSE_HOME` 指向家目录，保证网关、聊天命令和
 收件钩子共用同一份状态目录。
 
+## 版本、发版与自动更新
+
+版本号是日期格式 `年.月.日.序号`（如 `2026.11.14.1`），唯一的出处是
+仓库根目录的 `VERSION` 文件；`pyproject.toml` 的版本就是从它读的。
+版本号在提交代码时定好，定时任务只比对、从不自己涨号。
+
+发版（维护者操作）：
+
+1. 改完代码后跑 `python3 ops/bump_version.py`，它把新版本号写进
+   `VERSION`（同一天多次发版序号自动加一）。
+2. 提交并打 tag：`git add VERSION && git commit -m "Release <版本>" &&
+   git tag v<版本> && git push origin main v<版本>`。
+3. 打 tag 会触发发版流程：先核对 tag 和 `VERSION` 是否一致，再跑
+   版本相关测试、打包（`sdist`／`wheel`），并用 `git archive` 打一个
+   只含已跟踪文件的部署包，一起挂到新 release 上。部署包里没有凭
+   证、密钥、数据库和运行状态，发版流程和更新器都会验包，不合规
+   就失败。
+
+自动更新（部署机上）：
+
+- `ops/self_update.py` 每天凌晨 3:30 由 `self-update.timer` 跑一次，
+  到 GitHub 查最新 release 的版本号，和本地 `VERSION` 比对；一样
+  就什么都不做，不一样才下载新部署包、备份当前版本、解包覆盖、
+  重启网关服务，并把旧版本 -> 新版本记到 `self-update.log`。
+- 它绝不碰凭证、配置和状态文件；本地有未提交的改动时跳过并记日志；
+  解包前先验包（包里必须有且仅有一个顶层目录、VERSION 和版本号
+  对得上、不含凭证类文件），验不过就停手。更新器以 root 运行，
+  因为要写安装目录、重启服务。
+- 手动跑：`python3 ops/self_update.py --check-only` 只比对不改动；
+  `--dry-run` 只报告会做什么；`--no-restart` 跳过服务重启。
+- 第一次发版之前还没有 release 可查，更新器会直接报错等下一次，
+  这是正常的。
 
 ## 架构改造与本地工具
 
