@@ -1,0 +1,58 @@
+name: Release
+
+# Tag a release with: git tag v<version> && git push origin v<version>
+# where <version> is the content of the VERSION file (set by
+# `python3 ops/bump_version.py` before committing). The tag must match
+# VERSION exactly or this workflow fails.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check VERSION matches tag
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          VER="$(cat VERSION)"
+          [ "$TAG" = "$VER" ] || { echo "tag $TAG != VERSION $VER"; exit 1; }
+          echo "releasing version $VER"
+      - name: Run versioning tests
+        run: |
+          python3 tests/test_versioning.py
+          python3 tests/test_self_update.py
+      - name: Build package (sdist + wheel)
+        run: |
+          python3 -m pip install --upgrade build
+          python3 -m build
+          ls -la dist/
+      - name: Build deployment tarball
+        run: |
+          VER="$(cat VERSION)"
+          git archive --format=tar.gz \
+            --prefix="muse-mobile-channels-${VER}/" \
+            -o "muse-mobile-channels-${VER}.tar.gz" HEAD
+          tar tzf "muse-mobile-channels-${VER}.tar.gz" | head -20
+      - name: Verify tarball contents
+        run: |
+          VER="$(cat VERSION)"
+          python3 ops/self_update.py --verify-tarball \
+            "muse-mobile-channels-${VER}.tar.gz" --expect-version "$VER"
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VER="$(cat VERSION)"
+          gh release create "$TAG" --title "muse-mobile-channels $TAG" \
+            --generate-notes "dist/*" "muse-mobile-channels-${VER}.tar.gz"
