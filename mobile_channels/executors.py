@@ -1406,6 +1406,9 @@ class DualTrackExecutor:
                 outcome = self.primary.query(context, run_id)
             except Exception as exc:
                 return ExecutionOutcome('unknown', evidence=str(exc))
+            # 404 is the only signal that proves the send never landed (the
+            # server rejects a dead session before delivering), so a retry
+            # on a fresh session cannot double-deliver.
             send_proven_undelivered = (
                 outcome.state == 'unknown'
                 and not outcome.message_id
