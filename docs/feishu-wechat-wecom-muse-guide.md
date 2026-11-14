@@ -1,8 +1,8 @@
 # 飞书教程《微信企微畅连Muse教程》镜像
 
 > 来源：https://my.feishu.cn/docx/SsDMdusWboCxOrxJJD7c6Z2xngc（token：SsDMdusWboCxOrxJJD7c6Z2xngc）
-> 抓取日期：2026-11-14，飞书 revision 177；正文为当时全文原样镜像，未改写。
-> 修正记录：2026-11-14 已按项目现状修正 9 处（revision 158→167）：默认 legacy、版本与自动更新、凭证每日续期、企微 core 媒体路由、审批默认放行、故障转移限定 legacy、/new 回执。2026-11-14 晚补进第一步提示词 5 处（revision 167→173）：桥 token 每日续期、项目定时更新、Core 切换、Gadget 配对、保活核对。2026-11-14 晚再补第一步提示词 4 处（revision 173→177）：审批默认规则、VERSION 以文件为准、Core 切换点名文档、恢复演练加 sudo。
+> 抓取日期：2026-11-14，飞书 revision 178；正文为当时全文原样镜像，未改写。
+> 修正记录：2026-11-14 已按项目现状修正 9 处（revision 158→167）：默认 legacy、版本与自动更新、凭证每日续期、企微 core 媒体路由、审批默认放行、故障转移限定 legacy、/new 回执。2026-11-14 晚补进第一步提示词 5 处（revision 167→173）：桥 token 每日续期、项目定时更新、Core 切换、Gadget 配对、保活核对。2026-11-14 晚再补第一步提示词 4 处（revision 173→177）：审批默认规则、VERSION 以文件为准、Core 切换点名文档、恢复演练加 sudo。2026-11-14 晚 E3 节版本号改为以 VERSION 文件为准（revision 177→178）。
 > 维护规则：以后项目有调整影响到这个文档，也要跟着修改。
 
 ---
@@ -133,7 +133,7 @@ Muse 会给出刚生成的 login-qr.png。微信页面沿用“OpenClaw”名称
 
 ## 版本、发版与自动更新
 
-当前版本是 `2026.11.14.6`，唯一出处是仓库根目录的 `VERSION` 文件，格式为日期加序号（`年.月.日.序号`）；每版改了什么见 `CHANGELOG.md`。
+当前版本以仓库根目录的 `VERSION` 文件为准，唯一出处是该文件，格式为日期加序号（`年.月.日.序号`）；每版改了什么见 `CHANGELOG.md`。
 
 安装用一键脚本：`sudo ops/install.sh`（装 systemd 单元；`--dry-run` 先预览，`--only weixin|wecom` 只装一边，`--with-core` 再装 `muse-core-run.service`）。
 
