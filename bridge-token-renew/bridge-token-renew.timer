@@ -1,0 +1,10 @@
+[Unit]
+Description=Renew the bridge token and cookies once a day
+
+[Timer]
+OnCalendar=*-*-* 04:54:00
+Persistent=true
+Unit=bridge-token-renew.service
+
+[Install]
+WantedBy=timers.target

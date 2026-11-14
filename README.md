@@ -154,7 +154,11 @@ Muse 账号；接个人微信需要一个能当 iLink 机器人的微信号，�
    `--with-core`（装 `muse-core-run.service`）；先看不装加
    `--dry-run`；只装文件不启用加 `--no-enable`。装完
    `self-update.timer` 每天凌晨 3:30 自动查新版更新，不想要自动
-   更新就 `sudo systemctl disable --now self-update.timer`。
+   更新就 `sudo systemctl disable --now self-update.timer`。装完
+   `bridge-token-renew.timer` 每天凌晨 4:54 自动续桥 token 和
+   cookie（`native-bridge/renew_token.py`，轮换的会话票写回
+   `cookies.txt`，续不上就说明票死了、要重导凭证），不想要就
+   `sudo systemctl disable --now bridge-token-renew.timer`。
 
    不用脚本也可以手工装（和脚本等价）。**先把各 `.service` 文件里的 `/home/hatch`
    全换成你自己的家目录**（`WorkingDirectory`、`ExecStart`、
@@ -163,16 +167,18 @@ Muse 账号；接个人微信需要一个能当 iLink 机器人的微信号，�
 
    ```sh
    # 把 /home/hatch 换成你的 $HOME，例如：
-   # sed -i "s|/home/hatch|$HOME|g" weixin-bot/weixin-bot.service wecom-bot/wecom-bot.service native-bridge/native-bridge.service approval-relay/approval-relay.service channel-restore/channel-restore.service channel-restore/channel-restore.timer self-update/self-update.service self-update/self-update.timer
+   # sed -i "s|/home/hatch|$HOME|g" weixin-bot/weixin-bot.service wecom-bot/wecom-bot.service native-bridge/native-bridge.service approval-relay/approval-relay.service channel-restore/channel-restore.service channel-restore/channel-restore.timer self-update/self-update.service self-update/self-update.timer bridge-token-renew/bridge-token-renew.service bridge-token-renew/bridge-token-renew.timer
    sudo cp weixin-bot/weixin-bot.service wecom-bot/wecom-bot.service native-bridge/native-bridge.service approval-relay/approval-relay.service /etc/systemd/system/
    sudo cp channel-restore/channel-restore.service channel-restore/channel-restore.timer /etc/systemd/system/
    sudo cp self-update/self-update.service self-update/self-update.timer /etc/systemd/system/
+   sudo cp bridge-token-renew/bridge-token-renew.service bridge-token-renew/bridge-token-renew.timer /etc/systemd/system/
    sudo systemctl daemon-reload
-   sudo systemctl enable --now weixin-bot.service wecom-bot.service native-bridge.service approval-relay.service channel-restore.timer self-update.timer
+   sudo systemctl enable --now weixin-bot.service wecom-bot.service native-bridge.service approval-relay.service channel-restore.timer self-update.timer bridge-token-renew.timer
    ```
 
    只装选中的一边时，只拷、只启用那一边的网关单元即可；原生桥、
-   审批中转、`channel-restore` 定时器、`self-update` 定时器是共用的。
+   审批中转、`channel-restore` 定时器、`self-update` 定时器、
+   `bridge-token-renew` 定时器是共用的。
    `channel-restore` 以 root 运行，以便重装包括它自己定时器在内的 systemd 单元。
    恢复脚本只管理已有单元或存在渠道凭证的网关。没有明确的企微
    Core 配置时，它不会安装 Core drop-in 或启动 `muse-core-run`。

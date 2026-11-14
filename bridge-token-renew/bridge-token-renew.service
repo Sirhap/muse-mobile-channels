@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily bridge token and cookie renewal for muse-mobile-channels
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=HOME=/home/hatch
+Environment=MUSE_HOME=/home/hatch
+ExecStart=/home/hatch/workspace/bridge-token-renew/run.sh

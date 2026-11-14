@@ -19,7 +19,7 @@
 #   --only weixin|wecom
 #                     install only one gateway side; the shared units
 #                     (native-bridge, approval-relay, channel-restore,
-#                     self-update) are always installed
+#                     self-update, bridge-token-renew) are always installed
 #   --with-core       also install and enable muse-core-run.service
 #                     (WeCom core-mode runner; off by default, as in step 7)
 #   --no-enable       install the files but do not enable/start anything
@@ -93,15 +93,18 @@ add_unit "channel-restore/channel-restore.service"
 add_unit "channel-restore/channel-restore.timer"
 add_unit "self-update/self-update.service"
 add_unit "self-update/self-update.timer"
+add_unit "bridge-token-renew/bridge-token-renew.service"
+add_unit "bridge-token-renew/bridge-token-renew.timer"
 if [ "$WITH_CORE" -eq 1 ]; then add_unit "channel-restore/muse-core-run.service"; fi
 
 # Units with an [Install] section get enabled; the .service files without
-# one (channel-restore, self-update) are driven by their .timer.
+# one (channel-restore, self-update, bridge-token-renew) are driven by
+# their .timer.
 enable_name() {
     local base
     base="$(basename "$1")"
     case "$base" in
-        channel-restore.service|self-update.service) return 1 ;;
+        channel-restore.service|self-update.service|bridge-token-renew.service) return 1 ;;
         *) return 0 ;;
     esac
 }
