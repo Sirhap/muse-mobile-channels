@@ -26,7 +26,7 @@ Cookie 和 token 都可能被服务端提前作废。文件里的 `exp` 或 Cook
 
 ## token 每日自续
 
-`native-bridge/renew_token.py` 每天一次（定时任务 `bridge-token-daily-renew`，约凌晨 4:54）用还活着的 cookie 换新 token 写回 `token.json`，让 token 腿不再出生约 24 小时就死。只续 token、不续 cookie：`/api/auth/check` 与 `/api/hatch/token` 只换 token，不发新 cookie。任一步失败即退出、不改 `token.json`（cookie 死时失败是预期信号，说明该重导了）；`NATIVE_TOKEN_JSON` 存在时跳过（桥不读磁盘文件，续了也没用）。成功时静默，失败时汇报。手动跑一次：
+`native-bridge/renew_token.py` 每天一次（定时任务 `bridge-token-daily-renew`，约凌晨 4:54）用还活着的 cookie 换新 token 写回 `token.json`，同时把服务器随 `/api/auth/check` 回包发来的新 cookie（Set-Cookie：先删旧值再发新值）写回 `cookies.txt`，让 cookie 腿也不再冻结在导出那天。实测证据（2026-11-14，只看名字与过期时间）：每次调 `/api/auth/check` 服务器都发一个新会话票（max-age 30 天）与新网关票（max-age 365 天），浏览器会自动存下所以一直是 30 天；旧脚本只换 token、把新票扔了，才造成 7 天就死。写回后用 `check_credentials --source cookies` 验活，不过就从 `cookies.txt.bak` 恢复。手动跑一次：
 
 ```bash
 ~/muse-test-venv/bin/python ~/workspace/native-bridge/renew_token.py
