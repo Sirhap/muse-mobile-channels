@@ -766,6 +766,21 @@ class GadgetExecutor:
             ).fetchone()
         return row['session_id']
 
+    def invalidate_session(self, context: ExecutionContext) -> None:
+        """Drop the stored Gadget session for this conversation generation.
+
+        Call only when the server proved the session gone (the worker's
+        send got HTTP 404): the next _session() call mints a fresh id.
+        The server already deleted the session, so no context survives
+        that this could lose. Used by the query-time 404 retry so a dead
+        session heals itself instead of failing every later turn.
+        """
+        with self.store.transaction():
+            self.store.connection.execute(
+                'DELETE FROM gadget_sessions WHERE conversation_id=? AND generation=?',
+                (context.claim.conversation_id, context.claim.generation),
+            )
+
     @staticmethod
     def _worker_pid(platform_run_id: str | None) -> int | None:
         """Parse the 'worker:<pid>' handle stored as the run id."""
@@ -1283,6 +1298,12 @@ class DualTrackExecutor:
         self.primary = primary or GadgetExecutor(store, history_client_factory=bridge_client)
         self.fallback = fallback or MuseExecutor(store)
         self.circuit = circuit or CircuitBreaker()
+        # One self-healing Gadget retry per attempt after a proven-dead
+        # session (HTTP 404 on send). The counter bounds the retry so a
+        # fresh session that 404s too falls back to Native instead of
+        # looping; it lives only for this process, which is enough
+        # because each retry invalidates the proven-dead session first.
+        self._gadget_404_retries: dict[str, int] = {}
         from .handoff import HookHandoffExecutor
         self.handoff = HookHandoffExecutor(store, modes)
 
@@ -1391,6 +1412,44 @@ class DualTrackExecutor:
                 and (outcome.evidence or '').startswith('send_unconfirmed:')
                 and 'HTTP 404' in (outcome.evidence or '')
             )
+            if send_proven_undelivered and self._gadget_404_retries.get(context.claim.attempt_id, 0) < 1:
+                # The stored Gadget session is dead server-side (HTTP 404
+                # on send). Invalidate it so the next Gadget turn mints a
+                # fresh session, then retry THIS turn on Gadget: the 404
+                # proves the first send never landed, so a retry cannot
+                # double-deliver. One retry per attempt: if the fresh
+                # session 404s too, or the retry cannot be submitted, the
+                # turn falls through to the Native fallback below instead
+                # of retrying forever. (Live 2026-11-12/13: a session
+                # idle ~5 days died unnoticed and every turn failed; the
+                # fix must heal at once, not just degrade to backup.)
+                self._gadget_404_retries[context.claim.attempt_id] = 1
+                self.primary.invalidate_session(context)
+                self.circuit.record_failure()
+                with self.store.transaction():
+                    self.store.connection.execute(
+                        "UPDATE executor_runs SET status='failed_superseded' WHERE attempt_id=?",
+                        (context.claim.attempt_id,),
+                    )
+                try:
+                    retry_outcome = self.primary.submit(context)
+                except Exception:
+                    retry_outcome = None
+                if (retry_outcome is not None
+                        and retry_outcome.state == 'accepted' and retry_outcome.run_id):
+                    # Same shape as the Native fallback below: the runner
+                    # binds one run per attempt at submit time, so rebind
+                    # the attempt to the retry run and report 'running'.
+                    try:
+                        self.store.rebind_run(context.claim, retry_outcome.run_id)
+                    except OwnershipError:
+                        raise
+                    except Exception as exc:
+                        return ExecutionOutcome(
+                            'unknown',
+                            evidence=f"fallback_rebind_failed:{type(exc).__name__}:{exc}"[:200])
+                    return ExecutionOutcome('running')
+                # Retry could not be submitted: fall through to Native.
             if (outcome.state == 'failed' and not outcome.message_id) or send_proven_undelivered:
                 # Primary died before its message reached the session (the
                 # worker result carries no message_id), so a native retry

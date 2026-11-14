@@ -731,49 +731,6 @@ class TestDualTrackExecutor(unittest.TestCase):
         followup = dual_executor.query(context, attempt["run_id"])
         self.assertEqual(followup.state, "running")
 
-    def test_query_time_fallback_when_gadget_send_404_unknown(self):
-        """A Gadget turn whose send is proven undelivered (HTTP 404 on a
-        dead server-side session) falls back to Native instead of dying
-        on the unknown budget.
-
-        Proves the live 2026-11-12/13 WeCom outage: the stored Gadget
-        session a6b9ba21 was gone server-side, the worker returned
-        unknown/send_unconfirmed 404 with no message_id, and the runner
-        failed the task after 10 unknown polls without ever trying the
-        Native track. A 404 proves the message never landed, so a Native
-        retry cannot double-deliver.
-        """
-        context = self._create_context("m_fallback_404_unknown")
-        fake = FakeWorkerClient(configured=True)
-        primary = GadgetExecutor(self.store, client=fake)
-        fallback = MuseExecutor(
-            self.store, client_factory=lambda: self._scripted_bridge_client())
-        dual_executor = DualTrackExecutor(
-            store=self.store, primary=primary, fallback=fallback,
-        )
-        submitted = dual_executor.submit(context)
-        self.assertEqual(submitted.state, "accepted")
-        # Mirror what the runner does after a submit: bind the gadget run
-        # and move the task to 'running' (the query-phase state).
-        self.store.mark_submitted(context.claim, submitted.run_id)
-        fake.results[context.claim.attempt_id] = {
-            "state": "unknown",
-            "evidence": "send_unconfirmed: Muse /chat/stream returned HTTP 404",
-            "session_id": "s1",
-        }
-        outcome = dual_executor.query(context, submitted.run_id)
-        self.assertEqual(outcome.state, "running")
-        row = self.store.connection.execute(
-            "SELECT status, track, platform_run_id FROM executor_runs WHERE attempt_id=?",
-            (context.claim.attempt_id,),
-        ).fetchone()
-        self.assertEqual((row["status"], row["track"]), ("accepted", "native"))
-        attempt = self.store.connection.execute(
-            "SELECT run_id FROM execution_attempts WHERE id=?",
-            (context.claim.attempt_id,),
-        ).fetchone()
-        self.assertEqual(attempt["run_id"], row["platform_run_id"])
-
     def test_no_fallback_when_gadget_send_unknown_is_ambiguous(self):
         """An unknown Gadget result that does NOT prove non-delivery
         (e.g. no usable ack id, worker died without a result) must not
@@ -797,6 +754,98 @@ class TestDualTrackExecutor(unittest.TestCase):
         outcome = dual_executor.query(context, submitted.run_id)
         self.assertEqual(outcome.state, "unknown")
         fallback.submit.assert_not_called()
+
+    def test_query_time_retry_gadget_on_send_404_unknown(self):
+        """A Gadget turn whose send 404s on a dead stored session retries
+        on Gadget with a freshly minted session instead of dropping to
+        Native.
+
+        Proves the live 2026-11-12/13 outage is self-healing: the stored
+        session a6b9ba21 was gone server-side, the worker returned
+        unknown/send_unconfirmed 404 with no message_id. The 404 proves
+        the message never landed, so the same turn is re-sent once on a
+        fresh session; only if that retry cannot be submitted does the
+        turn fall back to Native.
+        """
+        context = self._create_context("m_retry_404_unknown")
+        fake = FakeWorkerClient(configured=True)
+        primary = GadgetExecutor(self.store, client=fake)
+        fallback = Mock(spec=MuseExecutor)
+        dual_executor = DualTrackExecutor(
+            store=self.store, primary=primary, fallback=fallback,
+        )
+        submitted = dual_executor.submit(context)
+        self.assertEqual(submitted.state, "accepted")
+        self.store.mark_submitted(context.claim, submitted.run_id)
+        dead_session = self.store.connection.execute(
+            "SELECT session_id FROM gadget_sessions WHERE conversation_id=? AND generation=?",
+            (context.claim.conversation_id, context.claim.generation),
+        ).fetchone()["session_id"]
+        fake.results[context.claim.attempt_id] = {
+            "state": "unknown",
+            "evidence": "send_unconfirmed: Muse /chat/stream returned HTTP 404",
+            "session_id": "s1",
+        }
+        outcome = dual_executor.query(context, submitted.run_id)
+        self.assertEqual(outcome.state, "running")
+        row = self.store.connection.execute(
+            "SELECT status, track, platform_run_id FROM executor_runs WHERE attempt_id=?",
+            (context.claim.attempt_id,),
+        ).fetchone()
+        self.assertEqual((row["status"], row["track"]), ("accepted", "gadget"))
+        self.assertNotEqual(row["platform_run_id"], submitted.run_id)
+        new_session = self.store.connection.execute(
+            "SELECT session_id FROM gadget_sessions WHERE conversation_id=? AND generation=?",
+            (context.claim.conversation_id, context.claim.generation),
+        ).fetchone()["session_id"]
+        self.assertNotEqual(new_session, dead_session)
+        self.assertEqual(len(fake.started), 2)
+        self.assertEqual(fake.started[1][1], new_session)
+        fallback.submit.assert_not_called()
+        # Follow-up query polls the retry worker (no result file yet).
+        del fake.results[context.claim.attempt_id]
+        followup = dual_executor.query(context, row["platform_run_id"])
+        self.assertEqual(followup.state, "running")
+
+    def test_second_404_after_gadget_retry_falls_back_to_native(self):
+        """If the retried Gadget turn 404s again, the turn falls back to
+        Native instead of retrying forever."""
+        context = self._create_context("m_retry_404_then_native")
+        fake = FakeWorkerClient(configured=True)
+        primary = GadgetExecutor(self.store, client=fake)
+        fallback = MuseExecutor(
+            self.store, client_factory=lambda: self._scripted_bridge_client())
+        dual_executor = DualTrackExecutor(
+            store=self.store, primary=primary, fallback=fallback,
+        )
+        submitted = dual_executor.submit(context)
+        self.assertEqual(submitted.state, "accepted")
+        self.store.mark_submitted(context.claim, submitted.run_id)
+        fake.results[context.claim.attempt_id] = {
+            "state": "unknown",
+            "evidence": "send_unconfirmed: Muse /chat/stream returned HTTP 404",
+            "session_id": "s1",
+        }
+        outcome = dual_executor.query(context, submitted.run_id)
+        self.assertEqual(outcome.state, "running")
+        row = self.store.connection.execute(
+            "SELECT status, track, platform_run_id FROM executor_runs WHERE attempt_id=?",
+            (context.claim.attempt_id,),
+        ).fetchone()
+        self.assertEqual((row["status"], row["track"]), ("accepted", "gadget"))
+        # The retry worker 404s too: now fall back to Native.
+        fake.results[context.claim.attempt_id] = {
+            "state": "unknown",
+            "evidence": "send_unconfirmed: Muse /chat/stream returned HTTP 404",
+            "session_id": "s1",
+        }
+        outcome2 = dual_executor.query(context, row["platform_run_id"])
+        self.assertEqual(outcome2.state, "running")
+        row2 = self.store.connection.execute(
+            "SELECT status, track FROM executor_runs WHERE attempt_id=?",
+            (context.claim.attempt_id,),
+        ).fetchone()
+        self.assertEqual((row2["status"], row2["track"]), ("accepted", "native"))
 
     def test_no_fallback_when_gadget_failed_after_send(self):
         """A Gadget turn that failed AFTER its message reached the session
