@@ -1,8 +1,8 @@
 # 飞书教程《微信企微畅连Muse教程》镜像
 
 > 来源：https://my.feishu.cn/docx/SsDMdusWboCxOrxJJD7c6Z2xngc（token：SsDMdusWboCxOrxJJD7c6Z2xngc）
-> 抓取日期：2026-11-14，飞书 revision 158；正文为当时全文原样镜像，未改写。
-> 已知过期提醒：该文仍写版本号 2026.11.09.6（当前 2026.11.14.6）、默认 legacy（企微生产跑 core），照原文装会出错，详见以后改文时再对。
+> 抓取日期：2026-11-14，飞书 revision 167；正文为当时全文原样镜像，未改写。
+> 修正记录：2026-11-14 已按项目现状修正 9 处（revision 158→167）：默认 legacy、版本与自动更新、凭证每日续期、企微 core 媒体路由、审批默认放行、故障转移限定 legacy、/new 回执。
 > 维护规则：以后项目有调整影响到这个文档，也要跟着修改。
 
 ---
@@ -15,14 +15,14 @@
 
 手机上直接在微信或企业微信里与 Muse 对话，日常使用无需打开 muse.ai。你可以只接个人微信、只接企业微信，也可以两者都接。网关运行在 Muse 虚拟机或已部署的 Linux 主机上，负责接收消息并把回复送回原聊天。
 
-本教程默认使用 Cookie 原生桥与 legacy 渠道流程。Cookie 来自你在浏览器登录 muse.ai 的会话，Gadget 设备配对属于可选进阶配置。两条渠道的消息记录与回复路由分别维护；Muse 平台的侧会话仍可能共享上下文，不把渠道分开理解为平台级信息隔离。
+本教程默认使用 Cookie 原生桥。Cookie 来自你在浏览器登录 muse.ai 的会话。两条渠道的生产模式不同：个人微信跑 legacy，企微跑 core（Gadget 主轨、Native 备轨）。两条渠道的消息记录与回复路由分别维护；Muse 平台的侧会话仍可能共享上下文，不把渠道分开理解为平台级信息隔离。
 
 ## 第一步，把安装提示词发给 Muse
 
 先用下面的提示词完成默认 Cookie 路径。Muse 负责检查和配置，你需要配合微信扫码、企业微信身份确认及浏览器凭证导出。已有部署先检查当前模式和在途任务，再按明确的变更计划操作。
 
 ```
-请帮我安装或检查 https://github.com/Sirhap/muse-mobile-channels，让我通过个人微信或企业微信与 Muse 对话。默认使用 Cookie 原生桥和 legacy 渠道流程；Gadget 配对与 Core 切换作为单独的可选项，先完成 Cookie 路径验收。
+请帮我安装或检查 https://github.com/Sirhap/muse-mobile-channels，让我通过个人微信或企业微信与 Muse 对话。默认使用 Cookie 原生桥；生产模式是个人微信 legacy、企微 core（Gadget 主轨、Native 备轨），先完成 Cookie 路径验收。
 
 先确认我要接个人微信、企业微信还是两者。只配置选中的渠道。检查现有仓库版本、未提交改动、运行服务、当前模式、任务队列和投递状态；已有生产部署先列出改动范围与恢复方式，得到我的同意后再重启服务、切换模式或修改在途状态。
 
@@ -49,7 +49,7 @@
 
 默认路径是“手机 → 微信／企微网关 → Cookie 原生桥 → Muse → 原聊天”。手机负责发消息，桥使用虚拟机上的凭证连接 Muse。初次安装和凭证失效时，需要本人在浏览器登录并导出凭证。
 
-默认 legacy 部署启用对应分流后，符合条件的单聊文字走 Cookie 原生桥；图片、文件、语音和群聊沿用收件 hooks。桥在发送前失败且满足安全交接条件时，任务可交给 hooks；已经发送或状态未知的任务先核查。Core、Gadget 及 Core 专用 hooks 属于额外启用的配置，不能套用同一条故障转移流程。
+个人微信是 legacy 部署：启用对应分流后，符合条件的单聊文字走 Cookie 原生桥；图片、文件、语音和群聊沿用收件 hooks。桥在发送前失败且满足安全交接条件时，任务可交给 hooks；已经发送或状态未知的任务先核查。企业微信是 core 部署：Gadget 主轨、Native 备轨，故障转移按 core 的规则走，见“掉线了怎么看”一节。
 
 ![](https://feishu.cn/file/SH4HbvUvUo7gt4xuoS0cZDPDnab)
 
@@ -131,20 +131,32 @@ Muse 会给出刚生成的 login-qr.png。微信页面沿用“OpenClaw”名称
 
 企业微信发出的视频上限是 10MB。网关会先尝试压缩，仍然超过 10MB 时，聊天里会收到一条说明，这条视频不会发出去。
 
+## 版本、发版与自动更新
+
+当前版本是 `2026.11.14.6`，唯一出处是仓库根目录的 `VERSION` 文件，格式为日期加序号（`年.月.日.序号`）；每版改了什么见 `CHANGELOG.md`。
+
+安装用一键脚本：`sudo ops/install.sh`（装 systemd 单元；`--dry-run` 先预览，`--only weixin|wecom` 只装一边，`--with-core` 再装 `muse-core-run.service`）。
+
+发版是维护者操作：改完先记 `CHANGELOG.md`，跑 `python3 ops/bump_version.py` 写新版本号进 `VERSION`，提交并打 `v<版本>` tag，GitHub Actions 会验版本、跑测试、打包并建 release。
+
+部署机上的 `ops/self_update.py` 每天凌晨 3:30 由 `self-update.timer` 跑一次，只比版本号：和最新 release 一样就什么都不做，不一样才下载新包、验包、备份、解包、重启网关服务；它不碰凭证、配置和状态文件。装完后用 `systemctl is-active self-update.timer` 核对更新器是否已启用。手动只比对不改动：`python3 ops/self_update.py --check-only`。
+
 ## 第三步，导出 Cookie 原生桥凭证
 
 <figure view-type="Card"><source name="muse-cred-extension-1.0.0.zip" mime="application/zip" size="27062" token="UnmbbGbh5oAImyx5Dqcc7701nlg"/></figure>
 
-推荐使用本节附件中的浏览器扩展，或从仓库下载 native-bridge/muse-cred-extension/ 完整目录。安装说明见 https://github.com/Sirhap/muse-mobile-channels/tree/main/native-bridge/muse-cred-extension 。扩展需要读取 muse.ai Cookie，包括 HttpOnly Cookie，请先核对来源与版本。  
-  
-Chrome 打开 chrome://extensions，开启开发者模式并选择“加载已解压的扩展程序”；Edge 打开 edge://extensions，开启开发人员模式并选择“加载解压缩的扩展”。两者都选择包含 manifest.json 的 muse-cred-extension 文件夹。Firefox 按扩展 README 临时载入，浏览器退出后可能需要重新加载。  
-  
-在同一浏览器登录 https://muse.ai 并打开目标 VM，点击 Muse Bridge Credential Exporter。确认 Cookie、VM ID、token 均获取成功，再点击“一键打包下载 ZIP”。完整凭证包包含 cookies.txt、vm_id.txt、token.json；界面提示部分失败时先处理错误。  
-  
-通过安全文件方式把 ZIP 交给 Muse。Muse 应先检查目标 VM、备份已有凭证，再安装到运行桥的 \~/.config/native-bridge/，目录权限 0700、文件 0600。VM 不一致时先核对，避免覆盖到另一个环境。检查 NATIVE_TOKEN_JSON 等环境配置是否仍覆盖新文件。  
-  
-验活命令为 \~/muse-test-venv/bin/python native-bridge/check_credentials.py --source all --json。分别确认 Cookie、token 与审批连接，再发真实普通消息验收。Cookie 和 token 可能提前失效，不按导出日期承诺可用一个月。  
-  
+推荐使用本节附件中的浏览器扩展，或从仓库下载 native-bridge/muse-cred-extension/ 完整目录。安装说明见 [https://github.com/Sirhap/muse-mobile-channels/tree/main/native-bridge/muse-cred-extension](https://github.com/Sirhap/muse-mobile-channels/tree/main/native-bridge/muse-cred-extension) 。扩展需要读取 muse.ai Cookie，包括 HttpOnly Cookie，请先核对来源与版本。
+
+Chrome 打开 chrome://extensions，开启开发者模式并选择“加载已解压的扩展程序”；Edge 打开 edge://extensions，开启开发人员模式并选择“加载解压缩的扩展”。两者都选择包含 manifest.json 的 muse-cred-extension 文件夹。Firefox 按扩展 README 临时载入，浏览器退出后可能需要重新加载。
+
+在同一浏览器登录 [https://muse.ai](https://muse.ai) 并打开目标 VM，点击 Muse Bridge Credential Exporter。确认 Cookie、VM ID、token 均获取成功，再点击“一键打包下载 ZIP”。完整凭证包包含 cookies.txt、vm_id.txt、token.json；界面提示部分失败时先处理错误。
+
+通过安全文件方式把 ZIP 交给 Muse。Muse 应先检查目标 VM、备份已有凭证，再安装到运行桥的 \~/.config/native-bridge/，目录权限 0700、文件 0600。VM 不一致时先核对，避免覆盖到另一个环境。检查 NATIVE_TOKEN_JSON 等环境配置是否仍覆盖新文件。
+
+验活命令为 \~/muse-test-venv/bin/python native-bridge/check_credentials.py --source all --json。分别确认 Cookie、token 与审批连接，再发真实普通消息验收。Cookie 和 token 可能提前失效，不按导出日期承诺可用一个月。
+
+凭证每天自动续一次：定时任务 `bridge-token-daily-renew` 每天约凌晨 4:54 跑 `native-bridge/renew_token.py`，调接口换新 token；服务器轮换会话票（30 天）时把新票写回 `cookies.txt`，写完验活，验不过就从备份恢复。服务器不是每次调用都发新票，没发时沿用旧票。成功不打扰，失败会汇报；票彻底死了、续期多日失败，才需要重新导出完整 ZIP。
+
 下面是仅导出 token.json 的备用方式，适用于临时恢复桥的 token 回退。它无法读取 HttpOnly Cookie，不能代替完整 Cookie 恢复，也不能修复只使用 Cookie 的审批中继。
 
 1. 用浏览器打开已经登录的 https://muse.ai 。
@@ -219,7 +231,7 @@ Chrome 打开 chrome://extensions，开启开发者模式并选择“加载已�
 
 可以发图片、文件、语音，也可以引用一条旧消息再问。引用会变成「（引用：…）」交给 Muse。这类消息，以及群聊，走冷车道，比纯文字私聊慢一点。
 
-网关下载入站附件的本地保护上限为 1 GiB，平台自身的类型、大小和回复窗口限制仍需满足。个人微信出站的受支持图片、视频超过 2,000,000 字节时会尝试既有压缩流程；企业微信视频超限时会尝试压缩，仍无法发送会提示失败。
+网关下载入站附件的本地保护上限为 1 GiB，平台自身的类型、大小和回复窗口限制仍需满足。个人微信出站的受支持图片、视频超过 2,000,000 字节时会尝试既有压缩流程。企业微信走 core 模式：图片 2 MiB 以内先下载再交给 core 执行器（Gadget 主轨支持图片输入，Native 备轨也能发图片）；视频、文件、语音暂不支持执行，会明确告诉你发不出去，而不是默默丢掉。
 
 同时接入企微并配置好对应目标时，legacy 微信网关可在特定文件投递失败场景尝试转投企微，并报告结果。它依赖实际路由和开关，单独安装微信时不能依赖这条路径。
 
@@ -229,7 +241,7 @@ Chrome 打开 chrome://extensions，开启开发者模式并选择“加载已�
 /new
 ```
 
-发送 /new 后，后续消息使用新会话上下文；legacy 原生桥在下一条走桥的文字到来时创建新会话。默认达到 80 个回合或会话超过 7 天时也会轮换。在途旧任务保留原回复路由；Muse 平台侧会话仍可能共享上下文。
+发送 /new 后回执就是“已开启新会话。”，后续消息使用新会话上下文；legacy 原生桥在下一条走桥的文字到来时创建新会话。默认达到 80 个回合或会话超过 7 天时也会轮换。在途旧任务保留原回复路由；Muse 平台侧会话仍可能共享上下文。
 
 想让一件事在后台做、不挡住当前聊天，用副助手：
 
@@ -237,7 +249,7 @@ Chrome 打开 chrome://extensions，开启开发者模式并选择“加载已�
 /subagent 把这周的会议纪要整理成三条结论
 ```
 
-默认 legacy 流程支持副助手命令，用 /subagent list 查看状态。Core 命令迁移范围以当前 /help 为准。手机审批需要中转服务、通知目标和操作者授权；提交结果未知时先核查原审批。
+默认 legacy 流程支持副助手命令，用 /subagent list 查看状态。Core 命令迁移范围以当前 /help 为准。手机审批走中转服务（approval-relay），需要配置通知目标和操作者授权；但自 2026-11-06 起，除黑名单外一律自动放行，黑名单默认是空的，只有黑名单命中或自动放行提交失败时才会发人工审批通知（/a 仅这次、/b 永久、/c 拒绝）。提交结果未知时先核查原审批。
 
 ## 聊天里的命令
 
@@ -276,7 +288,7 @@ Chrome 打开 chrome://extensions，开启开发者模式并选择“加载已�
   
 “请先只读检查当前仓库版本和运行模式、选中渠道的网关/桥/hook 服务、桥心跳、降级标记、任务队列与投递结果。请区分已入队、平台已接收、实际显示和结果不明，汇报发现及建议。不要输出凭证、用户 ID 或聊天正文；不要重发可能已经执行的任务，不要删除状态、清除 fallback 标记或重启服务。任何可能影响现有任务的操作先给出计划并征得我同意。”  
   
-桥切到备用路径后不会自动切回。确认所有备用任务及投递已结案、没有未知提交或积压后，再按仓库 docs/bridge-failover-2026-11-01.md 制定恢复操作。结果不明时先核查原任务，不能仅因为没看到回复就重发。
+桥切到备用路径后不会自动切回——这只适用于 legacy 桥。确认所有备用任务及投递已结案、没有未知提交或积压后，再按仓库 docs/bridge-failover-2026-11-01.md 制定恢复操作。Core 模式没有这条手动切回流程：Gadget 发送遇到 404（服务端会话已死）时，同回合删死会话、用新会话重试一次，再失败才走 Native 备轨，每回合最多重试一次；其他原因的结果未知不降级，避免重发。结果不明时先核查原任务，不能仅因为没看到回复就重发。
 
 ## 接一个还是两个
 
