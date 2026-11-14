@@ -10,9 +10,9 @@ Type=simple
 WorkingDirectory=/home/hatch/workspace
 Environment=PYTHONUNBUFFERED=1
 EnvironmentFile=-/etc/environment
-Environment=HOME=/home/hatch
-Environment=MUSE_HOME=/home/hatch
-ExecStart=/home/hatch/muse-test-venv/bin/python -m mobile_channels core-run --database /home/hatch/workspace/state/core.sqlite3 --modes /home/hatch/workspace/state/channel-modes.json
+Environment="HOME=/home/hatch"
+Environment="MUSE_HOME=/home/hatch"
+ExecStart="/home/hatch/muse-test-venv/bin/python" "-m" "mobile_channels" "core-run" "--database" "/home/hatch/workspace/state/core.sqlite3" "--modes" "/home/hatch/workspace/state/channel-modes.json"
 Restart=always
 RestartSec=5
 
