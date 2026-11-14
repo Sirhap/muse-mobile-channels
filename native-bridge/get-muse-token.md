@@ -24,6 +24,14 @@ Cookie 和 token 都可能被服务端提前作废。文件里的 `exp` 或 Cook
 
 如果以后提示桥凭证失效，让用户重新登录 Muse，用扩展导出新的 `muse-credentials.zip`，再次以文件交给 Muse，重复备份、核对、安装和两阶段验收；不要只等到名义过期日再处理。
 
+## token 每日自续
+
+`native-bridge/renew_token.py` 每天一次（定时任务 `bridge-token-daily-renew`，约凌晨 4:54）用还活着的 cookie 换新 token 写回 `token.json`，让 token 腿不再出生约 24 小时就死。只续 token、不续 cookie：`/api/auth/check` 与 `/api/hatch/token` 只换 token，不发新 cookie。任一步失败即退出、不改 `token.json`（cookie 死时失败是预期信号，说明该重导了）；`NATIVE_TOKEN_JSON` 存在时跳过（桥不读磁盘文件，续了也没用）。成功时静默，失败时汇报。手动跑一次：
+
+```bash
+~/muse-test-venv/bin/python ~/workspace/native-bridge/renew_token.py
+```
+
 ## 备用方式：控制台只导出 token
 
 脚本 [`get-muse-token.js`](get-muse-token.js) 是浏览器控制台片段，不能用 Node 执行。它通过浏览器现有登录态请求 token，无法读取 `HttpOnly` Cookie，不能生成 `cookies.txt`。单换 token 可能恢复桥的回退路径，但不能恢复审批中继，也不能证明 Cookie 恢复。
