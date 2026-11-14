@@ -90,6 +90,22 @@ class TestTarballVerify(unittest.TestCase):
                          {"app.py": "print('new')\n"})
             self_update.verify_tarball(tarball, "2026.11.15.1")
 
+    def test_tarball_with_top_level_dir_entry_passes(self):
+        # git archive emits the top-level directory itself as a member
+        # without a trailing slash; that entry must be accepted.
+        with tempfile.TemporaryDirectory() as tmp:
+            tarball = Path(tmp) / "good.tar.gz"
+            prefix = "muse-mobile-channels-2026.11.15.1/"
+            with tarfile.open(tarball, "w:gz") as archive:
+                info = tarfile.TarInfo(prefix.rstrip("/"))
+                info.type = tarfile.DIRTYPE
+                archive.addfile(info)
+                data = io.BytesIO(b"2026.11.15.1\n")
+                info = tarfile.TarInfo(prefix + "VERSION")
+                info.size = len(data.getvalue())
+                archive.addfile(info, data)
+            self_update.verify_tarball(tarball, "2026.11.15.1")
+
     def test_wrong_version_content_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             tarball = Path(tmp) / "bad.tar.gz"

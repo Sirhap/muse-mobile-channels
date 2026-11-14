@@ -224,8 +224,10 @@ def verify_tarball(tarball: Path, expected_version: str) -> None:
         members = archive.getmembers()
         if not members:
             raise UpdateError("tarball is empty")
+        top_dir = prefix.rstrip("/")
         for member in members:
-            if not member.name.startswith(prefix):
+            # The top-level directory entry itself carries no trailing slash.
+            if member.name != top_dir and not member.name.startswith(prefix):
                 raise UpdateError(
                     f"tarball member outside {prefix!r}: {member.name!r}")
             reason = _forbidden_reason(member.name)
