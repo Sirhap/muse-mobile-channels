@@ -1385,12 +1385,26 @@ class DualTrackExecutor:
                 outcome = self.primary.query(context, run_id)
             except Exception as exc:
                 return ExecutionOutcome('unknown', evidence=str(exc))
-            if outcome.state == 'failed' and not outcome.message_id:
+            send_proven_undelivered = (
+                outcome.state == 'unknown'
+                and not outcome.message_id
+                and (outcome.evidence or '').startswith('send_unconfirmed:')
+                and 'HTTP 404' in (outcome.evidence or '')
+            )
+            if (outcome.state == 'failed' and not outcome.message_id) or send_proven_undelivered:
                 # Primary died before its message reached the session (the
                 # worker result carries no message_id), so a native retry
                 # cannot double-deliver: supersede the gadget binding and
                 # fall back. A failed result WITH a message_id means the
                 # message was sent and a reply may exist -- never re-send.
+                # The same holds for an 'unknown' result that PROVES the
+                # send never landed: the worker settles send_unconfirmed
+                # with HTTP 404 when the server-side session is gone
+                # (live 2026-11-12/13: stored session a6b9ba21 dead,
+                # three WeCom turns died on the unknown budget without
+                # ever trying Native). Only a 404 proves non-delivery;
+                # any other unknown (ack missing, worker died mid-send)
+                # stays unknown so a retry cannot double-deliver.
                 self.circuit.record_failure()
                 with self.store.transaction():
                     self.store.connection.execute(
