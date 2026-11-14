@@ -35,6 +35,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -248,14 +249,35 @@ def verify_tarball(tarball: Path, expected_version: str) -> None:
                 f"{expected_version!r}")
 
 
+def _backup_ignore(dirpath: str, names: list[str]) -> set[str]:
+    """Names backup_install skips: caches/state plus non-regular files.
+
+    A code backup copies regular files, directories and symlinks only.
+    Runtime artifacts such as a Unix socket left by a preview harness are
+    not code and cannot be copied: copytree raises on them, which used to
+    abort the whole update before anything was applied (live 2026-11-14:
+    two stale probe-ui sockets under ts-spaces/ killed the backup step).
+    """
+    ignored = set(shutil.ignore_patterns(
+        ".git", "state", "__pycache__", "*.pyc", ".venv", "venv",
+        "dist", "build", "*.egg-info", "*.log")(dirpath, names))
+    for name in names:
+        try:
+            mode = os.lstat(os.path.join(dirpath, name)).st_mode
+        except OSError:
+            continue
+        if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)
+                or stat.S_ISLNK(mode)):
+            ignored.add(name)
+    return ignored
+
+
 def backup_install(install_dir: Path, old_version: str) -> Path:
-    """Copy the code tree (no .git, no state, no caches) next to the install."""
+    """Copy the code tree (no .git, no state, no caches, no special files)
+    next to the install."""
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     backup = install_dir.parent / f"{install_dir.name}.bak-{old_version}-{stamp}"
-    ignore = shutil.ignore_patterns(
-        ".git", "state", "__pycache__", "*.pyc", ".venv", "venv",
-        "dist", "build", "*.egg-info", "*.log")
-    shutil.copytree(install_dir, backup, ignore=ignore)
+    shutil.copytree(install_dir, backup, ignore=_backup_ignore)
     return backup
 
 

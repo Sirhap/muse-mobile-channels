@@ -7,6 +7,7 @@ test always passes --no-restart so no production service can be restarted.
 
 import io
 import json
+import socket
 import subprocess
 import sys
 import tarfile
@@ -270,6 +271,32 @@ class TestUpdaterFlow(unittest.TestCase):
                              "print('old')\n")
             self.assertIn("2026.11.14.1 -> 2026.11.15.1", proc.stdout)
             self.assertTrue((install / "self-update.log").is_file())
+
+    def test_apply_skips_socket_files_in_backup(self):
+        # Regression: a stale Unix socket in the tree used to crash
+        # backup_install (copytree raises on sockets) and abort the whole
+        # update before anything was applied (live 2026-11-14: two stale
+        # probe-ui sockets under ts-spaces/ killed the backup step).
+        with tempfile.TemporaryDirectory() as tmp:
+            install = make_install_dir(tmp)
+            sock_path = install / "scratch.sock"
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                sock.bind(str(sock_path))
+                tarball = Path(tmp) / "new.tar.gz"
+                make_tarball(tarball, "2026.11.15.1",
+                             {"app.py": "print('new')\n"})
+                proc = self._run(install, "--no-restart",
+                                 "--fake-latest-version", "2026.11.15.1",
+                                 "--fake-tarball", str(tarball))
+            finally:
+                sock.close()
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual((install / "VERSION").read_text(),
+                             "2026.11.15.1\n")
+            backups = list(Path(tmp).glob("checkout.bak-2026.11.14.1-*"))
+            self.assertEqual(len(backups), 1)
+            self.assertFalse((backups[0] / "scratch.sock").exists())
 
     def test_apply_rejects_bad_tarball(self):
         with tempfile.TemporaryDirectory() as tmp:
