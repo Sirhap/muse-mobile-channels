@@ -135,8 +135,8 @@ def run_core(database: Path, modes: Path, once: bool = False) -> dict:
         routes = set(map(tuple, store.connection.execute('SELECT DISTINCT channel,account_id FROM conversations')))
         if not routes <= scopes:
             raise ModeError('database contains accounts not owned by this runner configuration')
-        # Dual track: Gadget side chats first, native MuseExecutor as fallback.
-        # Without this the core path would never exercise the Gadget track.
+        # Dual track: Gadget side chats first unless the channel modes file
+        # disables it, native MuseExecutor as fallback.
         runner = CoreRunner(store, DualTrackExecutor(store, modes=modes), f'core-{os.getpid()}')
         observer = stack.enter_context(ThreadPoolExecutor(max_workers=1, thread_name_prefix='muse-replies'))
         pending_update = None

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import base64
 import importlib.util
+import json
 import os
 import re
 import threading
@@ -1281,7 +1282,9 @@ class DualTrackExecutor:
     """双轨高可用执行器，实现 Executor 协议。
 
     组合 GadgetExecutor（主轨）与 MuseExecutor（备轨）。
-    优先使用 Gadget 侧会话，遇故障或凭证缺失时无缝降级至 Native 备轨。
+    Gadget 只在该渠道的 modes 配置未显式关闭时使用（gadget_enabled，
+    缺省 true）；关闭后提交直接走 Native，提交失败且未提交时再由
+    hook 备用接手。已绑定 Gadget 的旧 attempt 仍按原轨 query 与 cancel。
     根据 attempt_id 在 executor_runs 中绑定的 track 精确分发 query 与 cancel，严禁跨轨串话。
     """
 
@@ -1295,6 +1298,7 @@ class DualTrackExecutor:
     ):
         self.store = store
         ensure_executor_schema(store)
+        self.modes = modes or os.environ.get("MUSE_CHANNEL_MODES")
         self.primary = primary or GadgetExecutor(store, history_client_factory=bridge_client)
         self.fallback = fallback or MuseExecutor(store)
         self.circuit = circuit or CircuitBreaker()
@@ -1305,7 +1309,24 @@ class DualTrackExecutor:
         # because each retry invalidates the proven-dead session first.
         self._gadget_404_retries: dict[str, int] = {}
         from .handoff import HookHandoffExecutor
-        self.handoff = HookHandoffExecutor(store, modes)
+        self.handoff = HookHandoffExecutor(store, self.modes)
+
+    def _gadget_enabled(self, context: ExecutionContext) -> bool:
+        """Gadget is opt-out per channel; only an explicit false disables it.
+
+        No modes file, an unreadable document, or a missing key all keep the
+        historical default (enabled). Production disables Gadget for WeCom
+        via channel-modes.json; validate_settings rejects a non-bool value
+        at publish time, so this read only ever sees a bool or nothing.
+        """
+        if not self.modes:
+            return True
+        try:
+            document = json.loads(Path(self.modes).read_text())
+            settings = document["channels"][context.channel]
+        except (OSError, ValueError, KeyError, TypeError):
+            return True
+        return settings.get("gadget_enabled", True) is not False
 
     def current_track(self, attempt_id: str) -> str | None:
         """根据 attempt_id 查询当前任务绑定的执行轨 ('gadget' 或 'native')。"""
@@ -1346,11 +1367,15 @@ class DualTrackExecutor:
         return Replies(self.store).tick(fetch_history)
 
     def submit(self, context: ExecutionContext) -> ExecutionOutcome:
-        """提交任务：优先主轨，故障/熔断时平滑降级至备轨。
+        """提交任务：Gadget 启用时优先主轨，故障/熔断时平滑降级至备轨；Gadget 关闭时直接走备轨。
 
         支持的图片与文字一起走 Gadget；未配置或故障时走 Native。
         其他媒体保留 Native 的显式能力校验，不能静默丢弃。
         """
+        # Gadget disabled for this channel: Native is the execution track,
+        # with the hook handoff as the fallback for proven-unsent work.
+        if not self._gadget_enabled(context):
+            return self._submit_native(context)
         # Only image inputs have a documented Gadget message representation.
         if any(not isinstance(item, dict) or item.get('kind') != 'image'
                for item in getattr(context, 'media', []) or []):

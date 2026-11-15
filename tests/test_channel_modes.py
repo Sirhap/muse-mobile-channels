@@ -62,6 +62,15 @@ class ChannelModeTests(unittest.TestCase):
             ChannelLease(self.path, 'weixin')
         write_modes(self.path, self.legacy)
 
+    def test_gadget_enabled_must_be_bool_when_present(self):
+        core = {'mode': 'core', 'database': '/tmp/example.sqlite3',
+                'account_id': 'bot', 'allowed_senders': ['alice'],
+                'gadget_enabled': 'false'}
+        with self.assertRaises(ModeError):
+            write_modes(self.path, {'channels': {'weixin': dict(core)}})
+        core['gadget_enabled'] = False
+        write_modes(self.path, {'channels': {'weixin': dict(core)}})
+
 
 if __name__ == '__main__':
     unittest.main()

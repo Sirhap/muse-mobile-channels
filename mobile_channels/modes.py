@@ -35,6 +35,8 @@ def validate_settings(channel: str, settings: dict) -> None:
         if not isinstance(settings.get('allowed_senders'), list) or not settings['allowed_senders'] or not all(
                 isinstance(item, str) and item.strip() for item in settings['allowed_senders']):
             raise ModeError('allowed_senders must be a nonempty list of identities')
+    if 'gadget_enabled' in settings and not isinstance(settings['gadget_enabled'], bool):
+        raise ModeError('gadget_enabled must be a boolean when present')
 
 
 class ChannelLease:
