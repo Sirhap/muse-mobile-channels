@@ -2,6 +2,8 @@
 import json
 import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
@@ -207,6 +209,58 @@ class CoreHookHandoffTests(unittest.TestCase):
             self.executor.cancel(context, "hook:foreign")
         row = self.store.connection.execute("SELECT cancel_requested FROM core_hook_handoffs").fetchone()
         self.assertFalse(row[0])
+
+    def _poll_script(self, home, **overrides):
+        """Run the real hook from an unrelated cwd with a minimal runtime env."""
+        runtime = self.root / "hook-runtime.sh"
+        runtime.write_text('silent() { printf "silent\\n%s\\n" "$2"; }\n'
+                           'wake() { printf "wake\\n%s\\n" "$2"; }\n')
+        environment = {
+            "HOME": str(home), "PATH": os.environ.get("PATH", os.defpath),
+            "HATCH_HOOK_RUNTIME": str(runtime), "PYTHONDONTWRITEBYTECODE": "1",
+            **overrides,
+        }
+        script = Path(__file__).resolve().parents[1] / "hooks/scripts/core-handoff.sh"
+        return subprocess.run(["bash", str(script)], cwd=self.root, env=environment,
+                              capture_output=True, text=True, timeout=15)
+
+    def test_hook_runtime_defaults_offer_once_without_muse_environment(self):
+        """A clean hook runtime can import the project and use production paths."""
+        home = self.root / "hook home"
+        workspace = home / "workspace"
+        state = workspace / "state"
+        state.mkdir(parents=True)
+        (workspace / "mobile_channels").symlink_to(
+            Path(__file__).resolve().parents[1] / "mobile_channels", target_is_directory=True)
+        (state / "core.sqlite3").symlink_to(self.database)
+        (state / "channel-modes.json").symlink_to(self.modes)
+        interpreter = home / "muse-test-venv/bin/python"
+        interpreter.parent.mkdir(parents=True)
+        interpreter.symlink_to(sys.executable)
+        self.runner.tick()
+
+        first = self._poll_script(home)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        event, payload = first.stdout.splitlines()
+        self.assertEqual(event, "wake")
+        self.assertEqual(json.loads(payload)["task"]["external_message_id"], "external-1")
+        second = self._poll_script(home)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(second.stdout, "silent\n{}\n")
+        row = self.store.connection.execute("SELECT state FROM core_hook_handoffs").fetchone()
+        self.assertEqual(row[0], "offered")
+
+    def test_hook_runtime_preserves_explicit_paths_and_pythonpath(self):
+        """Custom installs still work when HOME/workspace does not exist."""
+        self.runner.tick()
+        result = self._poll_script(
+            self.root / "custom home",
+            MUSE_CORE_HANDOFF_DATABASE=str(self.database), MUSE_CHANNEL_MODES=str(self.modes),
+            MUSE_CORE_HANDOFF_PYTHON=sys.executable,
+            PYTHONPATH=str(Path(__file__).resolve().parents[1]),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines()[0], "wake")
 
 
 if __name__ == "__main__":

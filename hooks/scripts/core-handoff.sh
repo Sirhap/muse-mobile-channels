@@ -3,10 +3,12 @@
 set -euo pipefail
 source "${HATCH_HOOK_RUNTIME:?hook runtime is required}"
 
-if [[ -z "${MUSE_CORE_HANDOFF_DATABASE:-}" || -z "${MUSE_CHANNEL_MODES:-}" ]]; then
-  silent "Core hook handoff is not configured" '{}'
-  exit 0
-fi
+# Hooks run without service-specific variables and may start outside workspace.
+# Preserve explicit paths and existing import paths for custom installations.
+: "${MUSE_CORE_HANDOFF_DATABASE:=$HOME/workspace/state/core.sqlite3}"
+: "${MUSE_CHANNEL_MODES:=$HOME/workspace/state/channel-modes.json}"
+: "${MUSE_CORE_HANDOFF_PYTHON:=$HOME/muse-test-venv/bin/python}"
+export PYTHONPATH="$HOME/workspace${PYTHONPATH:+:$PYTHONPATH}"
 
 HANDOFF="$("${MUSE_CORE_HANDOFF_PYTHON:-python3}" -m mobile_channels.handoff poll \
   --database "$MUSE_CORE_HANDOFF_DATABASE" --modes "$MUSE_CHANNEL_MODES" \
