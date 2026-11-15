@@ -2,7 +2,7 @@
 
 > 来源：https://my.feishu.cn/docx/SsDMdusWboCxOrxJJD7c6Z2xngc（token：SsDMdusWboCxOrxJJD7c6Z2xngc）
 > 抓取日期：2026-11-15，飞书 revision 199；正文为当时全文原样镜像，未改写。
-> 修正记录：2026-11-14 已按项目现状修正 9 处（revision 158→167）：默认 legacy、版本与自动更新、凭证每日续期、企微 core 媒体路由、审批默认放行、故障转移限定 legacy、/new 回执。2026-11-14 晚补进第一步提示词 5 处（revision 167→173）：桥 token 每日续期、项目定时更新、Core 切换、Gadget 配对、保活核对。2026-11-14 晚再补第一步提示词 4 处（revision 173→177）：审批默认规则、VERSION 以文件为准、Core 切换点名文档、恢复演练加 sudo。2026-11-14 晚 E3 节版本号改为以 VERSION 文件为准（revision 177→178）。2026-11-14 晚再审其余章节改 6 处（revision 178→184）：企微视频按 core 改写（两处）、确认卡片只 legacy、core 暂不支持 /subagent、“思考中”文案、/ping 完整引用、/queue drop 补桥变体。2026-11-15 凌晨删繁 9 处（revision 184→199）：删第二步末尾行、企微节两句、日常开头废话并合并两段、/new 段两句重复、掉线节验收句、结尾节三句重复，续期段与审批段缩短，10MB legacy 说明只留日常媒体段一处。2026-11-15 提示词改回 Cookie 加备用网关：企微 core 不推荐 Gadget，6 处（revision 199→205），生产仍跑 Gadget 主轨、是否改生产待定。
+> 修正记录：2026-11-14 已按项目现状修正 9 处（revision 158→167）：默认 legacy、版本与自动更新、凭证每日续期、企微 core 媒体路由、审批默认放行、故障转移限定 legacy、/new 回执。2026-11-14 晚补进第一步提示词 5 处（revision 167→173）：桥 token 每日续期、项目定时更新、Core 切换、Gadget 配对、保活核对。2026-11-14 晚再补第一步提示词 4 处（revision 173→177）：审批默认规则、VERSION 以文件为准、Core 切换点名文档、恢复演练加 sudo。2026-11-14 晚 E3 节版本号改为以 VERSION 文件为准（revision 177→178）。2026-11-14 晚再审其余章节改 6 处（revision 178→184）：企微视频按 core 改写（两处）、确认卡片只 legacy、core 暂不支持 /subagent、“思考中”文案、/ping 完整引用、/queue drop 补桥变体。2026-11-15 凌晨删繁 9 处（revision 184→199）：删第二步末尾行、企微节两句、日常开头废话并合并两段、/new 段两句重复、掉线节验收句、结尾节三句重复，续期段与审批段缩短，10MB legacy 说明只留日常媒体段一处。2026-11-15 提示词改回 Cookie 加备用网关：企微 core 不推荐 Gadget，6 处（revision 199→205）。2026-11-15 18:41 生产去 Gadget：执行器加 gadget_enabled 开关，wecom 设 false（提交 8822e6e），真实验收待用户发新消息。
 > 维护规则：以后项目有调整影响到这个文档，也要跟着修改。
 
 ---
