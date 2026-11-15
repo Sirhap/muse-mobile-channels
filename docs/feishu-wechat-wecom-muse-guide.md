@@ -2,7 +2,7 @@
 
 > 来源：https://my.feishu.cn/docx/SsDMdusWboCxOrxJJD7c6Z2xngc（token：SsDMdusWboCxOrxJJD7c6Z2xngc）
 > 抓取日期：2026-11-15，飞书 revision 199；正文为当时全文原样镜像，未改写。
-> 修正记录：2026-11-14 已按项目现状修正 9 处（revision 158→167）：默认 legacy、版本与自动更新、凭证每日续期、企微 core 媒体路由、审批默认放行、故障转移限定 legacy、/new 回执。2026-11-14 晚补进第一步提示词 5 处（revision 167→173）：桥 token 每日续期、项目定时更新、Core 切换、Gadget 配对、保活核对。2026-11-14 晚再补第一步提示词 4 处（revision 173→177）：审批默认规则、VERSION 以文件为准、Core 切换点名文档、恢复演练加 sudo。2026-11-14 晚 E3 节版本号改为以 VERSION 文件为准（revision 177→178）。2026-11-14 晚再审其余章节改 6 处（revision 178→184）：企微视频按 core 改写（两处）、确认卡片只 legacy、core 暂不支持 /subagent、“思考中”文案、/ping 完整引用、/queue drop 补桥变体。2026-11-15 凌晨删繁 9 处（revision 184→199）：删第二步末尾行、企微节两句、日常开头废话并合并两段、/new 段两句重复、掉线节验收句、结尾节三句重复，续期段与审批段缩短，10MB legacy 说明只留日常媒体段一处。
+> 修正记录：2026-11-14 已按项目现状修正 9 处（revision 158→167）：默认 legacy、版本与自动更新、凭证每日续期、企微 core 媒体路由、审批默认放行、故障转移限定 legacy、/new 回执。2026-11-14 晚补进第一步提示词 5 处（revision 167→173）：桥 token 每日续期、项目定时更新、Core 切换、Gadget 配对、保活核对。2026-11-14 晚再补第一步提示词 4 处（revision 173→177）：审批默认规则、VERSION 以文件为准、Core 切换点名文档、恢复演练加 sudo。2026-11-14 晚 E3 节版本号改为以 VERSION 文件为准（revision 177→178）。2026-11-14 晚再审其余章节改 6 处（revision 178→184）：企微视频按 core 改写（两处）、确认卡片只 legacy、core 暂不支持 /subagent、“思考中”文案、/ping 完整引用、/queue drop 补桥变体。2026-11-15 凌晨删繁 9 处（revision 184→199）：删第二步末尾行、企微节两句、日常开头废话并合并两段、/new 段两句重复、掉线节验收句、结尾节三句重复，续期段与审批段缩短，10MB legacy 说明只留日常媒体段一处。2026-11-15 提示词改回 Cookie 加备用网关：企微 core 不推荐 Gadget，6 处（revision 199→205），生产仍跑 Gadget 主轨、是否改生产待定。
 > 维护规则：以后项目有调整影响到这个文档，也要跟着修改。
 
 ---
@@ -15,18 +15,18 @@
 
 手机上直接在微信或企业微信里与 Muse 对话，日常使用无需打开 muse.ai。你可以只接个人微信、只接企业微信，也可以两者都接。网关运行在 Muse 虚拟机或已部署的 Linux 主机上，负责接收消息并把回复送回原聊天。
 
-本教程默认使用 Cookie 原生桥。Cookie 来自你在浏览器登录 muse.ai 的会话。两条渠道的生产模式不同：个人微信跑 legacy，企微跑 core（Gadget 主轨、Native 备轨）。两条渠道的消息记录与回复路由分别维护；Muse 平台的侧会话仍可能共享上下文，不把渠道分开理解为平台级信息隔离。
+本教程默认使用 Cookie 原生桥。Cookie 来自你在浏览器登录 muse.ai 的会话。两条渠道的生产模式不同：个人微信跑 legacy，企微跑 core（Cookie 执行，提交失败且未提交时由网关 hook 备用接手，不推荐 Gadget）。两条渠道的消息记录与回复路由分别维护；Muse 平台的侧会话仍可能共享上下文，不把渠道分开理解为平台级信息隔离。
 
 ## 第一步，把安装提示词发给 Muse
 
 先用下面的提示词完成默认 Cookie 路径。Muse 负责检查和配置，你需要配合微信扫码、企业微信身份确认及浏览器凭证导出。已有部署先检查当前模式和在途任务，再按明确的变更计划操作。
 
 ```
-请帮我安装或检查 https://github.com/Sirhap/muse-mobile-channels，让我通过个人微信或企业微信与 Muse 对话。默认使用 Cookie 原生桥；生产模式是个人微信 legacy、企微 core（Gadget 主轨、Native 备轨），先完成 Cookie 路径验收。Gadget 首次配对须 macOS 加蓝牙，本机 Linux 配不了：配对前 core 先走 Native 备轨，Gadget 凭证在有蓝牙的 Mac 上配出后以文件方式交付；装完发一条真实消息走一回合，查 state/core.sqlite3 里 executor_runs 表最新一行的 track 字段并报出实际执行轨是 Gadget 还是 Native，不要只说“已配 Gadget”。
+请帮我安装或检查 https://github.com/Sirhap/muse-mobile-channels，让我通过个人微信或企业微信与 Muse 对话。默认使用 Cookie 原生桥；生产模式是个人微信 legacy、企微 core（Cookie 执行，提交失败且未提交时由网关 hook 备用接手，不推荐 Gadget），先完成 Cookie 路径验收。装完发一条真实消息走一回合，查 state/core.sqlite3 里 executor_runs 表最新一行的 track 字段并报出实际执行轨是 native 还是 hooks，不要只说“已装备用”。
 
 先确认我要接个人微信、企业微信还是两者。只配置选中的渠道。检查现有仓库版本、未提交改动、运行服务、当前模式、任务队列和投递状态；已有生产部署先列出改动范围与恢复方式，得到我的同意后再重启服务、切换模式或修改在途状态。
 
-读取当前 main 的 README.md、docs/deployment-checks.md、所选渠道配置及 docs/bridge-failover-2026-11-01.md。按实际代码操作，保留完整仓库结构，核对家目录、workspace、服务和 hooks 路径。已有 Core 或 Gadget 部署先报告当前执行轨，再讨论是否调整。新装也一样：service-plan 默认装 legacy，企微要跑 core 须另走切换流程——先备好准确的数据库与 state/channel-modes.json，停旧写者，再按 docs/deployment-checks.md 里 Core 切换一段的流程启动（ops/install.sh --with-core 装 muse-core-run.service）；只生成 plan 不等于切了 core，切完核对企微实际跑在 core 模式。
+读取当前 main 的 README.md、docs/deployment-checks.md、所选渠道配置及 docs/bridge-failover-2026-11-01.md。按实际代码操作，保留完整仓库结构，核对家目录、workspace、服务和 hooks 路径。已有 Core 部署先报告当前执行轨，再讨论是否调整。新装也一样：service-plan 默认装 legacy，企微要跑 core 须另走切换流程——先备好准确的数据库与 state/channel-modes.json，停旧写者，再按 docs/deployment-checks.md 里 Core 切换一段的流程启动（ops/install.sh --with-core 装 muse-core-run.service）；只生成 plan 不等于切了 core，切完核对企微实际跑在 core 模式。
 
 每条依赖命令都从仓库根目录执行，只安装所选渠道：
 个人微信：python3 -m venv weixin-bot/.venv && weixin-bot/.venv/bin/pip install -r weixin-bot/requirements.txt
@@ -49,7 +49,7 @@
 
 默认路径是“手机 → 微信／企微网关 → Cookie 原生桥 → Muse → 原聊天”。手机负责发消息，桥使用虚拟机上的凭证连接 Muse。初次安装和凭证失效时，需要本人在浏览器登录并导出凭证。
 
-个人微信是 legacy 部署：启用对应分流后，符合条件的单聊文字走 Cookie 原生桥；图片、文件、语音和群聊沿用收件 hooks。桥在发送前失败且满足安全交接条件时，任务可交给 hooks；已经发送或状态未知的任务先核查。企业微信是 core 部署：Gadget 主轨、Native 备轨，故障转移按 core 的规则走，见“掉线了怎么看”一节。
+个人微信是 legacy 部署：启用对应分流后，符合条件的单聊文字走 Cookie 原生桥；图片、文件、语音和群聊沿用收件 hooks。桥在发送前失败且满足安全交接条件时，任务可交给 hooks；已经发送或状态未知的任务先核查。企业微信是 core 部署：Cookie 执行，提交失败且未提交时由网关 hook 备用接手，见“掉线了怎么看”一节。
 
 ![](https://feishu.cn/file/SH4HbvUvUo7gt4xuoS0cZDPDnab)
 
@@ -223,7 +223,7 @@ Chrome 打开 chrome://extensions，开启开发者模式并选择“加载已�
 
 可以发图片、文件、语音，也可以引用一条旧消息再问。引用会变成「（引用：…）」交给 Muse。这类消息，以及群聊，走冷车道，比纯文字私聊慢一点。
 
-网关下载入站附件的本地保护上限为 1 GiB，平台自身的类型、大小和回复窗口限制仍需满足。个人微信出站的受支持图片、视频超过 2,000,000 字节时会尝试既有压缩流程。企业微信走 core 模式：图片 2 MiB 以内先下载再交给 core 执行器（Gadget 主轨支持图片输入，Native 备轨也能发图片）；视频、文件、语音暂不支持执行，会明确告诉你发不出去，而不是默默丢掉；10MB 先压缩的流程只适用于 legacy 模式。
+网关下载入站附件的本地保护上限为 1 GiB，平台自身的类型、大小和回复窗口限制仍需满足。个人微信出站的受支持图片、视频超过 2,000,000 字节时会尝试既有压缩流程。企业微信走 core 模式：图片 2 MiB 以内先下载再交给 core 执行器（Cookie 执行支持图片输入）；视频、文件、语音暂不支持执行，会明确告诉你发不出去，而不是默默丢掉；10MB 先压缩的流程只适用于 legacy 模式。
 
 同时接入企微并配置好对应目标时，legacy 微信网关可在特定文件投递失败场景尝试转投企微，并报告结果。它依赖实际路由和开关，单独安装微信时不能依赖这条路径。
 
@@ -280,7 +280,7 @@ Chrome 打开 chrome://extensions，开启开发者模式并选择“加载已�
   
 “请先只读检查当前仓库版本和运行模式、选中渠道的网关/桥/hook 服务、桥心跳、降级标记、任务队列与投递结果。请区分已入队、平台已接收、实际显示和结果不明，汇报发现及建议。不要输出凭证、用户 ID 或聊天正文；不要重发可能已经执行的任务，不要删除状态、清除 fallback 标记或重启服务。任何可能影响现有任务的操作先给出计划并征得我同意。”  
   
-桥切到备用路径后不会自动切回——这只适用于 legacy 桥。确认所有备用任务及投递已结案、没有未知提交或积压后，再按仓库 docs/bridge-failover-2026-11-01.md 制定恢复操作。Core 模式没有这条手动切回流程：Gadget 发送遇到 404（服务端会话已死）时，同回合删死会话、用新会话重试一次，再失败才走 Native 备轨，每回合最多重试一次；其他原因的结果未知不降级，避免重发。结果不明时先核查原任务，不能仅因为没看到回复就重发。
+桥切到备用路径后不会自动切回——这只适用于 legacy 桥。确认所有备用任务及投递已结案、没有未知提交或积压后，再按仓库 docs/bridge-failover-2026-11-01.md 制定恢复操作。Core 模式没有这条手动切回流程：执行器提交失败且未提交时，由网关 hook 备用接手；结果未知时不交接，避免重发。结果不明时先核查原任务，不能仅因为没看到回复就重发。
 
 ## 接一个还是两个
 
