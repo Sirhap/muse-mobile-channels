@@ -1326,13 +1326,20 @@ class ChannelWorker(threading.Thread):
                        idle_push_seq=0)
 
     def history_events(self, sid, limit=40):
+        snapshot = getattr(type(self.gw), "history_snapshot", None)
+        if callable(snapshot):
+            return self.gw.history_snapshot(sid, limit, fresh=getattr(self, "_fresh_history", False))
         d = self.gw.call_json("chat.history",
                               body={"limit": limit, "session_id": sid})
         return sorted(d.get("chat_events", []), key=lambda e: e.get("seq", 0))
 
     def start_turn(self, row, cs):
         sid, preamble = self.session_for(cs)
-        evs = self.history_events(sid, limit=5)
+        self._fresh_history = True
+        try:
+            evs = self.history_events(sid, limit=5)
+        finally:
+            self._fresh_history = False
         baseline = evs[-1].get("seq", 0) if evs else 0
         text = row.get("text", "")
         if preamble:
@@ -2105,7 +2112,11 @@ class ChannelWorker(threading.Thread):
                     write_status({}, active={ch: self._active_summary()})
             except Exception:
                 pass
-            time.sleep(POLL_SECS)
+            waiter = getattr(type(self.gw), "wait_for_update", None)
+            if callable(waiter):
+                self.gw.wait_for_update(POLL_SECS)
+            else:
+                time.sleep(POLL_SECS)
 
     def step(self, spool, boundary_f):
         """Hold the channel routing lock across state checks and external calls."""
