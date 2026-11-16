@@ -1247,21 +1247,22 @@ class ChannelWorker(threading.Thread):
     def ensure_gw(self):
         if self.gw is not None:
             return True
+        started = time.monotonic()
         gw, exc = self._acquire_connection()
         if gw is None:
             if exc is not None:
                 self.log("connect failed:", type(exc).__name__, str(exc)[:140])
             return False
         self.gw = gw
-        self.log("connected")
+        self.log(f"connected elapsed_ms={int((time.monotonic() - started) * 1000)}")
         return True
 
+    def _reuse_cf_connection(self):
+        """WeChat CF turns share their worker's socket, with a fresh history read before sending."""
+        return self.ch == "weixin" and bool(os.environ.get("MUSE_CF_RELAY_CONFIG"))
+
     def drop_gw(self):
-        """Close the current connection, if any. Connections are
-        turn-scoped: _start_next connects fresh for every turn and the
-        connection is dropped when the turn ends, so the bridge never
-        holds an idle connection (an idle one gets reaped somewhere
-        along the path — the 2026-10-07 fallback root cause)."""
+        """Close the worker's socket after errors or a fresh-connection turn."""
         gw, self.gw = self.gw, None
         if gw is not None:
             try:
@@ -1958,8 +1959,8 @@ class ChannelWorker(threading.Thread):
         marked in poll_turn and merged by step). The first scan of a
         session only baselines the watermark — history is never
         retro-pushed. Read-only polling reuses/renews a quiet
-        connection; sends still always go out on fresh turn-scoped
-        connections via _start_next.
+        connection. WeChat CF turns reuse it after start_turn's fresh
+        history read; other transports connect fresh in _start_next.
         LT2 (gated): failures go through _note_idle_scan_failure —
         a session-not-found invalidates the dead sid so the scan
         stops, other failures streak towards a visible alert, and a
@@ -2266,9 +2267,7 @@ class ChannelWorker(threading.Thread):
                     [t["msgid"] for t in alive] != [t["msgid"] for t in turns]:
                 self._turns_dirty = False
                 self.update_cs(turns=alive)
-            if not alive:
-                # Turn over — close its connection. The next turn
-                # connects fresh; nothing idle is left behind to die.
+            if not alive and not self._reuse_cf_connection():
                 self.drop_gw()
         if self._turn_reply_marks:
             # Replies just delivered as turn answers must never be
@@ -2499,20 +2498,20 @@ class ChannelWorker(threading.Thread):
         if self._hold_submission():
             return
         row, nbytes = self.queue[0]
-        # Every turn starts on a FRESH connection (see drop_gw): the
-        # history read inside start_turn doubles as the liveness proof
-        # of a connection seconds old, so a turn can no longer discover
-        # a long-dead idle connection at send time — the failure mode
-        # behind the cold-path fallbacks. Cookie/token auth makes the
-        # ~2-3s reconnect cheap; that is the whole cost of the fix.
+        # start_turn reads history before reserving or sending. A reused
+        # CF socket must pass that live RPC; a failed pre-send read can
+        # reconnect once. A persisted submission intent always forbids retry.
         # LT2 (gated): a pre-send session-not-found against the
         # STORED sid means that sid died server-side; invalidate it
         # and retry THIS row exactly once on a fresh session before
         # considering the fallback path — never a duplicate send,
         # because the failed attempt never opened chat.stream.
         healed = False
+        started = time.monotonic()
+        reused = self._reuse_cf_connection() and self.gw is not None
         while True:
-            self.drop_gw()
+            if not reused:
+                self.drop_gw()
             if not self.ensure_gw():
                 if self.ch in ("weixin", "wecom") and not self._fallback_is_safe(row, nbytes):
                     self.log("fallback deferred: bridge backlog requires recovery")
@@ -2532,6 +2531,11 @@ class ChannelWorker(threading.Thread):
                 # proof that another writer can safely take over this row.
                 if isinstance(e, SubmissionPersistenceError):
                     raise
+                if reused and not is_session_not_found(e):
+                    self.log(f"warm connection failed before submission msgid={row.get('msgid')}; reconnecting once")
+                    self.drop_gw()
+                    reused = False
+                    continue
                 self.log(f"pre-send failure msgid={row.get('msgid')}: "
                          f"{type(e).__name__} {str(e)[:120]}")
                 if not healed and longtask_mode(self.ch) \
@@ -2541,6 +2545,7 @@ class ChannelWorker(threading.Thread):
                     self._invalidate_session(
                         f"pre-send msgid={row.get('msgid')}")
                     self.drop_gw()
+                    reused = False
                     continue
                 self._note_reconnect_failure(e)
                 if self.ch in ("weixin", "wecom") and not self._fallback_is_safe(row, nbytes):
@@ -2568,6 +2573,8 @@ class ChannelWorker(threading.Thread):
             self.update_cs(turns=turns, **self._consume_recovery(cs, row), **spool_progress(cs, nbytes))
             self.queue.pop(0)
         self._note_reconnect_success()
+        self.log(f"stream opened msgid={row.get('msgid')} transport={'reused' if reused else 'fresh'} "
+                 f"prepare_ms={int((time.monotonic() - started) * 1000)}")
 
 
 def cmd_daemon():
