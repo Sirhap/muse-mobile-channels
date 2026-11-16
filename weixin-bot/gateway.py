@@ -1921,6 +1921,7 @@ class Gateway:
         STATE.mkdir(parents=True, exist_ok=True)
         self.connected = False
         self.started_at = int(time.time())
+        self.last_platform_ok_at = None
         self.msgs_received = 0
         self.msgs_sent = 0
         self.last_error = ""
@@ -2099,6 +2100,7 @@ class Gateway:
             "connected": self.connected,
             "started_at": self.started_at,
             "updated_at": int(time.time()),
+            "last_platform_ok_at": self.last_platform_ok_at,
             "msgs_received": self.msgs_received,
             "msgs_sent": self.msgs_sent,
             "last_error": self.last_error,
@@ -4599,6 +4601,7 @@ class Gateway:
         self.connected = True
         self.state = "connected"
         self.last_error = ""
+        self.last_platform_ok_at = None
         log("session started; long-polling getupdates")
         self.write_status()
         core = getattr(self, "_core_binding", None)
@@ -4661,6 +4664,11 @@ class Gateway:
                 failures = 0
                 self.reconnect_failures = 0
                 self._stale_hits = 0
+                # Keep an idle gateway observable without writing on every busy poll.
+                now = int(time.time())
+                if self.last_platform_ok_at is None or now - self.last_platform_ok_at >= 15:
+                    self.last_platform_ok_at = now
+                    self.write_status()
                 await self._process_update_batch(client, creds, resp)
         finally:
             outbox_task.cancel()

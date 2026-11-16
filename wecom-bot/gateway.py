@@ -2012,6 +2012,7 @@ class Gateway:
         self.ws = None
         self.connected = False
         self.started_at = int(time.time())
+        self.last_platform_ok_at = None
         self.msgs_received = 0
         self.msgs_sent = 0
         self.last_error = ""
@@ -2151,6 +2152,7 @@ class Gateway:
             "connected": self.connected,
             "started_at": self.started_at,
             "updated_at": int(time.time()),
+            "last_platform_ok_at": self.last_platform_ok_at,
             "pid": os.getpid(),
             "msgs_received": self.msgs_received,
             "msgs_sent": self.msgs_sent,
@@ -3716,6 +3718,8 @@ class Gateway:
                     self.write_status()
                     return
                 missed = 0
+                self.last_platform_ok_at = int(time.time())
+                self.write_status()
             except Exception as e:  # connection likely dead
                 log(f"heartbeat exception: {e}")
                 return
@@ -4959,6 +4963,7 @@ class Gateway:
             self.connected = True
             self.state = "connected"
             self.last_error = ""
+            self.last_platform_ok_at = int(time.time())
             log("subscribed OK; long connection established")
             self.write_status()
             core = getattr(self, "_core_binding", None)
